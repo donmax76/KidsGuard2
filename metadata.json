@@ -1,0 +1,6 @@
+{
+  "name": "KidsGuard: Родительский контроль",
+  "description": "Комплексный родительский контроль: ограничение экранного времени, блокировка приложений, веб-фильтр контента и GPS-трекинг ребенка в реальном времени.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

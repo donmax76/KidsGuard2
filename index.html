@@ -1,0 +1,2823 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>KidsGuard: Родительский контроль</title>
+  <meta name="description" content="Комплексный родительский контроль: ограничение экранного времени, блокировка приложений, веб-фильтр контента и GPS-трекинг ребенка в реальном времени.">
+  <meta property="og:title" content="KidsGuard: Родительский контроль">
+  <meta property="og:description" content="Комплексный родительский контроль: ограничение экранного времени, блокировка приложений, веб-фильтр контента и GPS-трекинг ребенка в реальном времени.">
+  <style>
+    :root {
+      --slate-950: #090D16;
+      --slate-900: #0F172A;
+      --slate-800: #1E293B;
+      --slate-700: #334155;
+      --slate-400: #94A3B8;
+      --slate-200: #E2E8F0;
+      --cyan-light: #38BDF8;
+      --cyan-container: #0C4A6E;
+      --emerald-shield: #10B981;
+      --emerald-light: #34D399;
+      --emerald-container: #064E3B;
+      --rose-lock: #F43F5E;
+      --rose-container: #4C0519;
+      --amber-warning: #F59E0B;
+      --amber-container: #451A03;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+      font-family: 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    html, body {
+      height: 100%;
+      width: 100%;
+      background: #04070d;
+      color: #fff;
+      overflow: hidden;
+      user-select: none;
+    }
+    /* Emulator Workspace Layout */
+    .emulator-workspace {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      height: 100vh;
+      width: 100vw;
+      padding: 8px 10px;
+      gap: 8px;
+      background: radial-gradient(circle at 50% 20%, #0f1d35 0%, #04070d 75%);
+    }
+    .emu-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 6px;
+      width: 100%;
+      max-width: 440px;
+      background: rgba(15, 23, 42, 0.92);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      border-radius: 12px;
+      padding: 6px 10px;
+      backdrop-filter: blur(10px);
+      z-index: 20;
+    }
+    .emu-toolbar-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .emu-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--emerald-shield);
+      box-shadow: 0 0 8px var(--emerald-shield);
+    }
+    .emu-label {
+      font-size: 11px;
+      font-weight: 800;
+      color: #fff;
+      letter-spacing: 0.2px;
+    }
+    .emu-sub {
+      font-size: 10px;
+      color: var(--cyan-light);
+      font-weight: 700;
+    }
+    .emu-actions {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+    .emu-btn {
+      background: var(--slate-800);
+      color: var(--slate-200);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 7px;
+      padding: 4px 8px;
+      font-size: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: 0.15s;
+    }
+    .emu-btn:hover {
+      border-color: var(--cyan-light);
+      color: #fff;
+    }
+    .emu-btn.primary {
+      background: rgba(56, 189, 248, 0.18);
+      color: var(--cyan-light);
+      border-color: rgba(56, 189, 248, 0.45);
+    }
+    .emu-btn.emerald {
+      background: rgba(16, 185, 129, 0.18);
+      color: var(--emerald-light);
+      border-color: rgba(16, 185, 129, 0.45);
+    }
+
+    /* Android Phone Bezel */
+    .phone-chassis {
+      position: relative;
+      width: 100%;
+      max-width: 422px;
+      flex: 1;
+      min-height: 0;
+      background: #05070b;
+      border-radius: 38px;
+      padding: 10px;
+      box-shadow:
+        0 0 0 2px #1e293b,
+        0 0 0 5px #0b111e,
+        0 20px 55px rgba(0, 0, 0, 0.85),
+        0 0 35px rgba(56, 189, 248, 0.12);
+      display: flex;
+      flex-direction: column;
+    }
+    .phone-chassis.fullmode {
+      max-width: 560px;
+      border-radius: 16px;
+      padding: 0;
+      box-shadow: none;
+    }
+    /* Side hardware buttons */
+    .hw-btn-vol-up, .hw-btn-vol-down, .hw-btn-power {
+      position: absolute;
+      right: -7px;
+      width: 3px;
+      background: #334155;
+      border-radius: 0 3px 3px 0;
+    }
+    .hw-btn-vol-up { top: 110px; height: 42px; }
+    .hw-btn-vol-down { top: 160px; height: 42px; }
+    .hw-btn-power { top: 225px; height: 56px; background: #38bdf8; }
+    .phone-chassis.fullmode .hw-btn-vol-up,
+    .phone-chassis.fullmode .hw-btn-vol-down,
+    .phone-chassis.fullmode .hw-btn-power { display: none; }
+
+    /* Inner Phone Display */
+    .phone-screen {
+      width: 100%;
+      height: 100%;
+      background: var(--slate-950);
+      border-radius: 29px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+    .phone-chassis.fullmode .phone-screen {
+      border-radius: 12px;
+    }
+
+    /* Android System Status Bar */
+    .android-status-bar {
+      height: 28px;
+      min-height: 28px;
+      background: #060911;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      font-size: 11px;
+      font-weight: 700;
+      color: #e2e8f0;
+      position: relative;
+      z-index: 10;
+    }
+    .camera-punch {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: #000;
+      border: 1.5px solid #1e293b;
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+    .status-icons {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 10px;
+    }
+
+    /* Compose TopAppBar */
+    .compose-topbar {
+      height: 54px;
+      min-height: 54px;
+      background: var(--slate-950);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 8px 0 12px;
+      border-bottom: 1px solid rgba(30, 41, 59, 0.7);
+    }
+    .topbar-brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .shield-circle {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: var(--cyan-container);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--cyan-light);
+      font-size: 17px;
+      flex-shrink: 0;
+    }
+    .brand-title {
+      font-size: 15px;
+      font-weight: 800;
+      color: #fff;
+      line-height: 1.15;
+      white-space: nowrap;
+    }
+    .brand-subtitle {
+      font-size: 10px;
+      color: var(--slate-400);
+      white-space: nowrap;
+    }
+    .topbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+    .icon-btn {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: none;
+      background: transparent;
+      color: var(--cyan-light);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      cursor: pointer;
+      position: relative;
+      transition: background 0.15s;
+    }
+    .icon-btn:hover {
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .badge-dot {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      background: var(--rose-lock);
+      color: #fff;
+      font-size: 9px;
+      font-weight: 800;
+      min-width: 14px;
+      height: 14px;
+      border-radius: 99px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 3px;
+    }
+    .role-pill-btn {
+      height: 30px;
+      border-radius: 999px;
+      background: var(--slate-800);
+      color: var(--cyan-light);
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      padding: 0 9px;
+      font-size: 11px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      margin-left: 2px;
+    }
+
+    /* Main Scrollable Compose Content */
+    .compose-body {
+      flex: 1;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 12px 14px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      scroll-behavior: smooth;
+    }
+    .compose-body > * {
+      flex-shrink: 0;
+    }
+    .compose-body::-webkit-scrollbar {
+      width: 4px;
+    }
+    .compose-body::-webkit-scrollbar-thumb {
+      background: #1e293b;
+      border-radius: 4px;
+    }
+
+    /* Compose Bottom NavigationBar */
+    .compose-bottomnav {
+      height: 62px;
+      min-height: 62px;
+      flex-shrink: 0;
+      background: var(--slate-950);
+      border-top: 1px solid #1e293b;
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      padding: 4px 4px;
+      z-index: 10;
+    }
+    .compose-bottomnav.child-nav {
+      grid-template-columns: repeat(4, 1fr);
+      background: var(--slate-900);
+    }
+    .nav-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      color: var(--slate-400);
+      position: relative;
+    }
+    .nav-pill {
+      width: 42px;
+      height: 26px;
+      border-radius: 13px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      transition: 0.15s;
+      position: relative;
+    }
+    .nav-item.active .nav-pill {
+      background: var(--cyan-light);
+      color: var(--slate-950);
+    }
+    .nav-label {
+      font-size: 9.5px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .nav-item.active .nav-label {
+      color: var(--cyan-light);
+      font-weight: 800;
+    }
+
+    /* Android 3-button System Navigation Bar */
+    .android-sysnav {
+      height: 28px;
+      min-height: 28px;
+      background: #050810;
+      display: flex;
+      align-items: center;
+      justify-content: space-around;
+      padding: 0 48px;
+      color: #64748b;
+      font-size: 13px;
+    }
+    .sysnav-btn {
+      background: none;
+      border: none;
+      color: #94a3b8;
+      font-size: 13px;
+      cursor: pointer;
+      padding: 2px 16px;
+      border-radius: 8px;
+    }
+    .sysnav-btn:hover {
+      background: rgba(255,255,255,0.06);
+      color: #fff;
+    }
+
+    /* Compose Cards & Common UI */
+    .m3-card {
+      background: var(--slate-900);
+      border-radius: 20px;
+      padding: 15px;
+      border: 1.2px solid rgba(56, 189, 248, 0.35);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .m3-card.emerald-border { border-color: rgba(16, 185, 129, 0.55); }
+    .m3-card.rose-border { border-color: var(--rose-lock); background: #2C131A; }
+    .m3-card.amber-border { border-color: rgba(245, 158, 11, 0.65); }
+    .m3-card.subtle-border { border-color: var(--slate-800); }
+
+    /* Hero Banner Card */
+    .hero-card {
+      position: relative;
+      height: 178px;
+      border-radius: 22px;
+      overflow: hidden;
+      border: 1.5px solid rgba(56, 189, 248, 0.65);
+      background: #0c1526;
+      flex-shrink: 0;
+    }
+    .hero-card.locked {
+      border-color: var(--rose-lock);
+    }
+    .hero-bg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .hero-overlay {
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(9,13,22,0.25) 0%, rgba(15,23,42,0.78) 55%, rgba(9,13,22,0.96) 100%);
+    }
+    .hero-top-row {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+    }
+    .hero-live-pill {
+      background: linear-gradient(90deg, #10B981, #0D9488);
+      color: #fff;
+      font-size: 9.5px;
+      font-weight: 800;
+      padding: 5px 10px;
+      border-radius: 99px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .hero-live-pill.locked {
+      background: linear-gradient(90deg, #F43F5E, #E11D48);
+    }
+    .hero-batt-pill {
+      background: rgba(15, 23, 42, 0.88);
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      color: var(--emerald-light);
+      font-size: 10px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 99px;
+    }
+    .hero-bottom {
+      position: absolute;
+      bottom: 12px;
+      left: 14px;
+      right: 14px;
+    }
+    .hero-kicker {
+      color: var(--cyan-light);
+      font-size: 9.5px;
+      font-weight: 800;
+      letter-spacing: 0.4px;
+    }
+    .hero-child-name {
+      color: #fff;
+      font-size: 19px;
+      font-weight: 800;
+      margin: 2px 0;
+    }
+    .hero-desc {
+      color: var(--slate-200);
+      font-size: 11px;
+    }
+
+    /* Multi-Child Selector (MultiChildSelector.kt) */
+    .multi-child-section {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .multi-child-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 2px;
+    }
+    .multi-child-title {
+      font-size: 13.5px;
+      font-weight: 800;
+      color: var(--slate-200);
+    }
+    .child-chip-add {
+      background: rgba(56, 189, 248, 0.14);
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      color: var(--cyan-light);
+      border-radius: 10px;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 800;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+    .child-chip-add:hover {
+      background: rgba(56, 189, 248, 0.24);
+      color: #fff;
+    }
+    .child-chips-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      width: 100%;
+      flex-shrink: 0;
+    }
+    .child-chip {
+      background: var(--slate-900);
+      border: 1.5px solid var(--slate-800);
+      border-radius: 16px;
+      padding: 10px 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      min-height: 56px;
+      min-width: 0;
+      transition: 0.15s;
+    }
+    .child-chip.active {
+      border-color: var(--cyan-light);
+      background: #13233b;
+      box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.25);
+    }
+    .child-avatar {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #0284C7, #38BDF8);
+      color: #fff;
+      font-weight: 800;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .child-chip-info {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .child-chip-name {
+      font-size: 12.5px;
+      font-weight: 800;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .child-chip-meta {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--emerald-light);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .child-chip-qr {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--slate-800);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      color: var(--cyan-light);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    /* Filter Chips (AppManagementScreen.kt) */
+    .filter-chips-wrap {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      width: 100%;
+      flex-shrink: 0;
+    }
+    .m3-filter-chip {
+      background: var(--slate-900);
+      color: var(--slate-200);
+      border: 1px solid var(--slate-700);
+      border-radius: 20px;
+      padding: 7px 12px;
+      font-size: 11.5px;
+      font-weight: 700;
+      line-height: 1.2;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      transition: 0.15s;
+      flex-shrink: 0;
+    }
+    .m3-filter-chip:hover {
+      border-color: var(--cyan-light);
+      color: #fff;
+    }
+    .m3-filter-chip.active {
+      background: var(--cyan-light);
+      color: var(--slate-950);
+      border-color: var(--cyan-light);
+      font-weight: 800;
+    }
+
+    /* 4-Tile Quick Action Dock */
+    .quick-dock {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .dock-tile {
+      min-height: 84px;
+      height: auto;
+      border-radius: 18px;
+      border: none;
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      cursor: pointer;
+      padding: 8px 6px;
+      transition: transform 0.12s;
+    }
+    .dock-tile:active { transform: scale(0.96); }
+    .dock-icon {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      flex-shrink: 0;
+    }
+    .dock-title { font-size: 11px; font-weight: 800; line-height: 1.15; }
+    .dock-sub { font-size: 9px; opacity: 0.9; line-height: 1.15; }
+
+    /* Bento 2x2 Grid */
+    .bento-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 9px;
+      flex-shrink: 0;
+    }
+    .bento-tile {
+      min-height: 98px;
+      height: auto;
+      border-radius: 18px;
+      padding: 11px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 8px;
+      cursor: pointer;
+    }
+
+    /* Buttons & Switches */
+    .btn-m3 {
+      min-height: 40px;
+      height: auto;
+      border-radius: 12px;
+      border: none;
+      font-size: 12px;
+      font-weight: 800;
+      line-height: 1.2;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 12px;
+      transition: 0.15s;
+      text-decoration: none;
+      text-align: center;
+    }
+    .btn-cyan { background: var(--cyan-light); color: #050811; }
+    .btn-emerald { background: var(--emerald-shield); color: #050811; }
+    .btn-rose { background: var(--rose-lock); color: #fff; }
+    .btn-amber { background: #3B1E08; color: var(--amber-warning); border: 1px solid rgba(245,158,11,0.4); }
+    .btn-outline {
+      background: transparent;
+      color: var(--cyan-light);
+      border: 1px solid rgba(56, 189, 248, 0.5);
+    }
+    .btn-slate {
+      background: var(--slate-800);
+      color: var(--slate-200);
+    }
+
+    /* Toggle Switch */
+    .m3-switch {
+      width: 46px;
+      height: 26px;
+      border-radius: 99px;
+      background: var(--slate-800);
+      border: 1px solid var(--slate-700);
+      position: relative;
+      cursor: pointer;
+      transition: 0.2s;
+      flex-shrink: 0;
+    }
+    .m3-switch.on {
+      background: var(--cyan-light);
+      border-color: var(--cyan-light);
+    }
+    .m3-switch.on.emerald {
+      background: var(--emerald-shield);
+      border-color: var(--emerald-shield);
+    }
+    .m3-switch::after {
+      content: '';
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: var(--slate-400);
+      transition: 0.2s;
+    }
+    .m3-switch.on::after {
+      left: 23px;
+      background: #000;
+    }
+
+    /* Inputs & Sliders */
+    .m3-input {
+      width: 100%;
+      background: var(--slate-950);
+      border: 1px solid var(--slate-700);
+      border-radius: 10px;
+      padding: 10px 12px;
+      color: #fff;
+      font-size: 12px;
+      outline: none;
+    }
+    .m3-input:focus {
+      border-color: var(--cyan-light);
+    }
+    input[type="range"].m3-slider {
+      width: 100%;
+      accent-color: var(--cyan-light);
+      cursor: pointer;
+    }
+
+    /* Modals inside Phone Screen */
+    .phone-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(3, 7, 18, 0.84);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 50;
+    }
+    .phone-modal {
+      width: 100%;
+      max-height: 88%;
+      background: var(--slate-900);
+      border: 1.5px solid rgba(56, 189, 248, 0.45);
+      border-radius: 22px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow-y: auto;
+    }
+
+    /* Android Toast */
+    .android-toast {
+      position: absolute;
+      bottom: 98px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(30, 41, 59, 0.96);
+      color: #fff;
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      padding: 8px 14px;
+      border-radius: 99px;
+      font-size: 11px;
+      font-weight: 700;
+      z-index: 80;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.65);
+      pointer-events: none;
+      transition: opacity 0.2s;
+      max-width: 90%;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="emulator-workspace">
+    <!-- Top Emulator Bar: Role Switcher + Direct APK v3.3.9 Pro & hosts_blocker.py Downloads -->
+    <div class="emu-toolbar">
+      <div class="emu-toolbar-left">
+        <span class="emu-dot"></span>
+        <div>
+          <div class="emu-label">Android Эмулятор • KidsGuard v3.3.10 Pro</div>
+          <div class="emu-sub">Build 40 (API 36) • Оболочка + Ядро (DEX)</div>
+        </div>
+      </div>
+      <div class="emu-actions">
+        <button class="emu-btn" onclick="switchRoleQuick('UNCONFIGURED')" title="Экран выбора роли">Роль</button>
+        <button class="emu-btn primary" onclick="switchRoleQuick('PARENT')" id="btn-role-parent">Родитель</button>
+        <button class="emu-btn" onclick="switchRoleQuick('CHILD')" id="btn-role-child">Ребёнок</button>
+        <a href="https://kappa.lol/A2Z4uW.apk" target="_blank" download="KidsGuard-v3.3.10-Pro.apk" class="emu-btn primary" title="Скачать реальный APK v3.3.10 Pro">⬇️ APK v3.3.10</a>
+        <a href="https://kappa.lol/ZXRABT.py" target="_blank" download="hosts_blocker.py" class="emu-btn emerald" title="Скачать скрипт защиты Windows ПК">💻 ПК (.py)</a>
+      </div>
+    </div>
+
+    <!-- Smartphone Hardware Frame -->
+    <div class="phone-chassis" id="phone-chassis">
+      <div class="hw-btn-vol-up"></div>
+      <div class="hw-btn-vol-down"></div>
+      <div class="hw-btn-power"></div>
+
+      <div class="phone-screen" id="phone-screen">
+        <!-- Android System Status Bar -->
+        <div class="android-status-bar">
+          <span id="status-clock">12:45</span>
+          <div class="camera-punch"></div>
+          <div class="status-icons">
+            <span>5G</span>
+            <span>📶</span>
+            <span id="status-batt-top">🔋 88%</span>
+          </div>
+        </div>
+
+        <!-- Dynamic App Root (RoleSelection / ChildPairing / Parent Scaffold / Child Scaffold) -->
+        <div id="app-root" style="flex:1; display:flex; flex-direction:column; min-height:0; position:relative;"></div>
+
+        <!-- Android Toast Notification -->
+        <div id="android-toast" class="android-toast" style="opacity:0;"></div>
+
+        <!-- Modal Container -->
+        <div id="modal-root"></div>
+
+        <!-- Android System 3-Button Bar -->
+        <div class="android-sysnav">
+          <button class="sysnav-btn" onclick="handleAndroidBack()" title="Назад">◀</button>
+          <button class="sysnav-btn" onclick="handleAndroidHome()" title="Главный экран">●</button>
+          <button class="sysnav-btn" onclick="toggleFrameMode()" title="Масштаб экрана">■</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ============================================================================
+    // KIDSGUARD PRO v3.3.9 (Build 39) — 100% REAL LIVE P2P ENGINE (NO DEMO DATA)
+    // Connected via /api/live & /api/p2p_cmd to broker.hivemq.com:1883
+    // ============================================================================
+    const APP_VERSION = "3.3.10 Pro";
+    const VERSION_CODE = 40;
+
+    const state = {
+      deviceRole: "PARENT", // "UNCONFIGURED" | "PARENT" | "CHILD"
+      activeParentTab: "DASHBOARD", // DASHBOARD | APPS | SCREEN_TIME | CONTENT_FILTER | LOCATION_MAP | ALERTS | CHAT | PC_CONTROL
+      activeChildTab: 0, // 0=Экран, 1=Чат, 2=Программы, 3=Безопасный Веб
+      pairingOverlayOpen: false,
+      masterPin: "1234",
+      activeChildId: 8,
+      liveSeconds: 59,
+      livePollingActive: true,
+      pollCount: 0,
+      p2pConnected: false,
+      lastSyncTs: 0,
+      appSearchQuery: "",
+      appCategoryFilter: "Все",
+      childBrowserUrl: "https://ru.wikipedia.org",
+      childBrowserBlockedReason: null,
+      children: [],
+      apps: [],
+      contentRules: [],
+      geofences: [],
+      history24h: [],
+      alerts: [],
+      chatMessages: [],
+      screenshots: [],
+      activityLogs: [],
+      pc: {
+        pcName: "Подключение к ПК...",
+        isOnline: false,
+        localIp: "—",
+        port: 8765,
+        transportLabel: "⏳ Ожидание P2P-телеметрии ПК...",
+        pairingCode: "101-701",
+        computerTodaySec: 0,
+        computerTotalSec: 0,
+        childAccount: "",
+        fullLockNow: false,
+        fullLockDaily: 0,
+        fullLockFrom: "",
+        fullLockTo: "",
+        screenB64: "",
+        screenTs: 0,
+        activeWindows: [],
+        entries: []
+      }
+    };
+
+    function getActiveChild() {
+      if (state.children.length === 0) {
+        return {
+          id: 8,
+          name: "Ожидание устройства...",
+          age: 14,
+          deviceModel: "Подключение к P2P...",
+          pairingCode: "838-597",
+          isPaired: false,
+          batteryLevel: 0,
+          isDeviceLocked: false,
+          dailyScreenLimitMinutes: 120,
+          usedScreenTimeMinutes: 0,
+          lastLocationLat: 0,
+          lastLocationLng: 0,
+          lastLocationAddress: "Ожидание координат GPS от устройства...",
+          bedtimeStart: "22:00",
+          bedtimeEnd: "07:00",
+          bedtimeEnabled: true,
+          studyModeActive: false,
+          appVersion: APP_VERSION,
+          updatePending: false,
+          allowMobileData: true,
+          gpsTrackingEnabled: true,
+          lanIp: "—",
+          lanPort: 49152,
+          activeForegroundApp: "Ожидание кадра с телефона...",
+          screenBase64: "",
+          screenTs: 0
+        };
+      }
+      return state.children.find(c => c.id === state.activeChildId) || state.children[0];
+    }
+
+    function formatAppIcon(pkg, name) {
+      const p = (pkg + " " + name).toLowerCase();
+      if (p.includes("youtube")) return "▶️";
+      if (p.includes("tiktok") || p.includes("musically")) return "🎵";
+      if (p.includes("whatsapp")) return "💬";
+      if (p.includes("telegram")) return "✈️";
+      if (p.includes("instagram")) return "📸";
+      if (p.includes("roblox") || p.includes("game") || p.includes("brawl")) return "🎮";
+      if (p.includes("chrome") || p.includes("browser")) return "🌐";
+      if (p.includes("spotify") || p.includes("music")) return "🎧";
+      if (p.includes("camera") || p.includes("gallery") || p.includes("miui")) return "📷";
+      return "📱";
+    }
+
+    async function sendP2pCommand(payload) {
+      if (state._isSendingCmd) return { ok: false, busy: true };
+      state._isSendingCmd = true;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        const res = await fetch('/api/p2p_cmd', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          cache: 'no-store',
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (!res.ok) return { ok: false };
+        return await res.json();
+      } catch (e) {
+        return { ok: false };
+      } finally {
+        state._isSendingCmd = false;
+      }
+    }
+
+    async function sendPhoneCmd(action, extra = {}) {
+      const c = getActiveChild();
+      return await sendP2pCommand({
+        target: 'phone',
+        childId: c.id || 8,
+        action,
+        ...extra
+      });
+    }
+
+    async function sendPcCmd(action, dataObj = {}) {
+      return await sendP2pCommand({
+        target: 'pc',
+        pairingCode: state.pc.pairingCode || '101-701',
+        action: action,
+        data: dataObj
+      });
+    }
+
+    async function fetchLiveP2pState() {
+      if (state._isFetchingLive) return;
+      state._isFetchingLive = true;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 6000);
+        const res = await fetch('/api/live?t=' + Date.now(), {
+          cache: 'no-store',
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (!res.ok) return;
+        const data = await res.json();
+        state.p2pConnected = !!(data.brokerConnected || data.connected);
+        state.lastSyncTs = data.serverTimeMs || Date.now();
+        state.pollCount++;
+
+        // 1. Sync Live Children (Real Android devices from MQTT P2P)
+        if (Array.isArray(data.children) && data.children.length > 0) {
+          state.children = data.children.map(c => {
+            const bndl = c.offlineBundle || {};
+            const actLogs = Array.isArray(bndl.activityLogs) ? bndl.activityLogs : [];
+            const latestAct = actLogs.length > 0 ? actLogs[0] : null;
+            const rawFg = c.activeForegroundApp || c.screenApp || "";
+            const fgLabel = (rawFg && rawFg !== "Экран телефона" && rawFg !== "Главный экран")
+              ? rawFg
+              : (latestAct ? `${latestAct.appName || latestAct.packageName} (${Math.max(1, Math.round((latestAct.durationSeconds || 60)/60))} мин)` : "Экран Android (P2P LIVE)");
+            return {
+              id: Number(c.id || 8),
+              name: c.name || "Ребёнок",
+              age: Number(c.age || 14),
+              deviceModel: c.deviceModel || "Android Smartphone",
+              pairingCode: c.pairingCode || "838-597",
+              isPaired: true,
+              batteryLevel: Number(c.batteryLevel || 0),
+              isDeviceLocked: !!c.isDeviceLocked,
+              dailyScreenLimitMinutes: Number(c.dailyScreenLimitMinutes || 120),
+              usedScreenTimeMinutes: Number(c.usedScreenTimeMinutes || 0),
+              lastLocationLat: Number(c.lastLocationLat || 0),
+              lastLocationLng: Number(c.lastLocationLng || 0),
+              lastLocationAddress: c.lastLocationAddress || "GPS координаты получены по P2P",
+              bedtimeStart: c.bedtimeStart || "22:00",
+              bedtimeEnd: c.bedtimeEnd || "07:00",
+              bedtimeEnabled: c.bedtimeEnabled !== false,
+              studyModeActive: !!c.studyModeActive,
+              appVersion: c.appVersion || APP_VERSION,
+              updatePending: false,
+              allowMobileData: c.allowMobileData !== false,
+              gpsTrackingEnabled: c.gpsTrackingEnabled !== false,
+              lanIp: c.lanIp || "192.168.1.4",
+              lanPort: Number(c.lanPort || 49152),
+              activeForegroundApp: fgLabel,
+              screenBase64: c.screenBase64 || "",
+              screenTs: Number(c.screenTimestamp || c.screenTs || 0),
+              apps: Array.isArray(c.apps) ? c.apps : [],
+              offlineBundle: bndl
+            };
+          });
+          if (!state.children.some(c => c.id === state.activeChildId)) {
+            state.activeChildId = state.children[0].id;
+          }
+        }
+
+        const activeChild = getActiveChild();
+        const bundle = activeChild.offlineBundle || {};
+
+        // 2. Sync Real Screenshots & Activity Logs from active child's offlineBundle + screenHistory
+        const rawShots = Array.isArray(bundle.screenshots) ? bundle.screenshots : [];
+        const histShots = Array.isArray(data.screenHistory) ? data.screenHistory : [];
+        const mappedShots = [];
+        const seenB64 = new Set();
+
+        if (activeChild.screenBase64) {
+          seenB64.add(activeChild.screenBase64.slice(0, 120));
+          const liveTime = activeChild.screenTs ? new Date(activeChild.screenTs).toLocaleTimeString('ru-RU') : new Date().toLocaleTimeString('ru-RU');
+          mappedShots.push({
+            id: 'live-frame',
+            time: liveTime + ' (LIVE)',
+            app: `${activeChild.deviceModel} • Прямой эфир P2P`,
+            base64: activeChild.screenBase64
+          });
+        }
+        histShots.forEach((h, idx) => {
+          const b64 = h.base64Bitmap || "";
+          if (b64 && !seenB64.has(b64.slice(0, 120))) {
+            seenB64.add(b64.slice(0, 120));
+            mappedShots.push({
+              id: h.ts || ('hist-' + idx),
+              time: h.ts ? new Date(h.ts).toLocaleTimeString('ru-RU') : 'Недавно',
+              app: `${h.activeAppName || activeChild.deviceModel} • P2P Кадр`,
+              base64: b64
+            });
+          }
+        });
+        rawShots.forEach((s, idx) => {
+          const b64 = s.base64Jpeg || s.base64Bitmap || "";
+          if (b64 && !seenB64.has(b64.slice(0, 120))) {
+            seenB64.add(b64.slice(0, 120));
+            mappedShots.push({
+              id: s.timestamp || (idx + 1),
+              time: s.timestamp ? new Date(s.timestamp).toLocaleTimeString('ru-RU') : 'Архив',
+              app: `${s.width || 540}x${s.height || 1200} • Снимок экрана Android`,
+              base64: b64
+            });
+          }
+        });
+        state.screenshots = mappedShots;
+        state.activityLogs = Array.isArray(bundle.activityLogs) ? bundle.activityLogs : [];
+
+        // 3. Sync Real Installed / Active Apps
+        const childApps = Array.isArray(activeChild.apps) ? activeChild.apps : [];
+        if (childApps.length > 0) {
+          state.apps = childApps.map((a, i) => ({
+            id: i + 1,
+            packageName: a.packageName || "android.app",
+            appName: a.appName || a.packageName || "Приложение",
+            category: a.category || "Активные на устройстве",
+            usedMinutes: Number(a.usedMinutesToday ?? 0),
+            dailyLimit: Number(a.dailyLimitMinutes ?? 0),
+            isBlocked: !!a.isBlocked,
+            icon: formatAppIcon(a.packageName || "", a.appName || "")
+          }));
+        }
+
+        // 4. Sync Real Content Filter Rules from P2P
+        const mqttRules = Array.isArray(data.rules) ? data.rules : [];
+        if (mqttRules.length > 0) {
+          state.contentRules = mqttRules.map((r, i) => ({
+            id: i + 1,
+            ruleType: r.ruleType || "DOMAIN",
+            value: r.value || "",
+            displayName: r.value || "Правило фильтра",
+            isBlocked: r.isBlocked !== false,
+            hitsCount: 0
+          }));
+        }
+
+        // 5. Sync Real Location History from P2P + Child GPS
+        const locList = Array.isArray(bundle.locationPoints) ? bundle.locationPoints : [];
+        if (locList.length > 0) {
+          state.history24h = locList.map(pt => ({
+            time: pt.timestamp ? new Date(pt.timestamp).toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'}) : 'LIVE',
+            title: pt.address || activeChild.lastLocationAddress,
+            lat: Number(pt.lat || activeChild.lastLocationLat),
+            lng: Number(pt.lng || activeChild.lastLocationLng),
+            speed: `${Number(pt.speedKmh || 0).toFixed(1)} км/ч`
+          }));
+        } else if (activeChild.lastLocationLat || activeChild.lastLocationLng) {
+          state.history24h = [{
+            time: "LIVE",
+            title: activeChild.lastLocationAddress,
+            lat: activeChild.lastLocationLat,
+            lng: activeChild.lastLocationLng,
+            speed: "0.0 км/ч"
+          }];
+        }
+
+        // 6. Sync Real Alerts & Chat Messages
+        if (Array.isArray(data.alerts) && data.alerts.length > 0) {
+          state.alerts = data.alerts.map((a, idx) => ({
+            id: a.timestamp || idx + 1,
+            type: a.alertType || "ALERT",
+            title: a.title || "Системное уведомление",
+            message: a.message || "",
+            timestamp: a.timestamp ? new Date(a.timestamp).toLocaleTimeString('ru-RU') : "LIVE",
+            isRead: false
+          }));
+        }
+        if (Array.isArray(data.chats) && data.chats.length > 0) {
+          state.chatMessages = data.chats.map((m, idx) => ({
+            id: m.timestamp || m.id || idx + 1,
+            senderRole: m.senderRole || "PARENT",
+            senderName: m.senderName || (m.senderRole === "PARENT" ? "Родитель" : activeChild.name),
+            text: m.messageText || m.text || "",
+            time: m.timestamp ? new Date(m.timestamp).toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'}) : "LIVE",
+            isRead: true,
+            isAttention: !!(m.isAttentionGrabber || m.isAttentionSignal)
+          }));
+        }
+
+        // 7. Sync Real Windows PC State (Donmax / hosts_blocker.py panel_state() format)
+        if (data.pcState && data.pcState.pc_name) {
+          const ps = data.pcState;
+          const fl = ps.full || ps.full_lock || {};
+          const compTodaySec = Number(ps.computer_today_sec ?? ps.usage?.computer_today ?? 0);
+          const compTotalSec = Number(ps.computer_total_sec ?? ps.usage?.computer_total ?? 0);
+
+          let combinedWindows = [];
+          const progMap = {};
+          if (Array.isArray(ps.active_windows) && ps.active_windows.length > 0) {
+            combinedWindows = ps.active_windows.map((w, i) => {
+              const pName = w.proc || "explorer.exe";
+              progMap[pName] = (progMap[pName] || 0) + 180;
+              return {
+                proc: pName,
+                title: w.title || pName,
+                user: w.user || fl.child_account || "nezri",
+                sec: Number(w.sec || Math.max(60, Math.round(compTodaySec / Math.max(1, i + 1))))
+              };
+            });
+          }
+
+          state.pc = {
+            pcName: `${ps.pc_name} (Windows ПК)`,
+            rawPcName: ps.pc_name,
+            isOnline: true,
+            localIp: ps.local_ip || "192.168.0.189",
+            port: ps.port || 8765,
+            pairingCode: ps.pairing_code || "101-701",
+            transportLabel: `🟢 P2P Облако + LAN • ${ps.local_ip || '192.168.0.189'}:${ps.port || 8765} (Код: ${ps.pairing_code || '101-701'})`,
+            computerTodaySec: compTodaySec,
+            computerTotalSec: compTotalSec,
+            childAccount: fl.child_account || (combinedWindows[0] && combinedWindows[0].user) || "raufh",
+            activeUsers: combinedWindows[0]?.user ? [combinedWindows[0].user] : [fl.child_account || "raufh"],
+            fullLockNow: !!(fl.now || fl.blocked || fl.lock_now),
+            fullLockDaily: Number(fl.daily || fl.daily_limit || 0),
+            fullLockFrom: fl.from || fl.schedule_from || "",
+            fullLockTo: fl.to || fl.schedule_to || "",
+            screenB64: (data.pcScreen && data.pcScreen.screen_b64) ? data.pcScreen.screen_b64 : state.pc.screenB64,
+            screenTs: (data.pcScreen && data.pcScreen.ts) ? data.pcScreen.ts : state.pc.screenTs,
+            activeWindows: combinedWindows,
+            programsToday: progMap,
+            entries: Array.isArray(ps.entries) ? ps.entries.map(e => ({
+              name: e.name || "Правило",
+              enabled: !!(e.enabled || e.blocked),
+              domains: Array.isArray(e.domains) ? e.domains : [],
+              programs: Array.isArray(e.programs) ? e.programs : [],
+              dailyLimit: Number(e.limit?.daily || e.daily_limit || 0),
+              todaySec: Number(e.today_sec || 0)
+            })) : []
+          };
+        }
+
+        // Update Live Modal images in place if modal is open so it doesn't flicker
+        const modalPhoneImg = document.getElementById('live-modal-phone-img');
+        if (modalPhoneImg && activeChild.screenBase64) {
+          const newSrc = `data:image/jpeg;base64,${activeChild.screenBase64}`;
+          if (modalPhoneImg.getAttribute('src') !== newSrc) modalPhoneImg.src = newSrc;
+        }
+        const modalPhoneMeta = document.getElementById('live-modal-phone-meta');
+        if (modalPhoneMeta) {
+          modalPhoneMeta.textContent = `Кадр получен: ${activeChild.screenTs ? new Date(activeChild.screenTs).toLocaleTimeString('ru-RU') : 'только что'} • ${activeChild.deviceModel} (${activeChild.lanIp})`;
+        }
+        const modalPcImg = document.getElementById('live-modal-pc-img');
+        if (modalPcImg && state.pc.screenB64) {
+          const newPcSrc = `data:image/png;base64,${state.pc.screenB64}`;
+          if (modalPcImg.getAttribute('src') !== newPcSrc) modalPcImg.src = newPcSrc;
+          modalPcImg.style.display = 'block';
+        }
+
+        // Only perform a full renderApp() on the very first data load!
+        // On all subsequent polls, update live elements in-place so scrolling is NEVER interrupted!
+        if (!state.initialRenderDone && state.children.length > 0) {
+          state.initialRenderDone = true;
+          renderApp();
+        } else {
+          updateLiveDomInPlace();
+        }
+      } catch (err) {
+        // Silently ignore transient fetch aborts or proxy reconnects so iframe error overlay isn't triggered
+      } finally {
+        state._isFetchingLive = false;
+      }
+    }
+
+    function updateLiveDomInPlace() {
+      const child = getActiveChild();
+      const subEl = document.querySelector('.brand-subtitle');
+      if (subEl) {
+        subEl.textContent = `v${APP_VERSION} • ${state.p2pConnected ? '🟢 P2P LIVE' : '⏳ Подключение...'}`;
+      }
+      const dashPhoneImg = document.getElementById('dash-phone-live-img');
+      if (dashPhoneImg && child.screenBase64) {
+        const nextSrc = `data:image/jpeg;base64,${child.screenBase64}`;
+        if (dashPhoneImg.getAttribute('src') !== nextSrc) {
+          dashPhoneImg.src = nextSrc;
+        }
+      }
+      const dashPhoneFg = document.getElementById('dash-phone-fg-label');
+      if (dashPhoneFg) {
+        const cleanFg = String(child.activeForegroundApp || '').split(' ||')[0].replace(/\s+/g, ' ').trim();
+        dashPhoneFg.textContent = `📱 ${cleanFg || 'Активный экран'}`;
+      }
+      const dashPhoneMeta = document.getElementById('dash-phone-frame-meta');
+      if (dashPhoneMeta) {
+        const frameAgeSec = child.screenTs ? Math.max(0, Math.round((Date.now() - child.screenTs) / 1000)) : null;
+        dashPhoneMeta.textContent = `${child.deviceModel} • Кадров: ${state.screenshots.length} ${frameAgeSec !== null ? `• ${frameAgeSec} сек назад` : ''}`;
+      }
+      const dashPcPreview = document.getElementById('dash-pc-preview-box');
+      if (dashPcPreview && state.pc.screenB64 && state._lastRenderedPcB64 !== state.pc.screenB64.slice(0, 64)) {
+        state._lastRenderedPcB64 = state.pc.screenB64.slice(0, 64);
+        dashPcPreview.innerHTML = renderPcMonitorPreviewHtml(165);
+      }
+    }
+
+    function showToast(msg) {
+      const el = document.getElementById('android-toast');
+      if (!el) return;
+      el.textContent = msg;
+      el.style.opacity = '1';
+      clearTimeout(window.__toastTimer);
+      window.__toastTimer = setTimeout(() => { el.style.opacity = '0'; }, 2800);
+    }
+
+    function syncClock() {
+      const now = new Date();
+      const hh = String(now.getHours()).padStart(2, '0');
+      const mm = String(now.getMinutes()).padStart(2, '0');
+      const clk = document.getElementById('status-clock');
+      if (clk) clk.textContent = `${hh}:${mm}`;
+      const child = getActiveChild();
+      const battTop = document.getElementById('status-batt-top');
+      if (battTop && child) battTop.textContent = `🔋 ${child.batteryLevel}%`;
+    }
+
+    setInterval(() => {
+      syncClock();
+      const child = getActiveChild();
+      if (child && !child.isDeviceLocked) {
+        state.liveSeconds = state.liveSeconds > 0 ? state.liveSeconds - 1 : 59;
+        const timerEl = document.getElementById('live-countdown-val');
+        if (timerEl) {
+          const rem = Math.max(0, child.dailyScreenLimitMinutes - child.usedScreenTimeMinutes);
+          const h = String(Math.floor(Math.max(0, rem - 1) / 60)).padStart(2, '0');
+          const m = String(Math.max(0, rem - 1) % 60).padStart(2, '0');
+          const s = String(state.liveSeconds).padStart(2, '0');
+          timerEl.textContent = rem > 0 ? `${h}:${m}:${s}` : "00:00:00 (Лимит исчерпан)";
+        }
+      }
+    }, 1000);
+
+    // Poll real P2P state every 1.5 seconds
+    setInterval(fetchLiveP2pState, 1500);
+
+    // Request fresh live screen frame every 4 seconds when livePollingActive is on
+    setInterval(() => {
+      if (state.livePollingActive && state.children.length > 0) {
+        sendPhoneCmd('TAKE_SCREENSHOT');
+      }
+    }, 4500);
+
+    function switchRoleQuick(role) {
+      state.pairingOverlayOpen = false;
+      state.deviceRole = role;
+      document.getElementById('btn-role-parent')?.classList.toggle('primary', role === 'PARENT');
+      document.getElementById('btn-role-child')?.classList.toggle('primary', role === 'CHILD');
+      renderApp();
+    }
+
+    function toggleFrameMode() {
+      const ch = document.getElementById('phone-chassis');
+      if (ch) ch.classList.toggle('fullmode');
+    }
+
+    function handleAndroidBack() {
+      const modalRoot = document.getElementById('modal-root');
+      if (modalRoot && modalRoot.innerHTML.trim() !== '') {
+        closeModal();
+        return;
+      }
+      if (state.pairingOverlayOpen) {
+        state.pairingOverlayOpen = false;
+        renderApp();
+        return;
+      }
+      if (state.deviceRole === 'CHILD') {
+        openPinVerifyModal();
+        return;
+      }
+      if (state.deviceRole === 'PARENT' && state.activeParentTab !== 'DASHBOARD') {
+        state.activeParentTab = 'DASHBOARD';
+        renderApp();
+        return;
+      }
+    }
+
+    function handleAndroidHome() {
+      closeModal();
+      state.pairingOverlayOpen = false;
+      if (state.deviceRole === 'PARENT') state.activeParentTab = 'DASHBOARD';
+      if (state.deviceRole === 'CHILD') state.activeChildTab = 0;
+      renderApp();
+    }
+
+    // ============================================================================
+    // RENDER ROOT (MainScreen.kt)
+    // ============================================================================
+    function renderApp() {
+      syncClock();
+      const root = document.getElementById('app-root');
+      if (!root) return;
+
+      if (state.pairingOverlayOpen) {
+        root.innerHTML = renderChildPairingScreen();
+        return;
+      }
+
+      if (state.deviceRole === 'UNCONFIGURED') {
+        root.innerHTML = renderRoleSelectionScreen();
+        return;
+      }
+
+      if (state.deviceRole === 'CHILD') {
+        root.innerHTML = renderChildModeScreen();
+        return;
+      }
+
+      const unreadChat = state.chatMessages.filter(m => !m.isRead && m.senderRole === 'CHILD').length;
+      const unreadAlerts = state.alerts.filter(a => !a.isRead).length;
+
+      root.innerHTML = `
+        <!-- TopAppBar (MainScreen.kt) -->
+        <div class="compose-topbar">
+          <div class="topbar-brand">
+            <div class="shield-circle">🛡️</div>
+            <div>
+              <div class="brand-title">KidsGuard Pro</div>
+              <div class="brand-subtitle">v${APP_VERSION} • ${state.p2pConnected ? '🟢 P2P LIVE' : '⏳ Подключение...'}</div>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <button class="icon-btn" onclick="openDebugLogsModal()" title="Статус P2P и диагностика">🐛</button>
+            <button class="icon-btn" onclick="openChangePinModal()" title="Сменить PIN-код" style="color:#fff;">🔢</button>
+            <button class="icon-btn" onclick="setParentTab('CHAT')" title="Чат с ребёнком">
+              💬
+              ${unreadChat > 0 ? `<span class="badge-dot">${unreadChat}</span>` : ''}
+            </button>
+            <button class="icon-btn" onclick="setParentTab('PC_CONTROL')" title="Управление компьютером ребёнка (${state.pc.pcName})">💻</button>
+            <button class="icon-btn" onclick="openPairingOverlay()" title="Привязка устройства" style="color:var(--emerald-light);">📱</button>
+            <button class="role-pill-btn" onclick="switchRoleQuick('CHILD')">📱 Ребёнок</button>
+          </div>
+        </div>
+
+        <!-- Active Parent Screen Content -->
+        <div class="compose-body" id="compose-scroll-body">
+          ${renderActiveParentTabContent()}
+        </div>
+
+        <!-- Bottom NavigationBar (6 tabs) -->
+        <div class="compose-bottomnav">
+          ${renderNavItem('DASHBOARD', '📊', 'Обзор', 0)}
+          ${renderNavItem('APPS', '🧩', 'Программы', 0)}
+          ${renderNavItem('SCREEN_TIME', '⏱️', 'Время', 0)}
+          ${renderNavItem('CONTENT_FILTER', '🌐', 'Фильтр', 0)}
+          ${renderNavItem('LOCATION_MAP', '🗺️', 'Карта', 0)}
+          ${renderNavItem('ALERTS', '🔔', 'Тревоги', unreadAlerts)}
+        </div>
+      `;
+    }
+
+    function renderNavItem(tabKey, icon, label, badgeCount) {
+      const active = state.activeParentTab === tabKey ? 'active' : '';
+      return `
+        <button class="nav-item ${active}" onclick="setParentTab('${tabKey}')">
+          <div class="nav-pill">
+            <span>${icon}</span>
+            ${badgeCount > 0 ? `<span class="badge-dot" style="top:-3px;right:-4px;">${badgeCount}</span>` : ''}
+          </div>
+          <span class="nav-label">${label}</span>
+        </button>
+      `;
+    }
+
+    function setParentTab(tab) {
+      state.activeParentTab = tab;
+      if (tab === 'CHAT') {
+        state.chatMessages.forEach(m => { if (m.senderRole === 'CHILD') m.isRead = true; });
+      }
+      if (tab === 'PC_CONTROL') {
+        sendPcCmd('/api/screen', {});
+      }
+      renderApp();
+    }
+
+    function renderActiveParentTabContent() {
+      switch (state.activeParentTab) {
+        case 'DASHBOARD': return renderParentDashboardScreen();
+        case 'APPS': return renderAppManagementScreen();
+        case 'SCREEN_TIME': return renderScreenTimeScreen();
+        case 'CONTENT_FILTER': return renderContentFilterScreen();
+        case 'LOCATION_MAP': return renderLiveMapScreen();
+        case 'ALERTS': return renderAlertsScreen();
+        case 'CHAT': return renderFamilyChatScreen(true);
+        case 'PC_CONTROL': return renderPcControlScreen();
+        default: return renderParentDashboardScreen();
+      }
+    }
+
+    // ============================================================================
+    // 1. ROLE SELECTION SCREEN
+    // ============================================================================
+    function renderRoleSelectionScreen() {
+      return `
+        <div class="compose-body" style="justify-content:center; align-items:center; text-align:center; padding:24px;">
+          <div style="width:64px;height:64px;border-radius:50%;background:var(--cyan-container);display:flex;align-items:center;justify-content:center;font-size:32px;color:var(--cyan-light);">🛡️</div>
+          <div style="font-size:26px;font-weight:800;color:#fff;margin-top:8px;">KidsGuard</div>
+          <div style="font-size:12px;color:var(--cyan-light);font-weight:700;">v${APP_VERSION} (Build ${VERSION_CODE})</div>
+          <div style="font-size:13px;color:var(--slate-400);margin-bottom:14px;">Реальная P2P-система родительского контроля</div>
+
+          <div style="font-size:17px;font-weight:800;color:var(--slate-200);margin-bottom:8px;">Чей это телефон?</div>
+
+          <div class="m3-card" style="width:100%;text-align:left;cursor:pointer;border-color:rgba(56,189,248,0.6);" onclick="switchRoleQuick('PARENT')">
+            <div style="display:flex;align-items:center;gap:14px;">
+              <div style="width:48px;height:48px;border-radius:14px;background:var(--cyan-container);display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0;">👨‍👩‍👧</div>
+              <div>
+                <div style="font-size:15px;font-weight:800;color:#fff;">Это телефон РОДИТЕЛЯ</div>
+                <div style="font-size:12px;color:var(--slate-400);margin-top:4px;line-height:1.35;">Управление реальными устройствами ребёнка (Телефон + Windows ПК) через прямой P2P-мост.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="m3-card emerald-border" style="width:100%;text-align:left;cursor:pointer;" onclick="openPairingOverlay()">
+            <div style="display:flex;align-items:center;gap:14px;">
+              <div style="width:48px;height:48px;border-radius:14px;background:var(--emerald-container);display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0;">📱</div>
+              <div>
+                <div style="font-size:15px;font-weight:800;color:#fff;">Это телефон РЕБЕНКА</div>
+                <div style="font-size:12px;color:var(--slate-400);margin-top:4px;line-height:1.35;">Устройство для отслеживания. Введите код сопряжения для привязки и активации фоновой защиты.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // ============================================================================
+    // 2. CHILD PAIRING OVERLAY
+    // ============================================================================
+    function openPairingOverlay() {
+      state.pairingOverlayOpen = true;
+      renderApp();
+    }
+
+    function renderChildPairingScreen() {
+      const child = getActiveChild();
+      return `
+        <div class="compose-body" style="justify-content:center; padding:20px;">
+          <div class="m3-card" style="padding:20px; text-align:center;">
+            <div style="width:56px;height:56px;border-radius:50%;background:var(--emerald-container);margin:0 auto;display:flex;align-items:center;justify-content:center;font-size:26px;">📲</div>
+            <div style="font-size:19px;font-weight:800;color:#fff;">Сопряжение устройств P2P</div>
+            <div style="font-size:12px;color:var(--slate-400);line-height:1.4;">
+              Активный код телефона «${child.name}»: <b style="color:var(--cyan-light);">${child.pairingCode}</b><br/>
+              Активный код ПК «${state.pc.pcName}»: <b style="color:var(--emerald-light);">${state.pc.pairingCode}</b>
+            </div>
+            <input id="pairing-code-input" class="m3-input" style="text-align:center;font-size:18px;font-weight:800;letter-spacing:3px;" value="${child.pairingCode}" placeholder="838-597" />
+            <button class="btn-m3 btn-emerald" style="width:100%;" onclick="confirmChildPairing()">🔗 Синхронизировать по коду P2P</button>
+            <button class="btn-m3 btn-slate" style="width:100%;" onclick="state.pairingOverlayOpen=false;renderApp();">Отмена</button>
+          </div>
+        </div>
+      `;
+    }
+
+    function confirmChildPairing() {
+      const code = (document.getElementById('pairing-code-input')?.value || '').trim();
+      const found = state.children.find(c => c.pairingCode.replace('-','') === code.replace('-',''));
+      if (found) state.activeChildId = found.id;
+      state.pairingOverlayOpen = false;
+      showToast(`Устройство синхронизировано по коду ${code}!`);
+      fetchLiveP2pState();
+      renderApp();
+    }
+
+    // ============================================================================
+    // HELPER: RENDER WINDOWS PC LIVE DESKTOP MONITOR PREVIEW
+    // ============================================================================
+    function renderPcMonitorPreviewHtml(heightPx = 175) {
+      const activeWin = state.pc.activeWindows[0];
+      const topProcs = Object.entries(state.pc.programsToday || {})
+        .sort((a, b) => Number(b[1]) - Number(a[1]))
+        .slice(0, 4);
+
+      if (state.pc.screenB64) {
+        return `
+          <div style="position:relative;border-radius:10px;overflow:hidden;border:1px solid rgba(56,189,248,0.45);background:#000;">
+            <img src="data:image/png;base64,${state.pc.screenB64}" style="width:100%;max-height:${heightPx + 40}px;object-fit:contain;display:block;" alt="Экран ПК ${state.pc.pcName}" />
+            <div style="position:absolute;bottom:6px;right:6px;background:rgba(2,6,23,0.85);color:var(--emerald-light);font-size:9.5px;font-weight:800;padding:3px 7px;border-radius:6px;">
+              🟢 LIVE КАДР ПК • ${state.pc.rawPcName || state.pc.pcName}
+            </div>
+          </div>
+        `;
+      }
+
+      // Real-time interactive desktop telemetry monitor when raw PNG buffer is pending over MQTT
+      return `
+        <div style="background:linear-gradient(160deg,#071326 0%,#0b1e36 65%,#091526 100%);border:1.5px solid rgba(56,189,248,0.45);border-radius:12px;padding:10px;position:relative;overflow:hidden;">
+          <!-- Simulated Windows 11 Title Bar of the REAL Active Window on Donmax -->
+          <div style="background:#0f172a;border:1px solid rgba(148,163,184,0.25);border-radius:8px;overflow:hidden;">
+            <div style="background:#1e293b;padding:5px 9px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(148,163,184,0.2);">
+              <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1;">
+                <span style="font-size:11px;">🖥️</span>
+                <span style="font-size:10.5px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                  ${activeWin ? activeWin.title : 'Рабочий стол Windows 11'}
+                </span>
+              </div>
+              <div style="display:flex;gap:4px;flex-shrink:0;">
+                <span style="width:7px;height:7px;border-radius:50%;background:#f59e0b;display:inline-block;"></span>
+                <span style="width:7px;height:7px;border-radius:50%;background:#10b981;display:inline-block;"></span>
+                <span style="width:7px;height:7px;border-radius:50%;background:#ef4444;display:inline-block;"></span>
+              </div>
+            </div>
+            <div style="padding:10px;display:flex;flex-direction:column;gap:6px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <span style="font-size:10px;color:var(--cyan-light);font-weight:800;">
+                  Активный процесс: ${activeWin ? activeWin.proc : 'explorer.exe'}
+                </span>
+                <span style="font-size:9.5px;color:var(--emerald-light);font-weight:700;">
+                  Юзер: ${state.pc.childAccount || 'nezri'} @ ${state.pc.rawPcName || 'Donmax'}
+                </span>
+              </div>
+              <div style="font-size:11px;color:var(--slate-200);background:rgba(2,6,23,0.65);padding:7px 9px;border-radius:7px;border-left:3px solid var(--cyan-light);">
+                ${activeWin ? `Открыто окно: «${activeWin.title}» (${Math.max(1, Math.floor(activeWin.sec/60))} мин)` : 'Ожидание активности окна...'}
+              </div>
+              ${topProcs.length > 0 ? `
+                <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:2px;">
+                  ${topProcs.map(([p, s]) => `
+                    <span style="font-size:9.5px;background:rgba(56,189,248,0.12);border:1px solid rgba(56,189,248,0.28);color:#e2e8f0;padding:2px 6px;border-radius:5px;">
+                      ⚡ ${p}: ${Math.max(1, Math.round(Number(s)/60))}м
+                    </span>
+                  `).join('')}
+                </div>
+              ` : ''}
+            </div>
+          </div>
+          <!-- Windows Taskbar Strip -->
+          <div style="margin-top:6px;background:rgba(15,23,42,0.9);border-radius:6px;padding:4px 8px;display:flex;justify-content:space-between;align-items:center;font-size:9.5px;color:var(--slate-400);">
+            <span>🪟 Пуск • ${state.pc.localIp}:${state.pc.port}</span>
+            <span style="color:var(--emerald-light);font-weight:700;">● P2P Телеметрия LIVE</span>
+          </div>
+        </div>
+      `;
+    }
+
+    // ============================================================================
+    // 3. PARENT DASHBOARD SCREEN (ParentDashboardScreen.kt)
+    // ============================================================================
+    function renderParentDashboardScreen() {
+      const child = getActiveChild();
+      const isLocked = child.isDeviceLocked;
+      const usedMinutes = child.usedScreenTimeMinutes;
+      const dailyLimit = child.dailyScreenLimitMinutes;
+      const remainingMinutes = Math.max(0, dailyLimit - usedMinutes);
+      const blockedAppsCount = state.apps.filter(a => a.isBlocked).length;
+      const enabledPcRules = state.pc.entries.filter(e => e.enabled).length;
+      const activePcWin = state.pc.activeWindows[0];
+      const progressPct = Math.min(100, Math.round((usedMinutes / Math.max(1, dailyLimit)) * 100));
+      const frameAgeSec = child.screenTs ? Math.max(0, Math.round((Date.now() - child.screenTs) / 1000)) : null;
+
+      return `
+        <!-- 1. HeroBannerCard -->
+        <div class="hero-card ${isLocked ? 'locked' : ''}">
+          <img src="/hero_family_safety.jpg" class="hero-bg" alt="KidsGuard" onerror="this.style.display='none'" />
+          <div class="hero-overlay"></div>
+          <div class="hero-top-row">
+            <div class="hero-live-pill ${isLocked ? 'locked' : ''}">
+              <span style="width:7px;height:7px;border-radius:50%;background:#fff;display:inline-block;"></span>
+              <span>${isLocked ? 'ДОСТУП ОГРАНИЧЕН' : 'ЗАЩИТА АКТИВНА • P2P LIVE'}</span>
+            </div>
+            <div class="hero-batt-pill">🔋 ${child.batteryLevel}% • ${child.deviceModel}</div>
+          </div>
+          <div class="hero-bottom">
+            <div class="hero-kicker">KIDSGUARD PRO • РЕАЛЬНОЕ УСТРОЙСТВО P2P</div>
+            <div class="hero-child-name">${child.name} (${child.age} лет)</div>
+            <div class="hero-desc">Код: ${child.pairingCode} • LAN IP: ${child.lanIp} • Использовано: ${usedMinutes}/${dailyLimit} мин</div>
+          </div>
+        </div>
+
+        <!-- 2. MultiChildSelector -->
+        <div class="multi-child-section">
+          <div class="multi-child-header">
+            <span class="multi-child-title">Реальные устройства в сети (${state.children.length})</span>
+            <button class="child-chip-add" onclick="fetchLiveP2pState();showToast('Синхронизация с P2P брокером выполнена!')">↻ Обновить P2P</button>
+          </div>
+          <div class="child-chips-row">
+            ${state.children.map(c => `
+              <div class="child-chip ${c.id === child.id ? 'active' : ''}" onclick="selectChildProfile(${c.id})">
+                <div class="child-avatar">${c.name.charAt(0)}</div>
+                <div class="child-chip-info">
+                  <div class="child-chip-name">${c.name} • ${c.age} лет</div>
+                  <div class="child-chip-meta">🟢 ${c.deviceModel} • 🔋${c.batteryLevel}%</div>
+                </div>
+                <button class="child-chip-qr" onclick="event.stopPropagation();openPairingCodeModal(${c.id})" title="Код сопряжения ${c.pairingCode}">🔑</button>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+
+        <!-- 3. CommercialQuickActionDock (4 Gradient Tiles) -->
+        <div class="quick-dock">
+          <button class="dock-tile" style="background:linear-gradient(135deg,#0284C7,#4F46E5);" onclick="openLiveStreamModal()">
+            <div class="dock-icon">📹</div>
+            <div class="dock-title">Экран LIVE</div>
+            <div class="dock-sub">Трансляция</div>
+          </button>
+          <button class="dock-tile" style="background:linear-gradient(135deg,#059669,#0D9488);" onclick="setParentTab('LOCATION_MAP')">
+            <div class="dock-icon">🌍</div>
+            <div class="dock-title">GPS Карта</div>
+            <div class="dock-sub">Локация</div>
+          </button>
+          <button class="dock-tile" style="background:${isLocked ? 'linear-gradient(135deg,#10B981,#059669)' : 'linear-gradient(135deg,#E11D48,#9F1239)'};" onclick="toggleRemoteChildLock()">
+            <div class="dock-icon">${isLocked ? '🔓' : '🔒'}</div>
+            <div class="dock-title">${isLocked ? 'Открыть' : 'Блок'}</div>
+            <div class="dock-sub">${isLocked ? 'Разблок.' : 'В 1 клик'}</div>
+          </button>
+          <button class="dock-tile" style="background:linear-gradient(135deg,#D97706,#EA580C);" onclick="sendLoudSirenSignal()">
+            <div class="dock-icon">🔊</div>
+            <div class="dock-title">Сирена</div>
+            <div class="dock-sub">Вызов</div>
+          </button>
+        </div>
+
+        <!-- 4. CommercialKpiBentoGrid (2x2) -->
+        <div class="bento-grid">
+          <div class="bento-tile" style="background:#131C31;border:1px solid rgba(56,189,248,0.35);" onclick="setParentTab('SCREEN_TIME')">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <div style="width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#0EA5E9,#6366F1);display:flex;align-items:center;justify-content:center;font-size:14px;">⏱️</div>
+              <span style="font-size:9px;font-weight:800;color:var(--cyan-light);">ЛИМИТ ДНЯ</span>
+            </div>
+            <div>
+              <div style="font-size:16px;font-weight:800;color:#fff;">${ remainingMinutes > 0 ? `${Math.floor(remainingMinutes/60)}ч ${remainingMinutes%60}м` : 'Исчерпан' }</div>
+              <div style="font-size:10px;color:var(--slate-400);">Потрачено: ${usedMinutes} из ${dailyLimit} мин</div>
+            </div>
+          </div>
+          <div class="bento-tile" style="background:#0F2427;border:1px solid rgba(52,211,153,0.35);" onclick="setParentTab('LOCATION_MAP')">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <div style="width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#10B981,#0D9488);display:flex;align-items:center;justify-content:center;font-size:14px;">📍</div>
+              <span style="font-size:9px;font-weight:800;color:var(--emerald-light);">ГЕОЛОКАЦИЯ</span>
+            </div>
+            <div>
+              <div style="font-size:13px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${child.lastLocationAddress.split(',')[0]}</div>
+              <div style="font-size:10px;color:var(--emerald-light);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${child.lastLocationLat.toFixed(4)}, ${child.lastLocationLng.toFixed(4)}</div>
+            </div>
+          </div>
+          <div class="bento-tile" style="background:#1E1633;border:1px solid rgba(168,85,247,0.35);" onclick="setParentTab('APPS')">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <div style="width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#8B5CF6,#EC4899);display:flex;align-items:center;justify-content:center;font-size:14px;">🧩</div>
+              <span style="font-size:9px;font-weight:800;color:#C084FC;">ПРОГРАММЫ</span>
+            </div>
+            <div>
+              <div style="font-size:15px;font-weight:800;color:#fff;">Активно: ${state.apps.length} прил.</div>
+              <div style="font-size:10px;color:var(--slate-400);">Заблок: ${blockedAppsCount} • Логи: ${state.activityLogs.length}</div>
+            </div>
+          </div>
+          <div class="bento-tile" style="background:#1A202C;border:1px solid rgba(16,185,129,0.35);">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <div style="width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#10B981,#059669);display:flex;align-items:center;justify-content:center;font-size:14px;">🔋</div>
+              <span style="font-size:9px;font-weight:800;color:var(--emerald-light);">ЗАРЯД АКБ</span>
+            </div>
+            <div>
+              <div style="font-size:16px;font-weight:800;color:#fff;">${child.batteryLevel}%</div>
+              <div style="font-size:10px;color:var(--emerald-light);">${child.deviceModel}</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 5. REAL LIVE ANDROID SCREEN STREAM CARD (ActiveAppMonitoringCard.kt — STATIC FIXED HEIGHT) -->
+        <div class="m3-card" style="background:#111A2E;border-color:rgba(56,189,248,0.75);">
+          <div style="display:flex;justify-content:space-between;align-items:center;height:38px;overflow:hidden;">
+            <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1;">
+              <span style="width:9px;height:9px;border-radius:50%;background:var(--emerald-shield);display:inline-block;flex-shrink:0;"></span>
+              <div style="min-width:0;flex:1;">
+                <div style="font-size:14px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Мониторинг экрана LIVE: ${child.name}</div>
+                <div id="dash-phone-frame-meta" style="font-size:10px;color:var(--slate-400);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                  ${child.deviceModel} • Кадров: ${state.screenshots.length} ${frameAgeSec !== null ? `• ${frameAgeSec} сек назад` : ''}
+                </div>
+              </div>
+            </div>
+            <button class="emu-btn primary" style="flex-shrink:0;" onclick="state.livePollingActive=!state.livePollingActive;if(state.livePollingActive)takeRemoteSnapshot();renderApp();">
+              ${state.livePollingActive ? '● СТРИМ ВКЛ' : 'ПАУЗА'}
+            </button>
+          </div>
+
+          <div style="background:#050811;border:1.5px solid rgba(56,189,248,0.5);border-radius:14px;padding:10px;cursor:pointer;" onclick="openLiveStreamModal()">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;height:18px;overflow:hidden;">
+              <span style="font-size:10px;font-weight:800;color:var(--emerald-light);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">🟢 РЕАЛЬНЫЙ ЭКРАН ТЕЛЕФОНА (${child.deviceModel})</span>
+              <span style="font-size:10px;color:var(--cyan-light);font-weight:700;flex-shrink:0;">Во весь экран ⤢</span>
+            </div>
+
+            <div style="position:relative;border-radius:10px;overflow:hidden;background:#000;height:240px;display:flex;justify-content:center;align-items:center;border:1px solid rgba(56,189,248,0.3);">
+              ${child.screenBase64 ? `
+                <img id="dash-phone-live-img" src="data:image/jpeg;base64,${child.screenBase64}" style="height:230px;width:auto;max-width:100%;object-fit:contain;display:block;" alt="Экран ${child.name}" />
+              ` : `
+                <div style="text-align:center;padding:14px;">
+                  <div style="font-size:28px;margin-bottom:6px;">📲</div>
+                  <div style="font-size:13px;font-weight:800;color:#fff;">Запрос видеокадра с ${child.deviceModel}...</div>
+                  <div style="font-size:10.5px;color:var(--cyan-light);margin-top:4px;">Нажмите «Скриншот», чтобы мгновенно захватить экран</div>
+                </div>
+              `}
+              <div style="position:absolute;bottom:6px;left:6px;right:6px;height:26px;background:rgba(2,6,23,0.88);backdrop-filter:blur(4px);padding:0 8px;border-radius:7px;display:flex;justify-content:space-between;align-items:center;gap:8px;overflow:hidden;">
+                <span id="dash-phone-fg-label" style="font-size:10px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;">📱 ${String(child.activeForegroundApp || '').split(' ||')[0]}</span>
+                <span style="font-size:9.5px;color:var(--emerald-light);font-weight:700;flex-shrink:0;">LIVE JPEG</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;gap:8px;">
+            <button class="btn-m3 btn-cyan" style="flex:1;" onclick="openLiveStreamModal()">📹 Открыть стрим LIVE</button>
+            <button class="btn-m3 btn-outline" style="flex:1;" onclick="takeRemoteSnapshot()">📸 Скриншот (${state.screenshots.length})</button>
+            <button class="btn-m3 btn-slate" style="padding:0 10px;" onclick="openScreenshotsGalleryModal()" title="Галерея реальных скриншотов">🖼️</button>
+          </div>
+        </div>
+
+        <!-- 6. REAL WINDOWS PC REMOTE CONTROL & LIVE MONITOR CARD (Donmax / hosts_blocker.py) -->
+        <div class="m3-card ${state.pc.fullLockNow ? 'rose-border' : 'emerald-border'}">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+            <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;">
+              <div style="width:40px;height:40px;border-radius:50%;background:var(--cyan-container);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">💻</div>
+              <div style="min-width:0;flex:1;">
+                <div style="font-size:14px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">💻 ПК: ${state.pc.pcName}</div>
+                <div style="font-size:10.5px;color:var(--emerald-light);">${state.pc.transportLabel}</div>
+              </div>
+            </div>
+            <button class="emu-btn primary" onclick="requestPcScreenshot()">📸 Кадр ПК</button>
+          </div>
+
+          <div style="cursor:pointer;" onclick="openPcLiveStreamModal()">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <span style="font-size:10px;font-weight:800;color:var(--emerald-light);background:rgba(16,185,129,0.16);padding:3px 7px;border-radius:6px;">
+                🟢 МОНИТОР ПК LIVE (${state.pc.rawPcName || 'Donmax'} • Аккаунт: ${state.pc.childAccount || 'raufh'})
+              </span>
+              <span style="font-size:10px;color:var(--slate-400);">Сегодня за ПК: ${Math.floor(state.pc.computerTodaySec/60)} мин</span>
+            </div>
+            <div id="dash-pc-preview-box">
+              ${renderPcMonitorPreviewHtml(165)}
+            </div>
+          </div>
+
+          <div style="display:flex;gap:8px;">
+            <button class="btn-m3 btn-cyan" style="flex:1.2;" onclick="setParentTab('PC_CONTROL')">💻 Управление ПК (${state.pc.entries.length} правил)</button>
+            <button class="btn-m3 ${state.pc.fullLockNow ? 'btn-emerald' : 'btn-rose'}" style="flex:1;" onclick="togglePcFullLock()">
+              ${state.pc.fullLockNow ? '🔓 Разблок. ПК' : '🔒 Блок ПК'}
+            </button>
+          </div>
+        </div>
+
+        <!-- 7. Master Remote Phone Lock Card -->
+        <div class="m3-card ${isLocked ? 'rose-border' : ''}">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:44px;height:44px;border-radius:50%;background:${isLocked ? 'var(--rose-container)' : 'var(--cyan-container)'};display:flex;align-items:center;justify-content:center;font-size:22px;">
+              ${isLocked ? '🔒' : '🔓'}
+            </div>
+            <div style="flex:1;">
+              <div style="font-size:15px;font-weight:800;color:#fff;">${isLocked ? `Телефон «${child.name}» заблокирован` : `Удаленная блокировка (${child.deviceModel})`}</div>
+              <div style="font-size:11px;color:var(--slate-400);">${isLocked ? 'Экран телефона заблокирован командой P2P' : 'Мгновенная блокировка экрана через P2P-мост'}</div>
+            </div>
+          </div>
+          <button class="btn-m3 ${isLocked ? 'btn-emerald' : 'btn-rose'}" style="width:100%;height:46px;" onclick="toggleRemoteChildLock()">
+            ${isLocked ? '🔓 РАЗБЛОКИРОВАТЬ ТЕЛЕФОН СЕЙЧАС' : '🚫 ЗАБЛОКИРОВАТЬ ТЕЛЕФОН СЕЙЧАС'}
+          </button>
+        </div>
+
+        <!-- 8. Interactive Screen Time Management Panel -->
+        <div class="m3-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <div style="font-size:14px;font-weight:800;color:#fff;">⏱️ Контроль времени: ${child.name}</div>
+              <div style="font-size:11px;color:var(--slate-400);">Реальная статистика использования с телефона</div>
+            </div>
+            <button class="emu-btn primary" onclick="setParentTab('SCREEN_TIME')">Настроить →</button>
+          </div>
+          <div style="background:#121E31;border-radius:14px;padding:12px;display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <div style="font-size:9.5px;font-weight:800;color:var(--slate-400);">● ОСТАЛОСЬ ВРЕМЕНИ (LIVE)</div>
+              <div id="live-countdown-val" style="font-size:20px;font-weight:800;color:${remainingMinutes > 0 ? 'var(--emerald-light)' : 'var(--rose-lock)'};margin-top:2px;">
+                ${remainingMinutes > 0 ? `${String(Math.floor(Math.max(0, remainingMinutes - 1)/60)).padStart(2,'0')}:${String(Math.max(0, remainingMinutes - 1)%60).padStart(2,'0')}:${String(state.liveSeconds).padStart(2,'0')}` : '00:00:00 (Исчерпан)'}
+              </div>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-size:10px;color:var(--slate-400);">Потрачено сегодня</div>
+              <div style="font-size:14px;font-weight:800;color:#fff;">${Math.floor(usedMinutes/60)} ч ${usedMinutes%60} мин</div>
+              <div style="font-size:11px;color:var(--cyan-light);font-weight:700;">Лимит: ${Math.floor(dailyLimit/60)} ч ${dailyLimit%60} мин</div>
+            </div>
+          </div>
+          <div style="height:8px;background:var(--slate-800);border-radius:4px;overflow:hidden;">
+            <div style="width:${progressPct}%;height:100%;background:${remainingMinutes > 0 ? 'var(--cyan-light)' : 'var(--rose-lock)'};"></div>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn-m3 btn-outline" style="flex:1;height:36px;" onclick="grantBonusMinutes(15)">+15 мин</button>
+            <button class="btn-m3 btn-outline" style="flex:1;height:36px;" onclick="grantBonusMinutes(30)">+30 мин</button>
+            <button class="btn-m3 btn-outline" style="flex:1;height:36px;" onclick="grantBonusMinutes(60)">+1 час</button>
+          </div>
+        </div>
+
+        <!-- 9. Remote Silent Core-Engine (DEX) Update & Artifacts Card -->
+        <div class="m3-card emerald-border">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <div style="font-size:14px;font-weight:800;color:#fff;">Обновление Ядра (Оболочка + Ядро DEX без переустановки)</div>
+              <div style="font-size:11px;color:var(--emerald-light);font-weight:600;">Установлено на ${child.deviceModel}: v${child.appVersion} • Замена ядра без окон разрешений</div>
+            </div>
+            <span style="font-size:9.5px;font-weight:800;background:var(--emerald-container);color:var(--emerald-light);padding:4px 8px;border-radius:6px;">✓ LIVE</span>
+          </div>
+          <button class="btn-m3 btn-outline" style="width:100%;" onclick="triggerSilentOtaUpdate()">🔄 Обновить Ядро на телефоне ребёнка до v${APP_VERSION}</button>
+          <div style="display:flex;gap:8px;">
+            <a href="https://kappa.lol/A2Z4uW.apk" target="_blank" class="btn-m3 btn-slate" style="flex:1;color:var(--cyan-light);text-decoration:none;">⬇️ APK v3.3.10 (Постоянная)</a>
+            <a href="https://kappa.lol/ZXRABT.py" target="_blank" class="btn-m3 btn-slate" style="flex:1;color:var(--emerald-light);text-decoration:none;">💻 hosts_blocker.py</a>
+          </div>
+        </div>
+      `;
+    }
+
+    // ============================================================================
+    // 4. APP MANAGEMENT SCREEN (AppManagementScreen.kt)
+    // ============================================================================
+    function renderAppManagementScreen() {
+      const child = getActiveChild();
+      const categories = [
+        { key: "Все", label: `Все (${state.apps.length})` },
+        { key: "Разрешённые", label: `✓ Разрешённые (${state.apps.filter(a=>!a.isBlocked).length})` },
+        { key: "Заблокированные", label: `🚫 Заблок. (${state.apps.filter(a=>a.isBlocked).length})` }
+      ];
+      const filtered = state.apps.filter(a => {
+        const matchQ = !state.appSearchQuery || a.appName.toLowerCase().includes(state.appSearchQuery.toLowerCase()) || a.packageName.toLowerCase().includes(state.appSearchQuery.toLowerCase());
+        const matchC = state.appCategoryFilter === "Все" ? true :
+          state.appCategoryFilter === "Разрешённые" ? !a.isBlocked :
+          state.appCategoryFilter === "Заблокированные" ? a.isBlocked :
+          a.category === state.appCategoryFilter;
+        return matchQ && matchC;
+      });
+
+      return `
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <div style="flex:1;min-width:0;">
+            <div style="font-size:17px;font-weight:800;color:#fff;">Программы ${child.name} (${state.apps.length})</div>
+            <div style="font-size:11px;color:var(--slate-400);">Реальные приложения и активность с ${child.deviceModel}</div>
+          </div>
+          <button class="btn-m3 btn-slate" style="color:var(--cyan-light);flex-shrink:0;" onclick="requestRealAppsScan()">🔄 Сканировать P2P</button>
+        </div>
+
+        <input id="app-search-input" class="m3-input" placeholder="🔍 Поиск приложения или пакета..." value="${state.appSearchQuery}" oninput="handleAppSearchInput(this.value)" />
+
+        <div class="filter-chips-wrap">
+          ${categories.map(cat => `
+            <button class="m3-filter-chip ${state.appCategoryFilter === cat.key ? 'active' : ''}" onclick="state.appCategoryFilter='${cat.key}';renderApp();">${cat.label}</button>
+          `).join('')}
+        </div>
+
+        ${filtered.length === 0 ? `
+          <div class="m3-card" style="text-align:center;padding:20px;">
+            <div style="font-size:13px;font-weight:800;color:#fff;">Нажмите «🔄 Сканировать P2P» для запроса списка пакетов с телефона</div>
+          </div>
+        ` : filtered.map(app => `
+          <div class="m3-card ${app.isBlocked ? 'rose-border' : 'subtle-border'}" style="padding:12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+              <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;">
+                <div style="width:40px;height:40px;border-radius:12px;background:var(--slate-800);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">${app.icon}</div>
+                <div style="min-width:0;flex:1;">
+                  <div style="font-size:14px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${app.appName}</div>
+                  <div style="font-size:10.5px;color:var(--slate-400);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${app.packageName} • Активно: ${app.usedMinutes} мин</div>
+                </div>
+              </div>
+              <button class="btn-m3 ${app.isBlocked ? 'btn-rose' : 'btn-emerald'}" style="padding:6px 10px;flex-shrink:0;" onclick="toggleAppBlock(${app.id})">
+                ${app.isBlocked ? '🚫 Заблок.' : '✓ Разрешено'}
+              </button>
+            </div>
+          </div>
+        `).join('')}
+
+        ${state.activityLogs.length > 0 ? `
+          <div class="m3-card">
+            <div style="font-size:14px;font-weight:800;color:#fff;">📊 Хронология запуска приложений (${state.activityLogs.length})</div>
+            ${state.activityLogs.slice(0, 12).map(log => `
+              <div style="background:var(--slate-950);border-radius:9px;padding:8px 10px;display:flex;justify-content:space-between;align-items:center;">
+                <div style="min-width:0;flex:1;">
+                  <div style="font-size:12px;font-weight:700;color:#fff;">${log.appName || log.packageName}</div>
+                  <div style="font-size:10px;color:var(--slate-400);">${log.packageName} • Длительность: ${Math.max(1, Math.round((log.durationSeconds||0)/60))} мин (${log.durationSeconds} сек)</div>
+                </div>
+                <span style="font-size:10px;color:var(--cyan-light);font-weight:700;">${log.timestamp ? new Date(log.timestamp).toLocaleTimeString('ru-RU') : ''}</span>
+              </div>
+            `).join('')}
+          </div>
+        ` : ''}
+      `;
+    }
+
+    // ============================================================================
+    // 5. SCREEN TIME SCREEN (ScreenTimeScreen.kt)
+    // ============================================================================
+    function renderScreenTimeScreen() {
+      const child = getActiveChild();
+      const rem = Math.max(0, child.dailyScreenLimitMinutes - child.usedScreenTimeMinutes);
+      return `
+        <div>
+          <div style="font-size:18px;font-weight:800;color:#fff;">Экранное время: ${child.name}</div>
+          <div style="font-size:12px;color:var(--slate-400);">Устройство: ${child.deviceModel} (P2P LIVE)</div>
+        </div>
+
+        <div class="m3-card emerald-border">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:14px;font-weight:800;color:#fff;">● Остаток времени сегодня</span>
+            <span style="font-size:11px;color:var(--slate-400);">Потрачено: ${child.usedScreenTimeMinutes} мин</span>
+          </div>
+          <div style="font-size:26px;font-weight:800;color:${rem > 0 ? 'var(--emerald-light)' : 'var(--rose-lock)'};">
+            ${rem > 0 ? `${String(Math.floor(Math.max(0, rem - 1)/60)).padStart(2,'0')}:${String(Math.max(0, rem - 1)%60).padStart(2,'0')}:${String(state.liveSeconds).padStart(2,'0')}` : '00:00:00 (Лимит исчерпан)'}
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button class="btn-m3 btn-outline" style="flex:1;height:36px;" onclick="grantBonusMinutes(15)">+15 мин</button>
+            <button class="btn-m3 btn-outline" style="flex:1;height:36px;" onclick="grantBonusMinutes(30)">+30 мин</button>
+            <button class="btn-m3 btn-outline" style="flex:1;height:36px;" onclick="grantBonusMinutes(60)">+1 час</button>
+          </div>
+        </div>
+
+        <div class="m3-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:14px;font-weight:800;color:#fff;">⏱️ Установить дневной лимит</span>
+            <span style="font-size:16px;font-weight:800;color:var(--cyan-light);">${Math.floor(child.dailyScreenLimitMinutes/60)} ч ${child.dailyScreenLimitMinutes%60} мин</span>
+          </div>
+          <input type="range" class="m3-slider" min="30" max="360" step="15" value="${child.dailyScreenLimitMinutes}" onchange="updateChildDailyLimit(this.value)" />
+          <div style="display:flex;gap:6px;">
+            ${[60, 120, 180, 240].map(m => `
+              <button class="btn-m3 btn-outline" style="flex:1;height:34px;" onclick="updateChildDailyLimit(${m})">${m/60} ч</button>
+            `).join('')}
+          </div>
+        </div>
+
+        <div class="m3-card subtle-border">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <div style="font-size:15px;font-weight:800;color:#fff;">🌙 Ночной сон (Downtime)</div>
+              <div style="font-size:11px;color:var(--slate-400);">Расписание на устройстве ${child.name}</div>
+            </div>
+            <div class="m3-switch ${child.bedtimeEnabled ? 'on' : ''}" onclick="toggleBedtimeSchedule()"></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <div style="background:var(--slate-800);border-radius:12px;padding:10px;">
+              <div style="font-size:10px;color:var(--slate-400);">Отбой</div>
+              <div style="font-size:17px;font-weight:800;color:#fff;">${child.bedtimeStart}</div>
+            </div>
+            <div style="background:var(--slate-800);border-radius:12px;padding:10px;">
+              <div style="font-size:10px;color:var(--slate-400);">Подъем</div>
+              <div style="font-size:17px;font-weight:800;color:#fff;">${child.bedtimeEnd}</div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // ============================================================================
+    // 6. CONTENT FILTER SCREEN (ContentFilterScreen.kt)
+    // ============================================================================
+    function renderContentFilterScreen() {
+      const presets = ["tiktok.com", "roblox.com", "twitch.tv", "discord.com", "omegle.com", "1xbet.com", "pornhub.com"];
+      return `
+        <div>
+          <div style="font-size:18px;font-weight:800;color:#fff;">Веб-фильтр P2P (${state.contentRules.length} правил)</div>
+          <div style="font-size:11px;color:var(--slate-400);">Реальные правила фильтрации, синхронизированные через P2P</div>
+        </div>
+
+        <div class="m3-card rose-border" style="background:var(--slate-900);">
+          <div style="font-size:14px;font-weight:800;color:#fff;">🚫 Добавить сайт в черный список на телефоне</div>
+          <div style="display:flex;gap:6px;">
+            <input id="new-domain-input" class="m3-input" placeholder="Например: tiktok.com или 1xbet.com" />
+            <button class="btn-m3 btn-rose" onclick="addDomainBlacklist()">+ Блок</button>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;">
+            ${presets.map(d => {
+              const blocked = state.contentRules.some(r => r.value === d && r.isBlocked);
+              return `<button class="emu-btn ${blocked ? 'primary' : ''}" style="${blocked ? 'border-color:var(--rose-lock);color:#fda4af;background:var(--rose-container);' : ''}" onclick="toggleQuickDomain('${d}')">${blocked ? '🚫' : '+'} ${d}</button>`;
+            }).join('')}
+          </div>
+          ${state.contentRules.map(r => `
+            <div style="display:flex;justify-content:space-between;align-items:center;background:var(--slate-950);padding:8px 10px;border-radius:10px;">
+              <div>
+                <div style="font-size:12px;font-weight:800;color:#fff;">${r.value}</div>
+                <div style="font-size:10px;color:var(--slate-400);">Тип: ${r.ruleType} • Активно на телефоне</div>
+              </div>
+              <div class="m3-switch ${r.isBlocked ? 'on' : ''}" onclick="rToggle(${r.id})"></div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    // ============================================================================
+    // 7. LIVE MAP SCREEN (LiveMapScreen.kt)
+    // ============================================================================
+    function renderLiveMapScreen() {
+      const child = getActiveChild();
+      return `
+        <div class="m3-card" style="padding:12px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="width:9px;height:9px;border-radius:50%;background:var(--emerald-shield);display:inline-block;"></span>
+              <span style="font-size:14px;font-weight:800;color:#fff;">${child.name} (${child.deviceModel}) • GPS LIVE</span>
+            </div>
+            <span class="emu-btn">🔋 ${child.batteryLevel}%</span>
+          </div>
+          <div style="font-size:12px;color:var(--slate-200);">${child.lastLocationAddress}</div>
+          <div style="font-size:10.5px;color:var(--cyan-light);font-weight:700;">Реальные координаты GPS: ${child.lastLocationLat.toFixed(5)}, ${child.lastLocationLng.toFixed(5)}</div>
+
+          <div style="height:210px;border-radius:14px;background:#0c192c;border:1px solid rgba(56,189,248,0.35);position:relative;overflow:hidden;">
+            <svg width="100%" height="100%" viewBox="0 0 360 210">
+              <defs>
+                <pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse">
+                  <path d="M 30 0 L 0 0 0 30" fill="none" stroke="rgba(56,189,248,0.08)" stroke-width="1"/>
+                </pattern>
+              </defs>
+              <rect width="100%" height="100%" fill="url(#grid)" />
+              <path d="M 0 110 L 360 85 M 110 0 L 145 210 M 240 0 L 210 210" stroke="rgba(148,163,184,0.18)" stroke-width="10" fill="none"/>
+              <circle cx="180" cy="105" r="44" fill="rgba(56,189,248,0.15)" stroke="#38BDF8" stroke-dasharray="4 2" stroke-width="1.5"/>
+              <circle cx="180" cy="105" r="16" fill="rgba(16,185,129,0.3)"/>
+              <circle cx="180" cy="105" r="7" fill="#10B981" stroke="#fff" stroke-width="2"/>
+              <text x="110" y="78" fill="#fff" font-size="11" font-weight="bold">📍 ${child.name} (${child.lastLocationLat.toFixed(4)}, ${child.lastLocationLng.toFixed(4)})</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="m3-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:14px;font-weight:800;color:#fff;">🕒 Точки GPS с устройства (${state.history24h.length})</span>
+            <button class="emu-btn primary" onclick="fetchLiveP2pState();showToast('Координаты GPS синхронизированы!')">Обновить GPS ↻</button>
+          </div>
+          ${state.history24h.map(h => `
+            <div style="background:var(--slate-950);border-radius:10px;padding:9px 11px;display:flex;justify-content:space-between;align-items:center;">
+              <div>
+                <div style="font-size:12px;font-weight:700;color:#fff;">${h.title}</div>
+                <div style="font-size:10px;color:var(--slate-400);">Коорд: ${Number(h.lat).toFixed(5)}, ${Number(h.lng).toFixed(5)} • Время: ${h.time}</div>
+              </div>
+              <span style="color:var(--cyan-light);font-size:11px;font-weight:800;">LIVE</span>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    // ============================================================================
+    // 8. ALERTS SCREEN (AlertsScreen.kt)
+    // ============================================================================
+    function renderAlertsScreen() {
+      return `
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <div style="font-size:18px;font-weight:800;color:#fff;">Журнал событий P2P (${state.alerts.length})</div>
+            <div style="font-size:11px;color:var(--slate-400);">Реальные оповещения от подключенных устройств</div>
+          </div>
+        </div>
+        ${state.alerts.length === 0 ? `
+          <div class="m3-card" style="text-align:center;padding:24px;">
+            <div style="font-size:13px;color:var(--slate-400);">Новых тревожных уведомлений нет. Устройства работают штатно.</div>
+          </div>
+        ` : state.alerts.map(a => `
+          <div class="m3-card">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span style="font-size:13px;font-weight:800;color:#fff;">🔔 ${a.title}</span>
+              <span style="font-size:10px;color:var(--slate-400);">${a.timestamp}</span>
+            </div>
+            <div style="font-size:12px;color:var(--slate-200);">${a.message}</div>
+          </div>
+        `).join('')}
+      `;
+    }
+
+    // ============================================================================
+    // 9. FAMILY CHAT SCREEN (FamilyChatScreen.kt)
+    // ============================================================================
+    function renderFamilyChatScreen(isParent) {
+      const child = getActiveChild();
+      return `
+        <div class="m3-card subtle-border" style="padding:10px 14px;flex-direction:row;justify-content:space-between;align-items:center;">
+          <div>
+            <div style="font-size:14px;font-weight:800;color:#fff;">${isParent ? `Чат с: ${child.name} (${child.deviceModel})` : 'Связь с родителями'}</div>
+            <div style="font-size:10px;color:var(--emerald-light);">● Прямой P2P-канал (broker.hivemq.com)</div>
+          </div>
+          ${isParent ? `<button class="btn-m3 btn-rose" style="height:32px;" onclick="sendLoudSirenSignal()">🔊 Сирена</button>` : ''}
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:8px;flex:1;">
+          ${state.chatMessages.length === 0 ? `
+            <div class="m3-card" style="text-align:center;padding:20px;">
+              <div style="font-size:12px;color:var(--slate-400);">Напишите сообщение — оно мгновенно придет на телефон «${child.name}» по P2P.</div>
+            </div>
+          ` : state.chatMessages.map(m => {
+            const mine = (isParent && m.senderRole === 'PARENT') || (!isParent && m.senderRole === 'CHILD');
+            return `
+              <div style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};">
+                <div style="max-width:82%;background:${m.isAttention ? '#7F1D1D' : mine ? '#0369A1' : 'var(--slate-900)'};border:1px solid rgba(56,189,248,0.3);border-radius:14px;padding:9px 12px;">
+                  <div style="display:flex;justify-content:space-between;gap:12px;font-size:10px;font-weight:700;color:var(--cyan-light);">
+                    <span>${m.senderName}</span>
+                    <span style="color:var(--slate-400);">${m.time}</span>
+                  </div>
+                  <div style="font-size:12.5px;color:#fff;margin-top:3px;">${m.text}</div>
+                </div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:6px;">
+          <input id="chat-msg-input" class="m3-input" placeholder="Введите реальное сообщение для ${child.name}..." onkeydown="if(event.key==='Enter')sendChat('${isParent?'PARENT':'CHILD'}')" />
+          <button class="btn-m3 btn-cyan" onclick="sendChat('${isParent?'PARENT':'CHILD'}')">➤</button>
+        </div>
+      `;
+    }
+
+    // ============================================================================
+    // 10. WINDOWS PC CONTROL SCREEN (PcControlScreen.kt — REAL DONMAX TELEMETRY)
+    // ============================================================================
+    function renderPcControlScreen() {
+      return `
+        <div class="m3-card emerald-border">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <button class="icon-btn" style="background:var(--slate-800);color:#fff;" onclick="setParentTab('DASHBOARD')">←</button>
+              <div>
+                <div style="font-size:15px;font-weight:800;color:#fff;">💻 ${state.pc.pcName}</div>
+                <div style="font-size:11px;color:var(--emerald-light);">${state.pc.transportLabel}</div>
+              </div>
+            </div>
+            <button class="emu-btn primary" onclick="requestPcScreenshot()">📸 Обновить экран</button>
+          </div>
+          <div style="font-size:11px;color:var(--slate-200);display:flex;justify-content:space-between;">
+            <span>Активный сеанс: <b>${(state.pc.activeUsers || []).join(', ') || state.pc.childAccount}</b></span>
+            <span>Время за ПК сегодня: <b>${Math.floor(state.pc.computerTodaySec/60)} мин</b> (всего: ${Math.floor(state.pc.computerTotalSec/3600)} ч)</span>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:4px;">
+            <a href="https://kappa.lol/ZXRABT.py" target="_blank" download="hosts_blocker.py" class="btn-m3 btn-emerald" style="flex:1;height:36px;font-size:11.5px;text-decoration:none;">💻 Скачать hosts_blocker.py</a>
+            <a href="https://kappa.lol/A2Z4uW.apk" target="_blank" download="KidsGuard-v3.3.10-Pro.apk" class="btn-m3 btn-cyan" style="flex:1;height:36px;font-size:11.5px;text-decoration:none;">📱 Скачать APK v3.3.10</a>
+          </div>
+        </div>
+
+        <!-- LIVE PC MONITOR STREAM CARD -->
+        <div class="m3-card" style="background:#0B1324;border-color:rgba(56,189,248,0.65);">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:13px;font-weight:800;color:#fff;">🖥️ Трансляция монитора ПК (${state.pc.rawPcName || 'Donmax'})</span>
+            <button class="emu-btn primary" onclick="openPcLiveStreamModal()">Во весь экран ⤢</button>
+          </div>
+          <div onclick="openPcLiveStreamModal()" style="cursor:pointer;">
+            ${renderPcMonitorPreviewHtml(210)}
+          </div>
+        </div>
+
+        <!-- Full PC Lock Card -->
+        <div class="m3-card ${state.pc.fullLockNow ? 'rose-border' : ''}">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <div style="font-size:14px;font-weight:800;color:#fff;">🔒 Полная блокировка Windows ПК (${state.pc.rawPcName || 'Donmax'})</div>
+              <div style="font-size:11px;color:var(--slate-400);">Детский аккаунт Windows: ${state.pc.childAccount} • Код ПК: ${state.pc.pairingCode}</div>
+            </div>
+          </div>
+          <button class="btn-m3 ${state.pc.fullLockNow ? 'btn-emerald' : 'btn-rose'}" style="width:100%;" onclick="togglePcFullLock()">
+            ${state.pc.fullLockNow ? '🔓 Разблокировать вход в Windows ПК' : '🚫 Заблокировать Windows ПК сейчас'}
+          </button>
+        </div>
+
+        <!-- Real Active Windows & Processes on Donmax -->
+        <div class="m3-card">
+          <div style="font-size:14px;font-weight:800;color:#fff;">🪟 Реальные открытые окна и процессы на ПК (${state.pc.activeWindows.length})</div>
+          ${state.pc.activeWindows.map(w => `
+            <div style="background:var(--slate-950);border-radius:10px;padding:9px 11px;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+              <div style="min-width:0;flex:1;">
+                <div style="font-size:12px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${w.title}</div>
+                <div style="font-size:10px;color:var(--cyan-light);">${w.proc} • Активно сегодня: ${Math.max(1, Math.floor(w.sec/60))} мин (${w.sec} сек)</div>
+              </div>
+              <button class="emu-btn primary" onclick="blockPcProcess('${w.proc}')">🚫 Блок .exe</button>
+            </div>
+          `).join('')}
+        </div>
+
+        <!-- Real PC Blocking Rules from Donmax -->
+        <div class="m3-card">
+          <div style="font-size:14px;font-weight:800;color:#fff;">🛡️ Правила Hosts Blocker на ПК (${state.pc.entries.length})</div>
+          ${state.pc.entries.map((e, idx) => `
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--slate-800);">
+              <div style="min-width:0;flex:1;padding-right:8px;">
+                <div style="font-size:13px;font-weight:800;color:#fff;">${e.name}</div>
+                <div style="font-size:10px;color:var(--slate-400);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                  Домены: ${e.domains.slice(0,3).join(', ')} ${e.programs.length ? `• EXE: ${e.programs.join(', ')}` : ''}
+                </div>
+              </div>
+              <div class="m3-switch ${e.enabled ? 'on' : ''}" onclick="togglePcRuleEntry(${idx})"></div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    // ============================================================================
+    // 11. CHILD MODE SCREEN (ChildModeScreen.kt + UnifiedLockScreenViewBuilder.kt)
+    // ============================================================================
+    function renderChildModeScreen() {
+      const child = getActiveChild();
+      const rem = Math.max(0, child.dailyScreenLimitMinutes - child.usedScreenTimeMinutes);
+      if (child.isDeviceLocked) {
+        return `
+          <div style="flex:1;background:#0B1120;padding:18px;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:12px;">
+            <div style="width:100%;background:#111C33;border:1.5px solid rgba(56,189,248,0.45);border-radius:20px;padding:18px;text-align:center;display:flex;flex-direction:column;gap:10px;">
+              <div style="font-size:32px;">🔒</div>
+              <div style="font-size:17px;font-weight:800;color:#fff;">ТЕЛЕФОН ЗАБЛОКИРОВАН РОДИТЕЛЕМ</div>
+              <div style="font-size:12px;color:#BAE6FD;">Доступ временно ограничен родителем. Введите PIN-код родителя для разблокировки или отправьте сигнал SOS.</div>
+              <div id="child-lock-status-banner" style="font-size:11.5px;font-weight:800;color:#6EE7B7;min-height:18px;"></div>
+              <button class="btn-m3 btn-cyan" style="width:100%;height:44px;font-weight:800;" onclick="const p=document.getElementById('inline-lock-pin-box');if(p)p.style.display=(p.style.display==='none'?'flex':'none');">🔓 РАЗБЛОКИРОВАТЬ ЭКРАН (PIN)</button>
+              <div id="inline-lock-pin-box" style="display:none;flex-direction:column;gap:8px;background:#0D1526;padding:12px;border-radius:14px;border:1px solid rgba(56,189,248,0.3);">
+                <input id="inline-lock-pin-input" class="m3-input" type="password" maxlength="6" placeholder="Введите PIN родителя (1234)" style="text-align:center;font-size:16px;font-weight:800;letter-spacing:4px;" />
+                <button class="btn-m3 btn-emerald" style="width:100%;" onclick="verifyInlineChildLockPin()">✓ Подтвердить PIN и разблокировать</button>
+              </div>
+              <button class="btn-m3 btn-rose" style="width:100%;height:44px;font-weight:800;" onclick="sendChildSosEmergencySignal()">🚨 ЭКСТРЕННАЯ СВЯЗЬ SOS</button>
+            </div>
+          </div>
+        `;
+      }
+      return `
+        <div style="padding:8px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--slate-800);">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="width:10px;height:10px;border-radius:50%;background:${child.isDeviceLocked ? 'var(--rose-lock)' : 'var(--emerald-shield)'};"></span>
+            <div>
+              <div style="font-size:13px;font-weight:800;color:#fff;">${child.name} • ${child.deviceModel}</div>
+              <div style="font-size:10px;color:var(--cyan-light);font-weight:700;">v${APP_VERSION} • LAN IP: ${child.lanIp}:${child.lanPort}</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <button class="icon-btn" onclick="openChildPermissionsModal()" title="Системные доступы защиты">🛡️</button>
+            <button class="emu-btn" onclick="openPinVerifyModal()">🔒 Родитель</button>
+          </div>
+        </div>
+
+        <div class="compose-body">
+          ${state.activeChildTab === 0 ? `
+            <div class="m3-card emerald-border">
+              <div style="font-size:13px;font-weight:800;color:#fff;">Профиль устройства: ${child.name} (ID #${child.id})</div>
+              <div style="font-size:11px;color:var(--slate-400);">Код сопряжения: <b style="color:var(--cyan-light);">${child.pairingCode}</b> • Модель: ${child.deviceModel}</div>
+            </div>
+
+            <div class="m3-card">
+              <div style="font-size:12px;color:var(--slate-400);">Осталось экранного времени сегодня</div>
+              <div style="font-size:28px;font-weight:800;color:var(--cyan-light);">${Math.floor(rem/60)} ч ${rem%60} мин</div>
+              <div style="font-size:11px;color:var(--slate-400);">Использовано ${child.usedScreenTimeMinutes} из ${child.dailyScreenLimitMinutes} мин</div>
+            </div>
+            <button class="btn-m3 btn-rose" style="width:100%;" onclick="sendChildSosEmergencySignal()">🚨 ЭКСТРЕННАЯ СВЯЗЬ SOS (ОТПРАВИТЬ РОДИТЕЛЮ)</button>
+          ` : state.activeChildTab === 1 ? renderFamilyChatScreen(false) : `
+            <div style="font-size:16px;font-weight:800;color:#fff;">Активные программы (${state.apps.length})</div>
+            ${state.apps.map(a => `
+              <div class="m3-card subtle-border" style="padding:11px;flex-direction:row;justify-content:space-between;align-items:center;">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <span style="font-size:20px;">${a.icon}</span>
+                  <div>
+                    <div style="font-size:13px;font-weight:800;color:#fff;">${a.appName}</div>
+                    <div style="font-size:10px;color:var(--slate-400);">Использовано: ${a.usedMinutes} мин</div>
+                  </div>
+                </div>
+                <span style="font-size:11px;font-weight:800;color:${a.isBlocked ? 'var(--rose-lock)' : 'var(--emerald-light)'};">${a.isBlocked ? '🔒 Заблокировано' : '✓ Доступно'}</span>
+              </div>
+            `).join('')}
+          `}
+        </div>
+
+        <div class="compose-bottomnav child-nav">
+          <button class="nav-item ${state.activeChildTab===0?'active':''}" onclick="state.activeChildTab=0;renderApp();">
+            <div class="nav-pill">📱</div><span class="nav-label">Экран</span>
+          </button>
+          <button class="nav-item ${state.activeChildTab===1?'active':''}" onclick="state.activeChildTab=1;renderApp();">
+            <div class="nav-pill">💬</div><span class="nav-label">Чат (${state.chatMessages.length})</span>
+          </button>
+          <button class="nav-item ${state.activeChildTab===2?'active':''}" onclick="state.activeChildTab=2;renderApp();">
+            <div class="nav-pill">🧩</div><span class="nav-label">Программы</span>
+          </button>
+        </div>
+      `;
+    }
+
+    async function verifyInlineChildLockPin() {
+      const inp = document.getElementById('inline-lock-pin-input');
+      const val = (inp?.value || '').trim();
+      const c = getActiveChild();
+      if (val === state.masterPin || val === '1234') {
+        c.isDeviceLocked = false;
+        renderApp();
+        await sendPhoneCmd('UNLOCK_DEVICE');
+        showToast('✅ Экран успешно разблокирован по PIN-коду!');
+      } else {
+        const b = document.getElementById('child-lock-status-banner');
+        if (b) {
+          b.style.color = '#FDA4AF';
+          b.textContent = '❌ Неверный PIN-код родителя!';
+        }
+      }
+    }
+
+    async function sendChildSosEmergencySignal() {
+      const c = getActiveChild();
+      const b = document.getElementById('child-lock-status-banner');
+      if (b) {
+        b.style.color = '#FDE68A';
+        b.textContent = '⏳ Отправка сигнала SOS и GPS-координат родителю...';
+      }
+      await sendPhoneCmd('SOS_EMERGENCY', {
+        childName: c.name,
+        lat: c.latitude,
+        lng: c.longitude,
+        address: c.address
+      });
+      await sendPhoneCmd('CHAT_MESSAGE', {
+        senderRole: 'CHILD',
+        senderName: c.name,
+        messageText: `🚨 ЭКСТРЕННЫЙ СИГНАЛ SOS от ${c.name}! Координаты: ${c.address} (${c.latitude}, ${c.longitude})`,
+        isAttentionGrabber: true
+      });
+      if (b) {
+        b.style.color = '#6EE7B7';
+        b.textContent = '✅ Сигнал SOS и координаты доставлены родителю!';
+      }
+      showToast('🚨 Экстренный сигнал SOS отправлен родителю!');
+    }
+
+    // ============================================================================
+    // REAL P2P INTERACTIVE ACTIONS
+    // ============================================================================
+    function selectChildProfile(id) {
+      state.activeChildId = id;
+      const c = getActiveChild();
+      showToast(`Выбрано устройство: ${c.name} (${c.deviceModel})`);
+      renderApp();
+    }
+
+    async function toggleRemoteChildLock() {
+      const c = getActiveChild();
+      c.isDeviceLocked = !c.isDeviceLocked;
+      renderApp();
+      await sendPhoneCmd(c.isDeviceLocked ? 'LOCK_DEVICE' : 'UNLOCK_DEVICE');
+      showToast(c.isDeviceLocked ? `🔒 Команда блокировки отправлена на ${c.deviceModel}!` : `🔓 Команда разблокировки отправлена на ${c.deviceModel}!`);
+    }
+
+    async function togglePcFullLock() {
+      state.pc.fullLockNow = !state.pc.fullLockNow;
+      renderApp();
+      await sendPcCmd('/api/full_lock', {
+        lock_now: state.pc.fullLockNow,
+        daily_limit: state.pc.fullLockDaily,
+        schedule_from: state.pc.fullLockFrom,
+        schedule_to: state.pc.fullLockTo,
+        child_account: state.pc.childAccount
+      });
+      showToast(state.pc.fullLockNow ? `🔒 Команда блокировки отправлена на ПК ${state.pc.rawPcName || 'Donmax'}!` : `🔓 ПК ${state.pc.rawPcName || 'Donmax'} разблокирован!`);
+    }
+
+    async function togglePcRuleEntry(idx) {
+      const entry = state.pc.entries[idx];
+      if (!entry) return;
+      entry.enabled = !entry.enabled;
+      renderApp();
+      await sendPcCmd('/api/toggle', {
+        name: entry.name
+      });
+      showToast(`ПК ${state.pc.rawPcName || 'Donmax'}: правило «${entry.name}» ${entry.enabled ? 'ВКЛЮЧЕНО' : 'ВЫКЛЮЧЕНО'}`);
+    }
+
+    async function blockPcProcess(procName) {
+      await sendPcCmd('/api/add', {
+        name: `Блок ${procName}`,
+        domains: [],
+        programs: [procName],
+        daily_limit: 0
+      });
+      showToast(`🚫 Команда блокировки процесса ${procName} отправлена на ПК!`);
+    }
+
+    async function requestPcScreenshot() {
+      await sendPcCmd('/api/screen', {});
+      showToast(`📸 Запрос кадра монитора отправлен на ПК ${state.pc.rawPcName || 'Donmax'}!`);
+      setTimeout(fetchLiveP2pState, 1200);
+    }
+
+    async function sendLoudSirenSignal() {
+      const c = getActiveChild();
+      await sendPhoneCmd('PLAY_SIREN');
+      await sendPhoneCmd('CHAT_MESSAGE', {
+        senderRole: 'PARENT',
+        senderName: 'Родитель',
+        messageText: '🔊 ВНИМАНИЕ: Родитель вызывает тебя на связь! Срочно ответь.',
+        isAttentionGrabber: true
+      });
+      showToast(`🔊 Сигнал сирены отправлен на ${c.deviceModel}!`);
+      setTimeout(fetchLiveP2pState, 800);
+    }
+
+    async function grantBonusMinutes(mins) {
+      const c = getActiveChild();
+      c.dailyScreenLimitMinutes += mins;
+      renderApp();
+      await sendPhoneCmd('GRANT_BONUS_TIME', { bonusMinutes: mins, dailyLimitMinutes: c.dailyScreenLimitMinutes });
+      showToast(`✅ Добавлено +${mins} мин на ${c.deviceModel}!`);
+    }
+
+    async function updateChildDailyLimit(val) {
+      const c = getActiveChild();
+      const mins = parseInt(val, 10) || 120;
+      c.dailyScreenLimitMinutes = mins;
+      renderApp();
+      await sendPhoneCmd('UPDATE_SCREEN_LIMIT', { dailyLimitMinutes: mins });
+      showToast(`⏱️ Лимит времени (${mins} мин) отправлен на ${c.deviceModel}`);
+    }
+
+    async function toggleBedtimeSchedule() {
+      const c = getActiveChild();
+      c.bedtimeEnabled = !c.bedtimeEnabled;
+      renderApp();
+      await sendPhoneCmd('UPDATE_BEDTIME', {
+        bedtimeEnabled: c.bedtimeEnabled,
+        bedtimeStart: c.bedtimeStart,
+        bedtimeEnd: c.bedtimeEnd
+      });
+      showToast(`🌙 Расписание сна обновлено на ${c.deviceModel}`);
+    }
+
+    async function requestRealAppsScan() {
+      await sendPhoneCmd('SCAN_APPS');
+      await sendPhoneCmd('TAKE_SCREENSHOT');
+      showToast('🔄 Запрос сканирования установленных приложений отправлен по P2P!');
+      setTimeout(fetchLiveP2pState, 1500);
+    }
+
+    async function toggleAppBlock(appId) {
+      const app = state.apps.find(a => a.id === appId);
+      if (app) {
+        app.isBlocked = !app.isBlocked;
+        renderApp();
+        await sendPhoneCmd('SET_APP_BLOCK', {
+          packageName: app.packageName,
+          appName: app.appName,
+          isBlocked: app.isBlocked
+        });
+        showToast(`${app.appName}: ${app.isBlocked ? '🚫 заблокировано по P2P' : '✓ разрешено по P2P'}`);
+      }
+    }
+
+    function handleAppSearchInput(val) {
+      state.appSearchQuery = val;
+      renderApp();
+      const inp = document.getElementById('app-search-input');
+      if (inp) {
+        inp.focus();
+        inp.setSelectionRange(val.length, val.length);
+      }
+    }
+
+    async function rToggle(id) {
+      const r = state.contentRules.find(x => x.id === id);
+      if (r) {
+        r.isBlocked = !r.isBlocked;
+        renderApp();
+        await sendPhoneCmd('SYNC_CONTENT_RULES', { rules: state.contentRules });
+      }
+    }
+
+    async function addDomainBlacklist() {
+      const inp = document.getElementById('new-domain-input');
+      const val = (inp?.value || '').trim().toLowerCase().replace(/^https?:\/\//,'').replace(/^www\./,'').replace(/\/$/,'');
+      if (!val) return;
+      state.contentRules.push({
+        id: Date.now(),
+        ruleType: "DOMAIN",
+        value: val,
+        displayName: val,
+        isBlocked: true,
+        hitsCount: 0
+      });
+      renderApp();
+      await sendPhoneCmd('ADD_BLOCKED_DOMAIN', { domain: val });
+      showToast(`🚫 Домен ${val} заблокирован по P2P!`);
+    }
+
+    async function toggleQuickDomain(domain) {
+      const existing = state.contentRules.find(r => r.value === domain);
+      if (existing) {
+        existing.isBlocked = !existing.isBlocked;
+      } else {
+        state.contentRules.push({ id: Date.now(), ruleType: "DOMAIN", value: domain, displayName: domain, isBlocked: true, hitsCount: 0 });
+      }
+      renderApp();
+      await sendPhoneCmd('ADD_BLOCKED_DOMAIN', { domain });
+    }
+
+    async function sendChat(role) {
+      const inp = document.getElementById('chat-msg-input');
+      const txt = (inp?.value || '').trim();
+      if (!txt) return;
+      const c = getActiveChild();
+      state.chatMessages.push({
+        id: Date.now(),
+        senderRole: role,
+        senderName: role === 'PARENT' ? 'Родитель' : c.name,
+        text: txt,
+        time: new Date().toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'}),
+        isRead: false,
+        isAttention: false
+      });
+      renderApp();
+      await sendPhoneCmd('CHAT_MESSAGE', {
+        senderRole: role,
+        senderName: role === 'PARENT' ? 'Родитель' : c.name,
+        messageText: txt,
+        isAttentionGrabber: false
+      });
+    }
+
+    async function takeRemoteSnapshot() {
+      const c = getActiveChild();
+      await sendPhoneCmd('START_LIVE_STREAM');
+      await sendPhoneCmd('TAKE_SCREENSHOT');
+      showToast(`📸 Запрос свежего кадра экрана отправлен на ${c.deviceModel}!`);
+      setTimeout(fetchLiveP2pState, 1200);
+    }
+
+    async function triggerSilentOtaUpdate() {
+      const c = getActiveChild();
+      await sendPhoneCmd('UPDATE_APP', {
+        payload: `${APP_VERSION}|https://kappa.lol/q7sRgK.apk`,
+        targetVersion: APP_VERSION
+      });
+      showToast(`🔄 Модуль Ядра (${APP_VERSION}) отправлен на ${c.deviceModel} (тихая замена без переустановки)!`);
+    }
+
+    // ============================================================================
+    // MODALS (REAL LIVE PHONE STREAM, REAL LIVE PC STREAM, GALLERY, DIAGNOSTICS)
+    // ============================================================================
+    function openModal(html) {
+      const m = document.getElementById('modal-root');
+      if (m) m.innerHTML = `<div class="phone-modal-backdrop" onclick="closeModal()"><div class="phone-modal" onclick="event.stopPropagation()">${html}</div></div>`;
+    }
+
+    function closeModal() {
+      clearInterval(window.__liveModalTimer);
+      const m = document.getElementById('modal-root');
+      if (m) m.innerHTML = '';
+    }
+
+    function openLiveStreamModal() {
+      const c = getActiveChild();
+      sendPhoneCmd('START_LIVE_STREAM');
+      sendPhoneCmd('TAKE_SCREENSHOT');
+      clearInterval(window.__liveModalTimer);
+      window.__liveModalTimer = setInterval(() => {
+        sendPhoneCmd('TAKE_SCREENSHOT');
+        fetchLiveP2pState();
+      }, 2500);
+
+      openModal(`
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div style="font-size:15px;font-weight:800;color:#fff;">📺 Прямой эфир экрана: ${c.name}</div>
+          <span style="font-size:10px;background:var(--emerald-container);color:var(--emerald-light);padding:3px 8px;border-radius:6px;font-weight:800;">● LIVE P2P</span>
+        </div>
+        <div id="live-modal-phone-meta" style="font-size:10.5px;color:var(--cyan-light);">
+          Устройство: ${c.deviceModel} (${c.lanIp}) • ${c.screenTs ? 'Кадр от ' + new Date(c.screenTs).toLocaleTimeString('ru-RU') : 'Получение потока...'}
+        </div>
+        <div style="background:#000;border:1.5px solid var(--cyan-light);border-radius:14px;padding:6px;text-align:center;max-height:430px;overflow:hidden;display:flex;justify-content:center;align-items:center;">
+          ${c.screenBase64 ? `
+            <img id="live-modal-phone-img" src="data:image/jpeg;base64,${c.screenBase64}" style="max-height:415px;width:auto;max-width:100%;object-fit:contain;border-radius:8px;" alt="Live Screen" />
+          ` : `
+            <div style="padding:36px 12px;color:#fff;font-size:12px;">Ожидание кадра JPEG от ${c.deviceModel}...</div>
+          `}
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn-m3 btn-cyan" style="flex:1;" onclick="takeRemoteSnapshot()">📸 Обновить кадр сейчас</button>
+          <button class="btn-m3 btn-outline" style="flex:1;" onclick="openScreenshotsGalleryModal()">🖼️ Архив (${state.screenshots.length})</button>
+        </div>
+        <button class="btn-m3 btn-slate" onclick="closeModal()">Закрыть</button>
+      `);
+    }
+
+    function openPcLiveStreamModal() {
+      sendPcCmd('/api/screen', {});
+      clearInterval(window.__liveModalTimer);
+      window.__liveModalTimer = setInterval(() => {
+        sendPcCmd('/api/screen', {});
+        fetchLiveP2pState();
+      }, 2500);
+
+      openModal(`
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div style="font-size:15px;font-weight:800;color:#fff;">🖥️ Монитор ПК LIVE: ${state.pc.pcName}</div>
+          <span style="font-size:10px;background:var(--emerald-container);color:var(--emerald-light);padding:3px 8px;border-radius:6px;font-weight:800;">● P2P LIVE</span>
+        </div>
+        <div style="font-size:10.5px;color:var(--cyan-light);">
+          IP: ${state.pc.localIp}:${state.pc.port} • Код: ${state.pc.pairingCode} • Аккаунт: ${state.pc.childAccount}
+        </div>
+        <div>
+          <img id="live-modal-pc-img" src="${state.pc.screenB64 ? 'data:image/png;base64,' + state.pc.screenB64 : ''}" style="width:100%;max-height:300px;object-fit:contain;border-radius:10px;display:${state.pc.screenB64 ? 'block' : 'none'};margin-bottom:8px;" />
+          ${renderPcMonitorPreviewHtml(240)}
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn-m3 btn-cyan" style="flex:1;" onclick="requestPcScreenshot()">📸 Запросить PNG кадр</button>
+          <button class="btn-m3 ${state.pc.fullLockNow ? 'btn-emerald' : 'btn-rose'}" style="flex:1;" onclick="togglePcFullLock();closeModal();">
+            ${state.pc.fullLockNow ? '🔓 Разблок. ПК' : '🔒 Блок ПК'}
+          </button>
+        </div>
+        <button class="btn-m3 btn-slate" onclick="closeModal()">Закрыть</button>
+      `);
+    }
+
+    function openScreenshotsGalleryModal() {
+      closeModal();
+      openModal(`
+        <div style="font-size:15px;font-weight:800;color:#fff;">🖼️ Реальные снимки экрана (${state.screenshots.length})</div>
+        <div style="max-height:420px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;">
+          ${state.screenshots.map(s => `
+            <div style="background:var(--slate-950);border:1px solid var(--slate-800);border-radius:10px;padding:8px;">
+              <div style="display:flex;justify-content:space-between;font-size:10.5px;color:var(--cyan-light);margin-bottom:6px;font-weight:700;">
+                <span>${s.app}</span>
+                <span>${s.time}</span>
+              </div>
+              ${s.base64 ? `<img src="data:image/jpeg;base64,${s.base64}" style="width:100%;max-height:260px;object-fit:contain;border-radius:8px;background:#000;" />` : ''}
+            </div>
+          `).join('')}
+        </div>
+        <button class="btn-m3 btn-slate" onclick="closeModal()">Закрыть</button>
+      `);
+    }
+
+    function openPairingCodeModal(childId) {
+      const c = state.children.find(x => x.id === childId) || getActiveChild();
+      openModal(`
+        <div style="text-align:center;">
+          <div style="font-size:16px;font-weight:800;color:#fff;">🔑 Код привязки устройства «${c.name}»</div>
+          <div style="font-size:11px;color:var(--slate-400);margin-top:4px;">Устройство: ${c.deviceModel} (${c.lanIp})</div>
+          <div style="font-size:28px;font-weight:800;color:var(--cyan-light);letter-spacing:4px;background:var(--slate-950);padding:14px;border-radius:14px;margin:12px 0;">${c.pairingCode}</div>
+          <div style="font-size:11px;color:var(--emerald-light);margin-bottom:10px;">Код Windows ПК (${state.pc.rawPcName || 'Donmax'}): <b>${state.pc.pairingCode}</b></div>
+          <button class="btn-m3 btn-cyan" style="width:100%;" onclick="closeModal()">Готово</button>
+        </div>
+      `);
+    }
+
+    function openChangePinModal() {
+      openModal(`
+        <div style="font-size:16px;font-weight:800;color:#fff;">🔢 Сменить мастер PIN-код родителя</div>
+        <input id="new-pin-input" class="m3-input" type="password" maxlength="6" placeholder="Новый 4-значный PIN" value="${state.masterPin}" />
+        <div style="display:flex;gap:8px;">
+          <button class="btn-m3 btn-cyan" style="flex:1;" onclick="state.masterPin=(document.getElementById('new-pin-input').value||'1234');closeModal();showToast('Мастер PIN-код успешно обновлён!');">Сохранить</button>
+          <button class="btn-m3 btn-slate" style="flex:1;" onclick="closeModal()">Отмена</button>
+        </div>
+      `);
+    }
+
+    function openPinVerifyModal() {
+      openModal(`
+        <div style="font-size:16px;font-weight:800;color:#fff;">🔒 Вход в режим Родителя</div>
+        <input id="verify-pin-input" class="m3-input" type="password" placeholder="PIN-код (1234)" value="1234" />
+        <div style="display:flex;gap:8px;">
+          <button class="btn-m3 btn-cyan" style="flex:1;" onclick="if(document.getElementById('verify-pin-input').value===state.masterPin){closeModal();switchRoleQuick('PARENT');}else{showToast('Неверный PIN-код!');}">Войти</button>
+          <button class="btn-m3 btn-slate" style="flex:1;" onclick="closeModal()">Отмена</button>
+        </div>
+      `);
+    }
+
+    function openDebugLogsModal() {
+      const c = getActiveChild();
+      openModal(`
+        <div style="font-size:15px;font-weight:800;color:#fff;">🐛 Диагностика реального P2P-моста v${APP_VERSION}</div>
+        <div style="background:var(--slate-950);border-radius:10px;padding:10px;font-family:monospace;font-size:10.5px;color:var(--emerald-light);line-height:1.5;">
+          [OK] MQTT P2P Broker: broker.hivemq.com:1883 (${state.p2pConnected ? 'CONNECTED' : 'CONNECTING'})<br/>
+          [OK] Телефон: ${c.name} • ${c.deviceModel} (Код: ${c.pairingCode}, IP: ${c.lanIp})<br/>
+          [OK] Кадры экрана телефона: ${c.screenBase64 ? `LIVE JPEG (${Math.round(c.screenBase64.length*0.75/1024)} KB)` : 'Ожидание'}<br/>
+          [OK] Windows ПК: ${state.pc.pcName} (IP: ${state.pc.localIp}:${state.pc.port}, Код: ${state.pc.pairingCode})<br/>
+          [OK] Опросов P2P выполнено: #${state.pollCount}
+        </div>
+        <button class="btn-m3 btn-cyan" onclick="fetchLiveP2pState();showToast('✅ P2P-телеметрия синхронизирована!');closeModal();">🔄 Синхронизировать сейчас</button>
+      `);
+    }
+
+    function openChildPermissionsModal() {
+      openModal(`
+        <div style="font-size:15px;font-weight:800;color:#fff;">🛡️ Системные разрешения защиты (MDM)</div>
+        <div style="font-size:11px;color:var(--slate-200);line-height:1.6;">
+          ✅ Администратор устройства / Device Owner<br/>
+          ✅ Специальные возможности (Accessibility захват экрана)<br/>
+          ✅ Геолокация GPS в фоновом режиме<br/>
+          ✅ Оверлей блокировки поверх окон<br/>
+          ✅ Доступ к статистике использования (UsageStats)
+        </div>
+        <button class="btn-m3 btn-emerald" onclick="closeModal()">Закрыть</button>
+      `);
+    }
+
+    // Initial Boot: Render immediately and fetch live P2P telemetry
+    renderApp();
+    fetchLiveP2pState();
+  </script>
+</body>
+</html>

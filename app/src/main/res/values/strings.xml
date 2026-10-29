@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">KidsGuard</string>
+    <string name="device_admin_label">Защита KidsGuard</string>
+    <string name="device_admin_description">Предотвращает несанкционированное удаление родительского контроля ребенком без PIN-кода родителя.</string>
+    <string name="accessibility_service_description">Обеспечивает постоянный родительский контроль, блокировку запрещенных приложений поверх других окон и защиту KidsGuard от удаления ребенком.</string>
+</resources>
