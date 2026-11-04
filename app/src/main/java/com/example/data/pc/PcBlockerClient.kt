@@ -236,23 +236,109 @@ object PcBlockerClient {
   @Volatile
   private var pcPassword: String = ""
 
+  // ==== Изоляция ПК ====
+  // На публичном брокере много компьютеров с кодом по умолчанию 101-701. Без фильтра
+  // телефон принимал PC_STATE/PC_SCREEN/кадры от ЧУЖИХ ПК: список правил «прыгал»,
+  // могли показываться чужие экраны. Храним код + уникальный pc_id и принимаем только их.
+  @Volatile
+  private var configuredCode: String = "101-701"
+
+  @Volatile
+  private var configuredPcId: String = ""
+
+  @Volatile
+  private var codeExplicitlySet: Boolean = false
+
+  @Volatile
+  private var pcIdentityLoaded: Boolean = false
+
+  private fun pcPrefs() = DirectP2pSocketEngine.appContext
+    ?.getSharedPreferences("kidsguard_pc_client", android.content.Context.MODE_PRIVATE)
+
+  private fun loadPersistedPcIdentity() {
+    if (pcIdentityLoaded) return
+    val p = pcPrefs() ?: return
+    pcIdentityLoaded = true
+    val savedCode = p.getString("pc_code", "").orEmpty().trim()
+    if (savedCode.isNotBlank()) {
+      configuredCode = savedCode
+      codeExplicitlySet = true
+    }
+    val savedId = p.getString("pc_id", "").orEmpty().trim()
+    if (savedId.isNotBlank()) configuredPcId = savedId
+    val savedPwd = p.getString("pc_password", "").orEmpty()
+    if (savedPwd.isNotBlank()) pcPassword = savedPwd
+    _state.value = _state.value.copy(pairingCode = configuredCode)
+  }
+
+  private fun persistPcIdentity() {
+    val editor = pcPrefs()?.edit() ?: return
+    editor.putString("pc_code", configuredCode)
+    editor.putString("pc_id", configuredPcId)
+    editor.apply()
+  }
+
+  private fun normalizePcCode(code: String): String =
+    code.replace("-", "").replace(" ", "").trim().uppercase()
+
+  /** Принимаем пакет, только если он от нашего ПК: совпал код и (если известен) pc_id. */
+  private fun matchesConfiguredPc(code: String, pcId: String): Boolean {
+    if (code.isNotBlank() && normalizePcCode(code) != normalizePcCode(configuredCode)) {
+      // Пока код не задан пользователем и ПК ещё не опознан — принимаем первый пакет
+      // (обратная совместимость со старой версией скрипта без pc_id). Дальше — только свой.
+      if (codeExplicitlySet || configuredPcId.isNotBlank()) return false
+    }
+    if (pcId.isNotBlank() && configuredPcId.isNotBlank() && pcId.trim() != configuredPcId) return false
+    return true
+  }
+
+  private fun learnPcIdentity(code: String, pcId: String) {
+    var changed = false
+    if (code.isNotBlank() && !codeExplicitlySet && normalizePcCode(code) != normalizePcCode(configuredCode)) {
+      configuredCode = code.trim()
+      changed = true
+    }
+    if (pcId.isNotBlank() && configuredPcId.isBlank()) {
+      // Опознали конкретный ПК — фиксируем его и больше не слушаем чужие с тем же кодом.
+      configuredPcId = pcId.trim()
+      codeExplicitlySet = true
+      changed = true
+    }
+    if (changed) persistPcIdentity()
+  }
+
   private val _state = MutableStateFlow(PcConnectionState())
   val state: StateFlow<PcConnectionState> = _state.asStateFlow()
 
   fun setPairingCode(code: String) {
+    loadPersistedPcIdentity()
     val clean = code.trim().ifBlank { "101-701" }
+    configuredCode = clean
+    codeExplicitlySet = true
     _state.value = _state.value.copy(pairingCode = clean)
+    persistPcIdentity()
     requestSync()
   }
 
-  fun onUdpBeaconReceived(pcName: String, ip: String, port: Int, pairingCode: String) {
+  fun onUdpBeaconReceived(pcName: String, ip: String, port: Int, pairingCode: String, pcId: String = "") {
+    loadPersistedPcIdentity()
+    // Чужой ПК в той же сети с тем же кодом не должен перебивать настройки.
+    if (!matchesConfiguredPc(pairingCode, pcId)) return
+    if (!codeExplicitlySet && pairingCode.isNotBlank()) {
+      configuredCode = pairingCode.trim()
+    }
+    if (configuredPcId.isBlank() && pcId.isNotBlank()) {
+      configuredPcId = pcId.trim()
+      codeExplicitlySet = true
+    }
+    persistPcIdentity()
     val cur = _state.value
     val updatedIp = if (ip.isNotBlank() && ip != "127.0.0.1") ip else cur.lanIp
     _state.value = cur.copy(
       pcName = pcName.ifBlank { cur.pcName },
       lanIp = updatedIp,
       port = if (port in 1024..65535) port else cur.port,
-      pairingCode = pairingCode.ifBlank { cur.pairingCode },
+      pairingCode = configuredCode,
       isOnline = true,
       transportLabel = if (cur.isLanHttpAuthenticated) {
         "🟢 Wi-Fi LAN ($updatedIp:$port) + Интернет P2P"
@@ -265,17 +351,19 @@ object PcBlockerClient {
   fun ingestP2pStateJson(msg: JSONObject) {
     // Телефону ребёнка пакеты о ПК не нужны: не тратим его батарею и не пишем чужую историю.
     if (DirectP2pSocketEngine.currentRole == "CHILD") return
+    loadPersistedPcIdentity()
+    val msgCode = msg.optString("pairing_code", "").trim()
+    val msgPcId = msg.optString("pc_id", "").trim()
+    if (!matchesConfiguredPc(msgCode, msgPcId)) return
+    learnPcIdentity(msgCode, msgPcId)
     try {
-      val msgCode = msg.optString("pairing_code", "").trim()
-      val currentCode = _state.value.pairingCode.trim()
-      val resolvedCode = if (msgCode.isNotBlank()) msgCode else currentCode.ifBlank { "101-701" }
       val parsed = parseStateJson(
         msg = msg,
-        current = _state.value.copy(pairingCode = resolvedCode),
+        current = _state.value.copy(pairingCode = configuredCode),
         transport = if (_state.value.isLanHttpAuthenticated) {
           "🟢 Wi-Fi LAN (${_state.value.lanIp}:${_state.value.port}) + Интернет P2P"
         } else {
-          "🌐 Интернет P2P-мост (${msg.optString("pc_name", "Windows ПК")} • Код $resolvedCode)"
+          "🌐 Интернет P2P-мост (${msg.optString("pc_name", "Windows ПК")} • Код $configuredCode)"
         }
       )
       val statusErr = msg.optString("auth_error", "")
@@ -289,11 +377,15 @@ object PcBlockerClient {
 
   fun ingestP2pScreenJson(msg: JSONObject) {
     if (DirectP2pSocketEngine.currentRole == "CHILD") return
+    loadPersistedPcIdentity()
     val msgCode = msg.optString("pairing_code", "").trim()
+    val msgPcId = msg.optString("pc_id", "").trim()
+    if (!matchesConfiguredPc(msgCode, msgPcId)) return
+    learnPcIdentity(msgCode, msgPcId)
     val b64 = msg.optString("screen_b64", "")
     if (b64.isNotBlank()) {
       _state.value = _state.value.copy(
-        pairingCode = if (msgCode.isNotBlank()) msgCode else _state.value.pairingCode,
+        pairingCode = configuredCode,
         screenBase64 = b64,
         screenTimestampMs = msg.optLong("ts", System.currentTimeMillis()),
         screenReceivedAtMs = System.currentTimeMillis(),
@@ -344,6 +436,7 @@ object PcBlockerClient {
   fun startScreenStream(fps: Int = 4, quality: PcStreamQuality = PcStreamQuality.BALANCED) {
     // Экран ПК смотрит только родитель — телефону ребёнка это не нужно.
     if (DirectP2pSocketEngine.currentRole == "CHILD") return
+    loadPersistedPcIdentity()
     val cleanFps = fps.coerceIn(1, 10)
     if (streamRequested && streamFps == cleanFps && streamQuality == quality) {
       if (streamMjpegJob?.isActive != true) startLanMjpegIfPossible()
@@ -509,10 +602,17 @@ object PcBlockerClient {
   /**
    * Бинарный кадр P2P: 4 байта seq + 8 байт timestamp (big-endian) + JPEG.
    * Без Base64 — меньше трафика и нет парсинга килобайтных JSON-строк на каждый кадр.
+   * Топик: .../pc_stream_bin/<код>/<pc_id> — по нему отсекаем кадры чужих ПК.
    */
-  fun ingestP2pStreamFrameBinary(bytes: ByteArray, offset: Int, length: Int) {
+  fun ingestP2pStreamFrameBinary(topic: String, bytes: ByteArray, offset: Int, length: Int) {
     if (DirectP2pSocketEngine.currentRole == "CHILD") return
     if (!streamRequested || length <= 12) return
+    loadPersistedPcIdentity()
+    val parts = topic.split("/")
+    val topicPcId = parts.lastOrNull().orEmpty().trim()
+    val topicCode = if (parts.size >= 2) parts[parts.size - 2].trim() else ""
+    if (!matchesConfiguredPc(topicCode, topicPcId)) return
+    learnPcIdentity(topicCode, topicPcId)
     try {
       val buf = ByteBuffer.wrap(bytes, offset, length).order(ByteOrder.BIG_ENDIAN)
       buf.getInt() // seq
@@ -530,6 +630,11 @@ object PcBlockerClient {
   fun ingestP2pStreamFrame(msg: JSONObject) {
     if (DirectP2pSocketEngine.currentRole == "CHILD") return
     if (!streamRequested) return
+    loadPersistedPcIdentity()
+    val msgCode = msg.optString("pairing_code", "").trim()
+    val msgPcId = msg.optString("pc_id", "").trim()
+    if (!matchesConfiguredPc(msgCode, msgPcId)) return
+    learnPcIdentity(msgCode, msgPcId)
     val b64 = msg.optString("b64", "")
     if (b64.isBlank()) return
     val ts = msg.optLong("ts", System.currentTimeMillis())
@@ -592,11 +697,16 @@ object PcBlockerClient {
   fun connectLanWithPassword(ip: String, port: Int, password: String, pairingCode: String = "") {
     val cleanIp = ip.trim()
     val cleanPort = if (port in 1024..65535) port else 8765
+    loadPersistedPcIdentity()
     if (password.isNotBlank()) {
       pcPassword = password
+      pcPrefs()?.edit()?.putString("pc_password", password)?.apply()
     }
     if (pairingCode.isNotBlank()) {
-      _state.value = _state.value.copy(pairingCode = pairingCode.trim())
+      configuredCode = pairingCode.trim()
+      codeExplicitlySet = true
+      persistPcIdentity()
+      _state.value = _state.value.copy(pairingCode = configuredCode)
     }
     scope.launch {
       if (cleanIp.isBlank()) {
@@ -739,33 +849,41 @@ object PcBlockerClient {
   }
 
   private fun sendP2pCommand(action: String, data: JSONObject) {
-    val code = _state.value.pairingCode.trim().ifBlank { "101-701" }
-    val codes = linkedSetOf(code, "101-701")
-    for (targetCode in codes) {
-      val pkt = JSONObject().apply {
-        put("type", "PC_CMD")
-        put("pairing_code", targetCode)
-        put("action", action)
-        if (pcPassword.isNotBlank()) {
-          put("password", pcPassword)
-        }
-        put("data", data)
-        put("ts", System.currentTimeMillis())
-      }
-      DirectP2pSocketEngine.publishTcpSocketPacket(
-        topic = "${DirectP2pSocketEngine.TOPIC_ROOT}/pc_cmd/$targetCode",
-        json = pkt,
-        retain = false
+    // Пока ПК не опознан (нет маяка/сохранённого кода), НЕ отправляем команды на код
+    // по умолчанию: на публичном брокере так можно задеть чужой компьютер.
+    if (configuredPcId.isBlank() && !codeExplicitlySet) {
+      _state.value = _state.value.copy(
+        statusMessage = "Укажите код P2P компьютера в «⚙ Настройка подключения к ПК»"
       )
-      DirectP2pSocketEngine.publishTcpSocketPacket(
-        topic = "${DirectP2pSocketEngine.TOPIC_ROOT_LEGACY_PC}/pc_cmd/$targetCode",
-        json = pkt,
-        retain = false
-      )
+      return
     }
+    val code = configuredCode.trim().ifBlank { "101-701" }
+    // Только свой код: раньше команда дублировалась ещё и на 101-701, из-за чего
+    // можно было случайно управлять ЧУЖИМ компьютером с кодом по умолчанию.
+    val pkt = JSONObject().apply {
+      put("type", "PC_CMD")
+      put("pairing_code", code)
+      put("action", action)
+      if (pcPassword.isNotBlank()) {
+        put("password", pcPassword)
+      }
+      put("data", data)
+      put("ts", System.currentTimeMillis())
+    }
+    DirectP2pSocketEngine.publishTcpSocketPacket(
+      topic = "${DirectP2pSocketEngine.TOPIC_ROOT}/pc_cmd/$code",
+      json = pkt,
+      retain = false
+    )
+    DirectP2pSocketEngine.publishTcpSocketPacket(
+      topic = "${DirectP2pSocketEngine.TOPIC_ROOT_LEGACY_PC}/pc_cmd/$code",
+      json = pkt,
+      retain = false
+    )
   }
 
   fun requestSync() {
+    loadPersistedPcIdentity()
     scope.launch {
       sendP2pCommand("/api/sync", JSONObject())
       if (_state.value.isLanHttpAuthenticated) {
@@ -775,6 +893,7 @@ object PcBlockerClient {
   }
 
   fun requestPcScreenshot() {
+    loadPersistedPcIdentity()
     scope.launch {
       sendP2pCommand("/api/screen", JSONObject())
       if (_state.value.isLanHttpAuthenticated) {
@@ -1147,11 +1266,15 @@ object PcBlockerClient {
       pcName = msg.optString("pc_name", current.pcName).ifBlank { current.pcName },
       lanIp = if (ipFromMsg.isNotBlank() && ipFromMsg != "127.0.0.1") ipFromMsg else current.lanIp,
       port = msg.optInt("port", current.port),
-      pairingCode = msg.optString("pairing_code", current.pairingCode).ifBlank { current.pairingCode },
+      pairingCode = current.pairingCode,
       computerTodaySec = todayComputerSec,
       computerTotalSec = msg.optInt("computer_total_sec", current.computerTotalSec),
       fullLock = fullState,
-      entries = if (parsedEntries.isNotEmpty()) parsedEntries else current.entries,
+      entries = if (parsedEntries.isNotEmpty()) {
+        parsedEntries.distinctBy { it.name.trim().lowercase() }
+      } else {
+        current.entries
+      },
       activeWindows = windows,
       activityDate = todayIso,
       activityByUser = todayUsers,

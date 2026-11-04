@@ -207,7 +207,9 @@ fun PcControlScreen(
   var portInput by remember(pcState.port) { mutableStateOf(pcState.port.toString()) }
   var passwordInput by remember { mutableStateOf("") }
   var pairingCodeInput by remember(pcState.pairingCode) {
-    mutableStateOf(pcState.pairingCode.ifBlank { activeChildPairingCode })
+    // Код P2P относится к ПК (не к профилю ребёнка). В домашней сети он подхватывается
+    // из UDP-маяка, вручную вводится один раз и сохраняется.
+    mutableStateOf(pcState.pairingCode.ifBlank { "101-701" })
   }
 
   var childAccountInput by remember(pcState.fullLock.childAccount) {

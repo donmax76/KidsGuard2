@@ -521,7 +521,8 @@ object DirectP2pSocketEngine {
                 val pcPort = json.optInt("port", 8765)
                 val pcName = json.optString("pc_name", "Windows ПК")
                 val pCode = json.optString("pairing_code", "101-701")
-                com.example.data.pc.PcBlockerClient.onUdpBeaconReceived(pcName, pcIp, pcPort, pCode)
+                val pId = json.optString("pc_id", "")
+                com.example.data.pc.PcBlockerClient.onUdpBeaconReceived(pcName, pcIp, pcPort, pCode, pId)
               }
               "CHILD_STATE", "CHILD_PATCH" -> {
                 RealtimeCloudRelay.ingestImmediateStateJson(json)
@@ -651,6 +652,7 @@ object DirectP2pSocketEngine {
                       if (topic.contains("/pc_stream_bin")) {
                         // Живой кадр ПК в бинарном виде: без Base64 и без JSON-парсинга.
                         com.example.data.pc.PcBlockerClient.ingestP2pStreamFrameBinary(
+                          topic,
                           payloadBytes,
                           msgOffset,
                           remLen - msgOffset

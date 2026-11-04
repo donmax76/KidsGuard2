@@ -168,6 +168,17 @@ def normalize(entries):
         e["limit"] = lim
         if e["name"] == "Genshin Impact" and not e["programs"]:
             e["programs"] = ["GenshinImpact.exe", "YuanShen.exe"]
+    # Убираем дубли по имени (могли появиться при добавлении с ПК и с телефона):
+    # иначе список «прыгает» и в Compose ломаются ключи элементов.
+    seen = set()
+    unique = []
+    for e in entries:
+        key = str(e.get("name", "")).strip().lower()
+        if key and key in seen:
+            continue
+        seen.add(key)
+        unique.append(e)
+    entries[:] = unique
     return entries
 
 
@@ -241,6 +252,33 @@ def save_config(cfg):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONF_FILE)  # атомарно: конфиг никогда не окажется «битым»
+
+
+_PC_ID_CACHE = ""
+_PC_ID_DISABLED = False
+
+
+def pc_id():
+    """Стабильный случайный ID этого ПК: телефон отбрасывает пакеты чужих компьютеров
+    с тем же кодом привязки (по умолчанию 101-701 таких много на публичном брокере)."""
+    global _PC_ID_CACHE, _PC_ID_DISABLED
+    if _PC_ID_DISABLED:
+        return ""
+    if _PC_ID_CACHE:
+        return _PC_ID_CACHE
+    cfg = load_config() or {}
+    pid = str(cfg.get("pc_id") or "").strip()
+    if not pid:
+        pid = secrets.token_hex(8)
+        cfg["pc_id"] = pid
+        try:
+            save_config(cfg)
+        except Exception:
+            # Конфиг недоступен на запись — не привязываем телефон к временному ID.
+            _PC_ID_DISABLED = True
+            return ""
+    _PC_ID_CACHE = pid
+    return pid
 
 
 # ---------- разбор ввода ----------
@@ -2640,6 +2678,7 @@ def panel_state(csrf, full=True):
     return {
         "csrf": csrf,
         "pc_name": socket.gethostname(),
+        "pc_id": pc_id(),
         "local_ip": local_ip(),
         "port": int(web.get("port") or 8765),
         "pairing_code": str(web.get("pairing_code") or "101-701"),
@@ -3002,6 +3041,7 @@ def p2p_bridge_worker(st, host, port):
                             scr_json_str = json.dumps({
                                 "type": "PC_SCREEN",
                                 "pairing_code": code,
+                                "pc_id": pc_id(),
                                 "screen_b64": scr_auto["screen_b64"],
                                 "fmt": scr_auto.get("fmt", "image/png"),
                                 "ts": scr_auto.get("ts", int(time.time() * 1000))
@@ -3027,47 +3067,60 @@ def p2p_bridge_worker(st, host, port):
                             pwd = str(cmd_json.get("password", ""))
                             auth_error = ""
                             if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
-                                          "/api/fulllock_schedule", "/api/add", "/api/delete",
-                                          "/api/stream_start"):
-                                if pwd and cur_cfg.get("hash") and not check_password(
-                                        pwd, cur_cfg["salt"], cur_cfg["hash"]):
-                                    auth_error = "Неверный пароль программы ПК"
+                                          "/api/fulllock_schedule", "/api/add", "/api/delete"):
+                                # Если на ПК задан пароль панели — команда ОБЯЗАНА его содержать.
+                                # Раньше пустой пароль проходил проверку, и чужое приложение
+                                # с кодом по умолчанию 101-701 могло менять правила на этом ПК.
+                                if cur_cfg.get("hash") and not (
+                                        pwd and check_password(pwd, cur_cfg["salt"], cur_cfg["hash"])):
+                                    auth_error = "ПК защищён паролем: укажите пароль панели в настройках ПК"
                                 else:
-                                    if action == "/api/stream_start":
-                                        # Запоминаем брокер, через который телефон попросил поток:
-                                        # кадры пойдут только туда (без двойного трафика).
-                                        st["stream_broker"] = (host, port)
-                                        stream_touch(
-                                            duration=data.get("duration", 25.0),
-                                            fps=data.get("fps"),
-                                            w=data.get("w"),
-                                            h=data.get("h"),
-                                            quality=data.get("quality"),
-                                            binary=data.get("binary")
-                                        )
-                                    else:
-                                        res = panel_mutate(action, data)
-                                        if not res.get("ok", False):
-                                            auth_error = str(res.get("error", "Ошибка выполнения команды"))
+                                    res = panel_mutate(action, data)
+                                    if not res.get("ok", False):
+                                        auth_error = str(res.get("error", "Ошибка выполнения команды"))
                                 st["mtime"] = 0
                                 st["sig"] = None
+                            elif action == "/api/stream_start":
+                                # Просмотр экрана — тоже приватная операция: без пароля панели
+                                # чужое приложение с кодом по умолчанию могло смотреть экран ПК.
+                                if cur_cfg.get("hash") and not (
+                                        pwd and check_password(pwd, cur_cfg["salt"], cur_cfg["hash"])):
+                                    auth_error = "ПК защищён паролем: укажите пароль панели для просмотра экрана"
+                                else:
+                                    # Запоминаем брокер, через который телефон попросил поток:
+                                    # кадры пойдут только туда (без двойного трафика).
+                                    st["stream_broker"] = (host, port)
+                                    stream_touch(
+                                        duration=data.get("duration", 25.0),
+                                        fps=data.get("fps"),
+                                        w=data.get("w"),
+                                        h=data.get("h"),
+                                        quality=data.get("quality"),
+                                        binary=data.get("binary")
+                                    )
                             if action == "/api/stream_stop":
                                 stream_stop()
                             if action == "/api/screen":
-                                scr_res = panel_screen(force=True)
-                                if scr_res.get("ok"):
-                                    scr_json_str = json.dumps({
-                                        "type": "PC_SCREEN",
-                                        "pairing_code": code,
-                                        "screen_b64": scr_res["screen_b64"],
-                                        "fmt": scr_res.get("fmt", "image/png"),
-                                        "ts": scr_res.get("ts", int(time.time() * 1000))
-                                    }, ensure_ascii=False)
-                                    for r in roots:
-                                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
-                                last_screen_pub = time.time()
+                                if cur_cfg.get("hash") and not (
+                                        pwd and check_password(pwd, cur_cfg["salt"], cur_cfg["hash"])):
+                                    auth_error = "ПК защищён паролем: укажите пароль панели для снимка экрана"
+                                else:
+                                    scr_res = panel_screen(force=True)
+                                    if scr_res.get("ok"):
+                                        scr_json_str = json.dumps({
+                                            "type": "PC_SCREEN",
+                                            "pairing_code": code,
+                                            "pc_id": pc_id(),
+                                            "screen_b64": scr_res["screen_b64"],
+                                            "fmt": scr_res.get("fmt", "image/png"),
+                                            "ts": scr_res.get("ts", int(time.time() * 1000))
+                                        }, ensure_ascii=False)
+                                        for r in roots:
+                                            sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+                                    last_screen_pub = time.time()
                             if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
-                                          "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync"):
+                                          "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync",
+                                          "/api/stream_start", "/api/screen"):
                                 is_sync = action == "/api/sync"
                                 state_payload = panel_state("p2p", full=is_sync)
                                 state_payload["type"] = "PC_STATE"
@@ -3082,6 +3135,7 @@ def p2p_bridge_worker(st, host, port):
                                         scr_json_str = json.dumps({
                                             "type": "PC_SCREEN",
                                             "pairing_code": code,
+                                            "pc_id": pc_id(),
                                             "screen_b64": scr_now["screen_b64"],
                                             "fmt": scr_now.get("fmt", "image/png"),
                                             "ts": scr_now.get("ts", int(time.time() * 1000))
@@ -3180,11 +3234,12 @@ def p2p_stream_worker(st, host, port):
                     # 4 байта seq + 8 байт timestamp (мс) + JPEG
                     payload_bytes = struct.pack(">IQ", seq, ts) + data
                     for r in roots:
-                        sock.sendall(_mqtt_pub_pkt_bytes(f"{r}/pc_stream_bin/{code}", payload_bytes, retain=False))
+                        sock.sendall(_mqtt_pub_pkt_bytes(f"{r}/pc_stream_bin/{code}/{pc_id()}", payload_bytes, retain=False))
                 else:
                     payload = json.dumps({
                         "type": "PC_STREAM_FRAME",
                         "pairing_code": code,
+                        "pc_id": pc_id(),
                         "seq": seq,
                         "ts": ts,
                         "w": params["w"],
@@ -3219,6 +3274,7 @@ def udp_discovery_loop(st):
                     pkt = json.dumps({
                         "type": "PC_BEACON",
                         "pc_name": socket.gethostname(),
+                        "pc_id": pc_id(),
                         "ip": local_ip(),
                         "port": int(web.get("port") or 8765),
                         "pairing_code": str(web.get("pairing_code") or "101-701")
