@@ -23,12 +23,14 @@ import datetime
 import hashlib
 import hmac
 import http.server
+import io
 import ipaddress
 import json
 import math
 import os
 import re
 import secrets
+import select
 import shutil
 import socket
 import struct
@@ -38,6 +40,10 @@ import threading
 import time
 import traceback
 import zlib
+try:
+    from PIL import Image as _PILImage
+except Exception:  # Pillow не обязателен — есть чистый PNG-резерв
+    _PILImage = None
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -1838,8 +1844,8 @@ def top_activity(d, n=8, min_seconds=15):
     return procs, titles
 
 
-def capture_screen_png(dst_w=640, dst_h=360):
-    """Снимок экрана монитора в PNG без внешних библиотек (ctypes GDI + zlib)."""
+def _grab_screen_bgra(dst_w, dst_h):
+    """Снимок экрана монитора через GDI (ctypes) в raw-буфер BGRA dst_w*dst_h*4."""
     if not IS_WIN:
         return None
     try:
@@ -1858,8 +1864,11 @@ def capture_screen_png(dst_w=640, dst_h=360):
         u32.GetDC.argtypes, u32.GetDC.restype = [P], P
         u32.ReleaseDC.argtypes = [P, P]
         g32.CreateCompatibleDC.argtypes, g32.CreateCompatibleDC.restype = [P], P
-        g32.CreateDIBSection.argtypes, g32.CreateDIBSection.restype = [
-            P, P, wintypes.UINT, ctypes.POINTER(P), P, wintypes.DWORD]
+        # ВАЖНО: раньше здесь в restype попадал весь список из 6 типов -> ValueError при
+        # каждом вызове, и снимок экрана молча не работал вообще (возвращался None).
+        g32.CreateDIBSection.argtypes = [P, ctypes.POINTER(BIH), wintypes.UINT,
+                                         ctypes.POINTER(P), P, wintypes.DWORD]
+        g32.CreateDIBSection.restype = P
         g32.SelectObject.argtypes, g32.SelectObject.restype = [P, P], P
         g32.SetStretchBltMode.argtypes = [P, ctypes.c_int]
         g32.StretchBlt.argtypes = [P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -1888,8 +1897,14 @@ def capture_screen_png(dst_w=640, dst_h=360):
         g32.DeleteObject(bmp)
         g32.DeleteDC(mdc)
         u32.ReleaseDC(None, sdc)
+        return raw
+    except Exception:
+        return None
 
-        # Кодируем BGRA -> RGB PNG (фильтр 0 на каждую строку)
+
+def _encode_png_bgra(raw, dst_w, dst_h, level=6):
+    """BGRA-буфер -> PNG (фильтр 0 на каждую строку), без внешних библиотек."""
+    try:
         rows = bytearray()
         stride = dst_w * 4
         for y in range(dst_h):
@@ -1906,10 +1921,110 @@ def capture_screen_png(dst_w=640, dst_h=360):
         ihdr = struct.pack(">IIBBBBB", dst_w, dst_h, 8, 2, 0, 0, 0)
         return (b"\x89PNG\r\n\x1a\n"
                 + chunk(b"IHDR", ihdr)
-                + chunk(b"IDAT", zlib.compress(bytes(rows), 6))
+                + chunk(b"IDAT", zlib.compress(bytes(rows), level))
                 + chunk(b"IEND", b""))
     except Exception:
         return None
+
+
+def capture_screen_png(dst_w=640, dst_h=360, level=6):
+    """Снимок экрана монитора в PNG без внешних библиотек (ctypes GDI + zlib)."""
+    raw = _grab_screen_bgra(dst_w, dst_h)
+    if not raw:
+        return None
+    return _encode_png_bgra(raw, dst_w, dst_h, level)
+
+
+def capture_screen_frame(dst_w=800, dst_h=450, quality=55, prefer_jpeg=True):
+    """Кадр экрана -> (bytes, content_type).
+
+    С Pillow кодируется JPEG (в десятки раз быстрее и меньше PNG), без Pillow —
+    честный PNG-резерв, чтобы программа работала на «чистом» Python.
+    """
+    raw = _grab_screen_bgra(dst_w, dst_h)
+    if not raw:
+        return None
+    if prefer_jpeg and _PILImage is not None:
+        try:
+            img = _PILImage.frombuffer("RGB", (dst_w, dst_h), raw, "raw", "BGRX", 0, 1)
+            out = io.BytesIO()
+            img.save(out, "JPEG", quality=int(quality), optimize=False, subsampling=2)
+            return out.getvalue(), "image/jpeg"
+        except Exception:
+            pass
+    png = _encode_png_bgra(raw, dst_w, dst_h, 1)
+    if not png:
+        return None
+    return png, "image/png"
+
+
+# ====================== ЖИВАЯ ТРАНСЛЯЦИЯ ЭКРАНА ПК ======================
+# Экран передаётся кадрами (JPEG) двумя путями:
+#   1) MJPEG-поток по домашнему Wi-Fi: GET /api/stream  (multipart/x-mixed-replace);
+#   2) кадры через P2P-мост (Интернет) на топик .../pc_stream/<код>, пока открыта «аренда» потока.
+# Аренда продлевается телефоном (/api/stream_start) и автоматически истекает, чтобы
+# компьютер не кодировал видео бесконечно и не тратил батарею/трафик впустую.
+STREAM_LOCK = threading.RLock()
+# until_p2p — аренда для кадров через Интернет; until_lan — для MJPEG по домашнему Wi-Fi.
+# Разделяем их, чтобы при просмотре по Wi-Fi ПК не кодировал те же кадры ещё и в P2P.
+STREAM_ST = {"until": 0.0, "until_p2p": 0.0, "until_lan": 0.0,
+             "fps": 4.0, "w": 800, "h": 450, "quality": 55}
+
+
+def stream_touch(duration=25.0, fps=None, w=None, h=None, quality=None, channel="p2p"):
+    """Продлевает аренду живого потока и (опционально) меняет параметры кадров."""
+    with STREAM_LOCK:
+        now = time.time()
+        try:
+            if fps is not None:
+                STREAM_ST["fps"] = max(1.0, min(10.0, float(fps)))
+            if w is not None:
+                STREAM_ST["w"] = max(320, min(1600, int(w)))
+            if h is not None:
+                STREAM_ST["h"] = max(180, min(900, int(h)))
+            if quality is not None:
+                STREAM_ST["quality"] = max(25, min(90, int(quality)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            dur = float(duration)
+        except (TypeError, ValueError):
+            dur = 25.0
+        until = now + max(3.0, min(180.0, dur))
+        if channel == "lan":
+            STREAM_ST["until_lan"] = until
+        else:
+            STREAM_ST["until_p2p"] = until
+        STREAM_ST["until"] = max(float(STREAM_ST.get("until_lan") or 0.0),
+                                 float(STREAM_ST.get("until_p2p") or 0.0))
+        return dict(STREAM_ST)
+
+
+def stream_stop():
+    with STREAM_LOCK:
+        STREAM_ST["until"] = 0.0
+        STREAM_ST["until_p2p"] = 0.0
+        STREAM_ST["until_lan"] = 0.0
+
+
+def stream_is_active():
+    with STREAM_LOCK:
+        return time.time() < float(STREAM_ST.get("until") or 0.0)
+
+
+def stream_p2p_active():
+    with STREAM_LOCK:
+        return time.time() < float(STREAM_ST.get("until_p2p") or 0.0)
+
+
+def stream_params():
+    with STREAM_LOCK:
+        p = dict(STREAM_ST)
+    fps = max(1.0, min(10.0, float(p.get("fps") or 4.0)))
+    w = max(320, min(1600, int(p.get("w") or 800))) // 2 * 2
+    h = max(180, min(900, int(p.get("h") or 450))) // 2 * 2
+    q = max(25, min(90, int(p.get("quality") or 55)))
+    return {"fps": fps, "w": w, "h": h, "quality": q}
 
 
 def agent_main():
@@ -1938,7 +2053,8 @@ def agent_main():
                 )
     except Exception:
         proc_sec, title_sec = {}, {}
-    last_close, last_act_save, last_scr = 0.0, 0.0, 0.0
+    last_close, last_act_save, last_scr, last_agent_write = 0.0, 0.0, 0.0, 0.0
+    last_hist_save = 0.0
     while True:
         title, proc = foreground_info()
         day = datetime.date.today().isoformat()
@@ -1950,13 +2066,16 @@ def agent_main():
         key = title.strip()[:70]
         if key:
             title_sec[key] = title_sec.get(key, 0) + 1
-        try:
-            os.makedirs(PUB_DIR, exist_ok=True)
-            with open(path + ".tmp", "w", encoding="utf-8") as f:
-                json.dump({"ts": time.time(), "title": title, "proc": proc, "user": user}, f)
-            os.replace(path + ".tmp", path)
-        except Exception:
-            pass
+        # Файл активного окна обновляем раз в 3 секунды — этого достаточно, а диск не дёргаем ежесекундно.
+        if time.time() - last_agent_write >= 3:
+            last_agent_write = time.time()
+            try:
+                os.makedirs(PUB_DIR, exist_ok=True)
+                with open(path + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump({"ts": time.time(), "title": title, "proc": proc, "user": user}, f)
+                os.replace(path + ".tmp", path)
+            except Exception:
+                pass
         try:
             with open(os.path.join(PUB_DIR, "blocked.json"), "r", encoding="utf-8") as f:
                 bjson = json.load(f)
@@ -1976,7 +2095,8 @@ def agent_main():
                 close_tab()
             except Exception:
                 pass
-        want_scr = os.path.exists(req_path) or (time.time() - last_scr > 4)
+        # Снимок для превью: по запросу телефона/панели либо раз в 20 секунд (а не каждые 4 с).
+        want_scr = os.path.exists(req_path) or (time.time() - last_scr > 20)
         if want_scr:
             last_scr = time.time()
             try:
@@ -1984,11 +2104,11 @@ def agent_main():
                     os.remove(req_path)
             except Exception:
                 pass
-            png = capture_screen_png(640, 360)
-            if png:
+            frame = capture_screen_frame(800, 450, quality=65)
+            if frame:
                 try:
                     with open(scr_path + ".tmp", "wb") as f:
-                        f.write(png)
+                        f.write(frame[0])
                     os.replace(scr_path + ".tmp", scr_path)
                 except Exception:
                     pass
@@ -2002,7 +2122,10 @@ def agent_main():
                     json.dump({"date": today, "proc": proc_sec, "titles": title_sec}, f,
                               ensure_ascii=False)
                 os.replace(act_path + ".tmp", act_path)
-                save_activity_history_day(today, user, proc_sec, title_sec)
+                # 30-дневный архив пишем раз в минуту, а не каждые 5 секунд (бережём диск ПК).
+                if time.time() - last_hist_save > 60:
+                    last_hist_save = time.time()
+                    save_activity_history_day(today, user, proc_sec, title_sec)
             except Exception:
                 pass
         time.sleep(1)
@@ -2137,6 +2260,7 @@ def engine_main():
           "kws": None, "dirty": False, "saved": time.time(), "full_prev": None}
     PANEL_ST["u"] = st["u"]
     threading.Thread(target=p2p_bridge_loop, args=(st,), daemon=True).start()
+    threading.Thread(target=p2p_stream_loop, args=(st,), daemon=True).start()
     threading.Thread(target=udp_discovery_loop, args=(st,), daemon=True).start()
     while True:
         try:
@@ -2291,12 +2415,17 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             _, s = self._session()
             if not s:
                 return self._send(401, {"ok": False})
-            return self._send(200, panel_state(s["csrf"]))
+            return self._send(200, panel_state(s["csrf"], full=False))
         if self.path == "/api/screen":
             _, s = self._session()
             if not s:
                 return self._send(401, {"ok": False})
             return self._send(200, panel_screen())
+        if self.path.split("?")[0] == "/api/stream":
+            _, s = self._session()
+            if not s:
+                return self._send(401, {"ok": False})
+            return self._stream_mjpeg()
         if self.path == "/api/ping":
             cfg = load_config() or {}
             web = cfg.get("web") or {}
@@ -2325,10 +2454,67 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
         if self.path == "/api/screen":
             return self._send(200, panel_screen(force=True))
+        if self.path == "/api/stream_start":
+            params = stream_touch(
+                duration=data.get("duration", 25.0),
+                fps=data.get("fps"),
+                w=data.get("w"),
+                h=data.get("h"),
+                quality=data.get("quality"),
+                channel="lan"
+            )
+            return self._send(200, {"ok": True, "stream": stream_params(), "lease_until": params["until"]})
+        if self.path == "/api/stream_stop":
+            stream_stop()
+            return self._send(200, {"ok": True})
         if self.path in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
                          "/api/fulllock_schedule", "/api/add", "/api/delete"):
             return self._send(200, panel_mutate(self.path, data))
         self._send(404, {"ok": False})
+
+    def _stream_mjpeg(self):
+        """Непрерывный MJPEG-поток экрана ПК для приложения родителя (Wi-Fi, без P2P)."""
+        boundary = "kidsguardframe"
+        interval = 0.0
+        try:
+            # Клиент подключился к потоку — держим аренду живой, пока он читает кадры.
+            stream_touch(duration=10.0, channel="lan")
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=%s" % boundary)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.connection.settimeout(8.0)  # чтобы «мёртвый» клиент не держал поток вечно
+            except Exception:
+                pass
+            deadline = time.time() + 180.0
+            while time.time() < deadline:
+                params = stream_params()
+                frame = capture_screen_frame(params["w"], params["h"], quality=params["quality"])
+                if not frame:
+                    time.sleep(0.25)
+                    continue
+                data, ctype = frame
+                self.wfile.write(b"--" + boundary.encode("ascii") + b"\r\n")
+                self.wfile.write(
+                    ("Content-Type: %s\r\nContent-Length: %d\r\n\r\n" % (ctype, len(data))).encode("ascii")
+                )
+                self.wfile.write(data)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+                stream_touch(duration=10.0, channel="lan")  # живой клиент продлевает аренду
+                interval = 1.0 / max(1.0, params["fps"])
+                time.sleep(interval)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
 
     def _login(self, data):
         ip = self.client_address[0]
@@ -2356,31 +2542,62 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                    cookie=f"hb_session={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200")
 
 
-def panel_screen(force=False):
+def panel_screen(force=False, w=640, h=360, quality=60):
+    """Один кадр экрана ПК (Base64). force=True — запросить свежий кадр прямо сейчас."""
     req_path = os.path.join(PUB_DIR, "screen_req.flag")
     scr_path = os.path.join(PUB_DIR, "screen.png")
+    started = time.time()
     try:
         os.makedirs(PUB_DIR, exist_ok=True)
+        agent_online = bool(fresh_agents())
         if force:
-            with open(req_path, "w", encoding="utf-8") as f:
-                f.write("1")
-            time.sleep(0.8)
-        if not os.path.exists(scr_path) or (time.time() - os.path.getmtime(scr_path) > 8):
-            direct_png = capture_screen_png(640, 360)
-            if direct_png:
+            try:
+                with open(req_path, "w", encoding="utf-8") as f:
+                    f.write("1")
+            except Exception:
+                pass
+            # Агент пользовательской сессии просыпается раз в секунду — ждём его кадр.
+            wait_until = started + (1.5 if agent_online else 0.0)
+            while agent_online and time.time() < wait_until:
+                if os.path.exists(scr_path) and os.path.getmtime(scr_path) >= started:
+                    break
+                time.sleep(0.08)
+        got_fresh = os.path.exists(scr_path) and os.path.getmtime(scr_path) >= started
+        stale = (not os.path.exists(scr_path)) or (time.time() - os.path.getmtime(scr_path) > 8)
+        # Прямой захват из этого процесса нужен, только если агента нет (иначе из сессии
+        # SYSTEM получился бы чёрный кадр и затёр настоящий рабочий стол).
+        if force and not got_fresh and not agent_online:
+            frame = capture_screen_frame(w, h, quality=quality)
+            if frame:
                 with open(scr_path + ".tmp", "wb") as f:
-                    f.write(direct_png)
+                    f.write(frame[0])
+                os.replace(scr_path + ".tmp", scr_path)
+        elif not force and stale and not agent_online:
+            frame = capture_screen_frame(w, h, quality=quality)
+            if frame:
+                with open(scr_path + ".tmp", "wb") as f:
+                    f.write(frame[0])
                 os.replace(scr_path + ".tmp", scr_path)
         if os.path.exists(scr_path):
             with open(scr_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
-            return {"ok": True, "screen_b64": b64, "ts": int(os.path.getmtime(scr_path) * 1000)}
+                blob = f.read()
+            return {
+                "ok": True,
+                "screen_b64": base64.b64encode(blob).decode("ascii"),
+                "fmt": "image/jpeg" if blob[:3] == b"\xff\xd8\xff" else "image/png",
+                "ts": int(os.path.getmtime(scr_path) * 1000)
+            }
     except Exception as ex:
         return {"ok": False, "error": str(ex)}
     return {"ok": False, "error": "Скриншот пока недоступен (сеанс пользователя не активен)"}
 
 
-def panel_state(csrf):
+def panel_state(csrf, full=True):
+    """Состояние ПК для панели/телефона.
+
+    full=False — «лёгкий» пакет без 30-дневной истории активности: он уходит по P2P
+    каждые несколько секунд, чтобы не гонять сотни килобайт и не будить радио телефона.
+    """
     cfg = load_config() or {"entries": []}
     normalize(cfg["entries"])
     u = PANEL_ST.get("u") or load_usage()
@@ -2396,23 +2613,24 @@ def panel_state(csrf):
             "procs": [{"name": p, "seconds": int(s)} for p, s in procs],
             "titles": [{"title": t, "seconds": int(s)} for t, s in titles]
         }
-    hist_raw = load_activity_history()
     act_by_date = {}
-    for day_key, users_map in hist_raw.items():
-        if not isinstance(users_map, dict):
-            continue
-        day_users_out = {}
-        for user, d in users_map.items():
-            if not isinstance(d, dict):
+    if full:
+        hist_raw = load_activity_history()
+        for day_key, users_map in hist_raw.items():
+            if not isinstance(users_map, dict):
                 continue
-            procs, titles = top_activity(d, n=12, min_seconds=5)
-            day_users_out[user] = {
-                "date": day_key,
-                "procs": [{"name": p, "seconds": int(s)} for p, s in procs],
-                "titles": [{"title": t, "seconds": int(s)} for t, s in titles]
-            }
-        if day_users_out:
-            act_by_date[day_key] = day_users_out
+            day_users_out = {}
+            for user, d in users_map.items():
+                if not isinstance(d, dict):
+                    continue
+                procs, titles = top_activity(d, n=12, min_seconds=5)
+                day_users_out[user] = {
+                    "date": day_key,
+                    "procs": [{"name": p, "seconds": int(s)} for p, s in procs],
+                    "titles": [{"title": t, "seconds": int(s)} for t, s in titles]
+                }
+            if day_users_out:
+                act_by_date[day_key] = day_users_out
     if act_out:
         act_by_date[today_iso] = act_out
     agents = fresh_agents()
@@ -2457,6 +2675,8 @@ def panel_state(csrf):
         "activity_date": today_iso,
         "activity": act_out,
         "activity_by_date": act_by_date,
+        "stream_active": stream_is_active(),
+        "stream_params": stream_params(),
         "ts": int(time.time() * 1000)
     }
 
@@ -2645,6 +2865,10 @@ def local_ip():
 # по общему коду привязки (pairing_code, по умолчанию 101-701) и паролю администратора.
 P2P_TOPIC_ROOT = "kidsguard/eb6ecfcf/v33_p2p"
 P2P_TOPIC_ROOT_V34 = "kidsguard/eb6ecfcf/v34_p2p"
+# Публичные MQTT-брокеры. Держим соединение с ОБОИМИ одновременно: телефон может
+# подключиться к любому из них, и раньше стороны могли «разойтись» по разным брокерам
+# (команды и кадры экрана просто не доходили).
+P2P_BROKERS = (("broker.hivemq.com", 1883), ("broker.emqx.io", 1883))
 
 
 def _mqtt_rem_len(n):
@@ -2702,10 +2926,15 @@ def _mqtt_read_rem_len(sock):
 
 
 def p2p_bridge_loop(st):
+    """Поднимает по одному P2P-мосту на каждый публичный брокер (hivemq + emqx)."""
+    for host, port in P2P_BROKERS:
+        threading.Thread(target=p2p_bridge_worker, args=(st, host, port), daemon=True).start()
+
+
+def p2p_bridge_worker(st, host, port):
     """Удалённый P2P-мост MDM для синхронизации правил и лимитов ПК через Интернет."""
-    brokers = [("broker.hivemq.com", 1883), ("broker.emqx.io", 1883)]
-    b_idx = 0
     roots = [P2P_TOPIC_ROOT, P2P_TOPIC_ROOT_V34]
+    fails = 0
     while True:
         cfg = st.get("cfg") or load_config() or {}
         web = cfg.get("web") or {}
@@ -2713,8 +2942,6 @@ def p2p_bridge_loop(st):
             time.sleep(5)
             continue
         code = str(web.get("pairing_code") or "101-701").strip() or "101-701"
-        host, port = brokers[b_idx % len(brokers)]
-        b_idx += 1
         sock = None
         try:
             sock = socket.create_connection((host, port), timeout=10)
@@ -2727,11 +2954,14 @@ def p2p_bridge_loop(st):
                 _mqtt_read_exact(sock, rl)
             if (hdr & 0xF0) != 0x20:
                 raise RuntimeError("CONNACK failed")
+            fails = 0
 
             for idx, r in enumerate(roots, 1):
                 sock.sendall(_mqtt_sub_pkt(idx, f"{r}/pc_cmd/{code}"))
 
             last_pub = 0.0
+            last_full_pub = 0.0
+            last_screen_pub = 0.0
             while True:
                 now = time.time()
                 cur_cfg = st.get("cfg") or load_config() or {}
@@ -2742,23 +2972,32 @@ def p2p_bridge_loop(st):
                 if cur_code != code:
                     break
 
-                if now - last_pub >= 3.0:
+                if now - last_pub >= 4.0:
                     last_pub = now
-                    state_payload = panel_state("p2p")
+                    # Полную историю за 30 дней отдаём редко; в обычном пакете только «сегодня».
+                    want_full = (now - last_full_pub) >= 60.0
+                    if want_full:
+                        last_full_pub = now
+                    state_payload = panel_state("p2p", full=want_full)
                     state_payload["type"] = "PC_STATE"
                     state_json_str = json.dumps(state_payload, ensure_ascii=False)
                     for r in roots:
-                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_state/{code}", state_json_str, retain=True))
-                    scr_auto = panel_screen(force=False)
-                    if scr_auto.get("ok"):
-                        scr_json_str = json.dumps({
-                            "type": "PC_SCREEN",
-                            "pairing_code": code,
-                            "screen_b64": scr_auto["screen_b64"],
-                            "ts": scr_auto.get("ts", int(time.time() * 1000))
-                        }, ensure_ascii=False)
-                        for r in roots:
-                            sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+                        # Лёгкий пакет retained (его получают новые подписчики), полный — только живьём.
+                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_state/{code}", state_json_str, retain=not want_full))
+                    # Одиночный кадр для превью (не чаще раза в 30 с и не во время потока).
+                    if not stream_is_active() and (now - last_screen_pub) >= 30.0:
+                        last_screen_pub = now
+                        scr_auto = panel_screen(force=False)
+                        if scr_auto.get("ok"):
+                            scr_json_str = json.dumps({
+                                "type": "PC_SCREEN",
+                                "pairing_code": code,
+                                "screen_b64": scr_auto["screen_b64"],
+                                "fmt": scr_auto.get("fmt", "image/png"),
+                                "ts": scr_auto.get("ts", int(time.time() * 1000))
+                            }, ensure_ascii=False)
+                            for r in roots:
+                                sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
 
                 try:
                     h = _mqtt_read_exact(sock, 1)[0]
@@ -2778,16 +3017,31 @@ def p2p_bridge_loop(st):
                             pwd = str(cmd_json.get("password", ""))
                             auth_error = ""
                             if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
-                                          "/api/fulllock_schedule", "/api/add", "/api/delete"):
+                                          "/api/fulllock_schedule", "/api/add", "/api/delete",
+                                          "/api/stream_start"):
                                 if pwd and cur_cfg.get("hash") and not check_password(
                                         pwd, cur_cfg["salt"], cur_cfg["hash"]):
                                     auth_error = "Неверный пароль программы ПК"
                                 else:
-                                    res = panel_mutate(action, data)
-                                    if not res.get("ok", False):
-                                        auth_error = str(res.get("error", "Ошибка выполнения команды"))
+                                    if action == "/api/stream_start":
+                                        # Запоминаем брокер, через который телефон попросил поток:
+                                        # кадры пойдут только туда (без двойного трафика).
+                                        st["stream_broker"] = (host, port)
+                                        stream_touch(
+                                            duration=data.get("duration", 25.0),
+                                            fps=data.get("fps"),
+                                            w=data.get("w"),
+                                            h=data.get("h"),
+                                            quality=data.get("quality")
+                                        )
+                                    else:
+                                        res = panel_mutate(action, data)
+                                        if not res.get("ok", False):
+                                            auth_error = str(res.get("error", "Ошибка выполнения команды"))
                                 st["mtime"] = 0
                                 st["sig"] = None
+                            if action == "/api/stream_stop":
+                                stream_stop()
                             if action == "/api/screen":
                                 scr_res = panel_screen(force=True)
                                 if scr_res.get("ok"):
@@ -2795,34 +3049,125 @@ def p2p_bridge_loop(st):
                                         "type": "PC_SCREEN",
                                         "pairing_code": code,
                                         "screen_b64": scr_res["screen_b64"],
+                                        "fmt": scr_res.get("fmt", "image/png"),
                                         "ts": scr_res.get("ts", int(time.time() * 1000))
                                     }, ensure_ascii=False)
                                     for r in roots:
                                         sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+                                last_screen_pub = time.time()
                             if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
                                           "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync"):
-                                state_payload = panel_state("p2p")
+                                is_sync = action == "/api/sync"
+                                state_payload = panel_state("p2p", full=is_sync)
                                 state_payload["type"] = "PC_STATE"
                                 if auth_error:
                                     state_payload["auth_error"] = auth_error
                                 state_json_str = json.dumps(state_payload, ensure_ascii=False)
                                 for r in roots:
                                     sock.sendall(_mqtt_pub_pkt(f"{r}/pc_state/{code}", state_json_str, retain=True))
-                                scr_now = panel_screen(force=False)
-                                if scr_now.get("ok"):
-                                    scr_json_str = json.dumps({
-                                        "type": "PC_SCREEN",
-                                        "pairing_code": code,
-                                        "screen_b64": scr_now["screen_b64"],
-                                        "ts": scr_now.get("ts", int(time.time() * 1000))
-                                    }, ensure_ascii=False)
-                                    for r in roots:
-                                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+                                if is_sync:
+                                    scr_now = panel_screen(force=True)
+                                    if scr_now.get("ok"):
+                                        scr_json_str = json.dumps({
+                                            "type": "PC_SCREEN",
+                                            "pairing_code": code,
+                                            "screen_b64": scr_now["screen_b64"],
+                                            "fmt": scr_now.get("fmt", "image/png"),
+                                            "ts": scr_now.get("ts", int(time.time() * 1000))
+                                        }, ensure_ascii=False)
+                                        for r in roots:
+                                            sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+                                    last_screen_pub = time.time()
                                 last_pub = time.time()
+                                last_full_pub = time.time() if is_sync else last_full_pub
                 except socket.timeout:
                     sock.sendall(bytes([0xC0, 0x00]))
         except Exception:
-            time.sleep(3)
+            # Мёртвый брокер не должен долбиться каждые 3 секунды — плавный backoff.
+            fails += 1
+            time.sleep(min(45, 3 * fails))
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+
+def p2p_stream_loop(st):
+    """Поднимает отправителя живого потока на каждый брокер (кадры уйдут только в тот,
+    через который телефон реально запросил просмотр)."""
+    for host, port in P2P_BROKERS:
+        threading.Thread(target=p2p_stream_worker, args=(st, host, port), daemon=True).start()
+
+
+def p2p_stream_worker(st, host, port):
+    """Отдельное P2P-соединение для ЖИВОГО ПОТОКА экрана ПК.
+
+    Держим его отдельно от командного канала, чтобы кодирование/отправка кадров
+    (5–10 кадров в секунду) не задерживала команды блокировки и синхронизации.
+    Работает только пока жива аренда потока (stream_p2p_active()).
+    """
+    roots = [P2P_TOPIC_ROOT_V34]  # новые версии приложения слушают v34 — видео не дублируем
+    while True:
+        if not stream_p2p_active():
+            time.sleep(0.5)
+            continue
+        # Если телефон запросил поток через конкретный брокер — второй не дублирует трафик.
+        target = st.get("stream_broker")
+        if target and target != (host, port):
+            time.sleep(0.4)
+            continue
+        cfg = st.get("cfg") or load_config() or {}
+        web = cfg.get("web") or {}
+        if not web.get("enabled", True):
+            time.sleep(2)
+            continue
+        code = str(web.get("pairing_code") or "101-701").strip() or "101-701"
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=10)
+            sock.settimeout(5.0)
+            sock.sendall(_mqtt_connect_pkt(f"hb_stream_{code}_{secrets.token_hex(4)}"))
+            hdr = _mqtt_read_exact(sock, 1)[0]
+            rl = _mqtt_read_rem_len(sock)
+            if rl > 0:
+                _mqtt_read_exact(sock, rl)
+            if (hdr & 0xF0) != 0x20:
+                raise RuntimeError("CONNACK failed (stream)")
+            seq = 0
+            while stream_p2p_active():
+                cur_cfg = st.get("cfg") or cfg or {}
+                cur_web = cur_cfg.get("web") or {}
+                if not cur_web.get("enabled", True):
+                    break
+                if (str(cur_web.get("pairing_code") or "101-701").strip() or "101-701") != code:
+                    break
+                cur_target = st.get("stream_broker")
+                if cur_target and cur_target != (host, port):
+                    break
+                params = stream_params()
+                frame = capture_screen_frame(params["w"], params["h"], quality=params["quality"])
+                if not frame:
+                    time.sleep(0.4)
+                    continue
+                data, ctype = frame
+                seq += 1
+                payload = json.dumps({
+                    "type": "PC_STREAM_FRAME",
+                    "pairing_code": code,
+                    "seq": seq,
+                    "ts": int(time.time() * 1000),
+                    "w": params["w"],
+                    "h": params["h"],
+                    "fmt": ctype,
+                    "b64": base64.b64encode(data).decode("ascii")
+                }, ensure_ascii=False)
+                for r in roots:
+                    sock.sendall(_mqtt_pub_pkt(f"{r}/pc_stream/{code}", payload, retain=False))
+                time.sleep(1.0 / max(1.0, params["fps"]))
+        except Exception:
+            time.sleep(2)
         finally:
             if sock:
                 try:

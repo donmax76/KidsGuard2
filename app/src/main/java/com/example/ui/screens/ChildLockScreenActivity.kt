@@ -51,6 +51,13 @@ class ChildLockScreenActivity : ComponentActivity() {
           WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
           WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
     )
+    // Экран блокировки не должен гореть сутками — через 45 секунд разрешаем подсветке
+    // погаснуть (сама блокировка остаётся и появится при включении экрана).
+    window.decorView.postDelayed({
+      try {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+      } catch (_: Exception) {}
+    }, 45_000L)
 
     val reason = intent.getStringExtra("EXTRA_REASON")
       ?: "Телефон заблокирован родительским контролем KidsGuard.\nРазблокируйте через телефон родителя или введите PIN-код ниже."

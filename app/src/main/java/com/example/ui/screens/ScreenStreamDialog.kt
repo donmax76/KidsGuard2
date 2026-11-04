@@ -86,6 +86,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.data.cloud.CloudSyncManager
 import com.example.data.model.ChildProfileEntity
 import com.example.ui.theme.AmberWarning
@@ -128,6 +131,22 @@ fun ScreenStreamDialog(
 
   var isAutoStreamActive by remember { mutableStateOf(true) }
   var refreshIntervalSec by remember { mutableFloatStateOf(2.0f) }
+
+  // Пока приложение свёрнуто — не опрашиваем телефон ребёнка и не держим его экран
+  // в режиме трансляции (это зря жжёт батарею у обоих устройств).
+  var isAppResumed by remember { mutableStateOf(true) }
+  val lifecycleOwner = LocalLifecycleOwner.current
+  DisposableEffect(lifecycleOwner) {
+    val observer = LifecycleEventObserver { _, event ->
+      when (event) {
+        Lifecycle.Event.ON_RESUME -> isAppResumed = true
+        Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> isAppResumed = false
+        else -> {}
+      }
+    }
+    lifecycleOwner.lifecycle.addObserver(observer)
+    onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+  }
 
   val childId = child?.id ?: 0L
   val childName = child?.name ?: "Нет добавленного ребёнка"
@@ -211,10 +230,29 @@ fun ScreenStreamDialog(
     }
   }
 
-  // Continuous live polling while dialog is open
-  LaunchedEffect(isAutoStreamActive, refreshIntervalSec, childId) {
+  // Открытие/сворачивание: включаем и выключаем «живое окно» на телефоне ребёнка.
+  LaunchedEffect(childId, isAppResumed) {
     if (childId <= 0L) return@LaunchedEffect
-    while (isAutoStreamActive) {
+    if (isAppResumed) {
+      onSendCloudCommand("START_LIVE_STREAM", "")
+      onSendCloudCommand("TAKE_SCREENSHOT", "")
+    } else {
+      onSendCloudCommand("STOP_LIVE_STREAM", "")
+    }
+  }
+
+  // Continuous live polling while dialog is open
+  LaunchedEffect(isAutoStreamActive, refreshIntervalSec, childId, isAppResumed) {
+    if (childId <= 0L || !isAppResumed) return@LaunchedEffect
+    var lastStartSentMs = 0L
+    while (isAutoStreamActive && isAppResumed) {
+      // «Живое окно» на телефоне живёт 120 с — продлеваем его раз в минуту,
+      // пока родитель реально смотрит экран.
+      val nowMs = System.currentTimeMillis()
+      if (nowMs - lastStartSentMs > 60_000L) {
+        lastStartSentMs = nowMs
+        onSendCloudCommand("START_LIVE_STREAM", "")
+      }
       onSendCloudCommand("TAKE_SCREENSHOT", "")
       val fetched = cloudSync.pollLatestScreenSnapshot(childId)
       if (fetched != null) {
@@ -224,14 +262,18 @@ fun ScreenStreamDialog(
           remoteTimestamp = ts
         }
         if (b64.isNotBlank()) {
-          try {
-            val bytes = Base64.decode(b64, Base64.DEFAULT)
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            if (bmp != null) {
-              remoteBitmap = bmp
-              frameSequenceCount++
+          val bmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            try {
+              val bytes = Base64.decode(b64, Base64.DEFAULT)
+              BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            } catch (_: Exception) {
+              null
             }
-          } catch (_: Exception) {}
+          }
+          if (bmp != null) {
+            remoteBitmap = bmp
+            frameSequenceCount++
+          }
         }
       }
       val delayMs = (refreshIntervalSec * 1000).toLong().coerceAtLeast(1200L)

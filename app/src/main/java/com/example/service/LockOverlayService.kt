@@ -215,6 +215,17 @@ class LockOverlayService : Service() {
 
       overlayView = layout
       windowManager?.addView(overlayView, params)
+      // Через 45 секунд разрешаем экрану погаснуть (оверлей остаётся и появится при
+      // включении экрана) — иначе заблокированный телефон горит всю ночь и сажает батарею.
+      android.os.Handler(mainLooper).postDelayed({
+        try {
+          val p = overlayView?.layoutParams as? WindowManager.LayoutParams
+          if (p != null) {
+            p.flags = p.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
+            windowManager?.updateViewLayout(overlayView, p)
+          }
+        } catch (_: Exception) {}
+      }, 45_000L)
       Log.d(TAG, "Unified full-screen device lock overlay displayed")
     } catch (e: Exception) {
       Log.e(TAG, "showFullDeviceLockOverlay failed: ${e.message}")

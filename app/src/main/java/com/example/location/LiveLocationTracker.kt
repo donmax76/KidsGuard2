@@ -399,6 +399,17 @@ class LiveLocationTracker(
   @Volatile
   private var lastAcceptedLocation: Location? = null
 
+  // Экономный GPS: режим «высокая точность» только пока родитель смотрит карту,
+  // а обратный геокодинг и запись в БД — не на каждую секунду, а по факту перемещения.
+  @Volatile
+  private var lastTrackingHighAccuracy: Boolean = false
+  private var lastTrackingModeSwitchMs: Long = 0L
+  @Volatile
+  private var lastGeocodeAddress: String = ""
+  @Volatile
+  private var lastGeocodeMs: Long = 0L
+  private var lastPersistMs: Long = 0L
+
   init {
     activeInstances.add(this)
     readRealDeviceBattery()
@@ -500,7 +511,12 @@ class LiveLocationTracker(
         }.also { activeListener = it }
 
         var anyActive = false
-        // 1. Primary Google Play Services FusedLocationProviderClient with forced PRIORITY_HIGH_ACCURACY
+        // Режим трекинга зависит от того, смотрит ли родитель карту прямо сейчас.
+        // Раньше ВСЕГДА запрашивался PRIORITY_HIGH_ACCURACY каждые 3–8 секунд — GPS-радио
+        // не спало никогда, и телефон ребёнка разряжался за несколько часов.
+        val parentViewing = com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
+        lastTrackingHighAccuracy = parentViewing
+        // 1. Primary Google Play Services FusedLocationProviderClient
         try {
           val fused = fusedLocationClient
           if (fused != null) {
@@ -510,9 +526,12 @@ class LiveLocationTracker(
               }
             }
             val currentReq = CurrentLocationRequest.Builder()
-              .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
-              .setMaxUpdateAgeMillis(5_000L)
-              .setDurationMillis(8_000L)
+              .setPriority(
+                if (parentViewing) Priority.PRIORITY_HIGH_ACCURACY
+                else Priority.PRIORITY_BALANCED_POWER_ACCURACY
+              )
+              .setMaxUpdateAgeMillis(if (parentViewing) 10_000L else 60_000L)
+              .setDurationMillis(if (parentViewing) 8_000L else 20_000L)
               .build()
             fused.getCurrentLocation(currentReq, null)
               .addOnSuccessListener { loc ->
@@ -539,13 +558,15 @@ class LiveLocationTracker(
               }
             }
             fusedLocationCallback = cb
+            val fusedInterval = if (parentViewing) 12_000L else 90_000L
             val fusedReq = com.google.android.gms.location.LocationRequest.Builder(
-              Priority.PRIORITY_HIGH_ACCURACY,
-              8_000L
+              if (parentViewing) Priority.PRIORITY_HIGH_ACCURACY
+              else Priority.PRIORITY_BALANCED_POWER_ACCURACY,
+              fusedInterval
             )
-              .setMinUpdateIntervalMillis(3_000L)
-              .setMinUpdateDistanceMeters(3f)
-              .setWaitForAccurateLocation(true)
+              .setMinUpdateIntervalMillis(if (parentViewing) 8_000L else 60_000L)
+              .setMinUpdateDistanceMeters(if (parentViewing) 10f else 30f)
+              .setWaitForAccurateLocation(parentViewing)
               .build()
             fused.requestLocationUpdates(fusedReq, cb, Looper.getMainLooper())
             anyActive = true
@@ -557,10 +578,15 @@ class LiveLocationTracker(
           try {
             if (lm.allProviders.contains(provider)) {
               val isSatelliteGps = provider == LocationManager.GPS_PROVIDER
-              val intervalMs = if (isSatelliteGps) 10_000L else 8_000L
-              val minDistanceM = 0f
+              val intervalMs = when {
+                parentViewing && isSatelliteGps -> 15_000L
+                parentViewing -> 20_000L
+                isSatelliteGps -> 180_000L
+                else -> 300_000L
+              }
+              val minDistanceM = if (parentViewing) 10f else 50f
               if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val quality = if (isSatelliteGps) {
+                val quality = if (parentViewing && isSatelliteGps) {
                   android.location.LocationRequest.QUALITY_HIGH_ACCURACY
                 } else {
                   android.location.LocationRequest.QUALITY_BALANCED_POWER_ACCURACY
@@ -568,7 +594,7 @@ class LiveLocationTracker(
                 val req = android.location.LocationRequest.Builder(intervalMs)
                   .setQuality(quality)
                   .setMinUpdateDistanceMeters(minDistanceM)
-                  .setMinUpdateIntervalMillis(3_000L)
+                  .setMinUpdateIntervalMillis(if (parentViewing) 10_000L else 120_000L)
                   .build()
                 lm.requestLocationUpdates(provider, req, context.mainExecutor, listener)
               } else {
@@ -595,22 +621,50 @@ class LiveLocationTracker(
     if (prev != null && !isBetterLocation(loc, prev)) {
       return
     }
+    val movedMeters = if (prev != null) {
+      distanceMeters(prev.latitude, prev.longitude, loc.latitude, loc.longitude)
+    } else {
+      Double.MAX_VALUE
+    }
     lastAcceptedLocation = loc
     latestHardwareFix = loc
     if (loc.accuracy in 0.1f..80f) {
       lastKnownHighAccuracyLocation = loc
     }
 
+    val nowMs = System.currentTimeMillis()
+    // Переключаем режим GPS при появлении/пропадании родителя на карте (не чаще раза в 30 с).
+    val parentViewingNow = com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
+    if (parentViewingNow != lastTrackingHighAccuracy && nowMs - lastTrackingModeSwitchMs > 30_000L) {
+      lastTrackingModeSwitchMs = nowMs
+      startRealLocationUpdates()
+    }
+
+    // Геокодинг — только при заметном перемещении или раз в 2 минуты (сеть/Geocoder дорогие).
+    val needGeocode = lastGeocodeAddress.isBlank() || movedMeters > 60.0 || nowMs - lastGeocodeMs > 120_000L
+    // Запись маршрута в SQLite — при перемещении >40 м или раз в минуту.
+    val needPersist = movedMeters > 40.0 || nowMs - lastPersistMs > 60_000L
+
     scope.launch(Dispatchers.IO) {
       val effectiveLat = loc.latitude
       val effectiveLng = loc.longitude
-      val realAddress = reverseGeocodeExact(context, effectiveLat, effectiveLng)
+      val realAddress = if (needGeocode) {
+        val fresh = reverseGeocodeExact(context, effectiveLat, effectiveLng)
+        if (fresh.isNotBlank() && !isStaleOrDemoAddress(fresh)) {
+          lastGeocodeAddress = fresh
+          lastGeocodeMs = System.currentTimeMillis()
+          fresh
+        } else {
+          lastGeocodeAddress.ifBlank { fresh }
+        }
+      } else {
+        lastGeocodeAddress.ifBlank { _locationState.value.currentAddress }
+      }
       val speed = (loc.speed * 3.6f).coerceAtLeast(0f)
       val accuracy = if (loc.accuracy > 0f) loc.accuracy else 8f
       val batt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(context)
       val zoneName = checkGeofenceTransition(effectiveLat, effectiveLng)
 
-      val nowMs = System.currentTimeMillis()
       val cutoff24h = nowMs - 24L * 3600L * 1000L
       val newCrumb = LocationBreadcrumb(
         latitude = effectiveLat,
@@ -637,6 +691,9 @@ class LiveLocationTracker(
         batteryLevel = batt,
         isMoving = speed > 2.5f
       )
+
+      if (!needPersist) return@launch
+      lastPersistMs = nowMs
 
       // Directly sync real physical device GPS coordinates & save to Offline Store-and-Forward Room DB when this phone is CHILD
       try {

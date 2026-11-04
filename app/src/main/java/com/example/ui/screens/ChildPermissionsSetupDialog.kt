@@ -126,12 +126,14 @@ fun ChildPermissionsSetupDialog(
     if (result.resultCode == Activity.RESULT_OK && result.data != null) {
       ScreenShotManager.onPermissionGrantedFromUi(context, result.resultCode, result.data!!)
       KidsGuardBackgroundService.startWithMediaProjection(context, result.resultCode, result.data!!)
-      com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(24L * 3600_000L)
-      Toast.makeText(context, "Живая трансляция экрана (LIVE с индикацией) включена и сохранена!", Toast.LENGTH_SHORT).show()
+      // Короткое окно (90 с) — только чтобы показать первый кадр родителю.
+      // Постоянная трансляция НЕ включается: экран передаётся по запросу и гаснет
+      // сразу после просмотра, иначе телефон ребёнка разряжается за считаные часы.
+      com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
+      Toast.makeText(context, "Живая трансляция экрана разрешена и сохранена! Показ — по запросу родителя.", Toast.LENGTH_SHORT).show()
     } else {
-      com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(24L * 3600_000L)
       KidsGuardBackgroundService.start(context, enableProjectionFgs = true)
-      Toast.makeText(context, "Режим живой трансляции сохранен в фоновой службе", Toast.LENGTH_SHORT).show()
+      Toast.makeText(context, "Разрешение на трансляцию не выдано — экран будет недоступен для просмотра", Toast.LENGTH_SHORT).show()
     }
     refreshStatuses()
   }
@@ -332,7 +334,7 @@ fun ChildPermissionsSetupDialog(
             PermissionItemCard(
               title = "4. Живая трансляция экрана (LIVE с индикацией)",
               description = if (isLiveGranted)
-                "Прямая трансляция экрана активна и сохранена в памяти (не сбрасывается при закрытии окон)"
+                "Разрешение сохранено. Экран передаётся только по запросу родителя — в фоне батарея не тратится"
               else
                 "Нажмите и выберите «Начать» в системном окне Android для живого показа и записи экрана",
               isGranted = isLiveGranted,
@@ -342,7 +344,7 @@ fun ChildPermissionsSetupDialog(
                   ScreenShotManager.setLiveStreamEnabled(context, true)
                   isLiveStreamPersisted = true
                   KidsGuardBackgroundService.start(context, enableProjectionFgs = true)
-                  com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(3600_000L)
+                  com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
                   val mpm = context.getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
                   if (mpm != null) {
                     mediaProjectionLauncher.launch(mpm.createScreenCaptureIntent())

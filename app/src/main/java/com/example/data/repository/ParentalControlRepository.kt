@@ -609,8 +609,15 @@ class ParentalControlRepository(private val context: Context) {
                     "STOP_LOUD_RING" -> {
                       stopDeviceLoudAlarm()
                     }
-                    "START_LIVE_STREAM", "TAKE_SCREENSHOT", "QUERY_ACTIVE_APP" -> {
+                    "START_LIVE_STREAM" -> {
+                      // Только явный просмотр включает «живое окно». Одиночный снимок
+                      // (TAKE_SCREENSHOT) и запрос активного приложения НЕ должны
+                      // держать MediaProjection включённым — иначе батарея течёт зря.
                       com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(120_000L)
+                    }
+                    "STOP_LIVE_STREAM" -> {
+                      // Родитель закрыл просмотр — сразу отцепляем зеркало экрана (экономия батареи).
+                      com.example.service.KidsGuardAccessibilityService.stopLiveStreamingWindow()
                     }
                     "REQUEST_GPS_NOW", "REQUEST_OFFLINE_SYNC" -> {
                       if (!com.example.location.LiveLocationTracker.isEmulator() && com.example.location.LiveLocationTracker.isGpsTrackingAllowed) {

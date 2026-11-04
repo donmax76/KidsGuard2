@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "255421920761",
+    "project_id": "gen-lang-client-0664045019",
+    "storage_bucket": "gen-lang-client-0664045019.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:255421920761:android:f8efc525961314aa517928",
+        "android_client_info": {
+          "package_name": "com.aistudio.kidsguard.pvrtqx"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB0gCjqyVEyzGR3l_RkbV2S_imOoo8oVYs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      },
+      "configuration_version": "1"
+    }
+  ],
+  "configuration_version": "1"
+}

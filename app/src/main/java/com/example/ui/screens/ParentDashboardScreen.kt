@@ -208,17 +208,50 @@ fun ParentDashboardScreen(
     item {
       val pcState by com.example.data.pc.PcBlockerClient.state.collectAsState()
       val enabledRules = pcState.entries.count { it.enabled }
-      val pcLiveBitmap = remember(pcState.screenBase64) {
-        if (pcState.screenBase64.isNotBlank()) {
+      // Живой кадр с ПК (поток включается только пока дашборд на экране и приложение активно).
+      val pcLiveFrame by com.example.data.pc.PcBlockerClient.liveFrame.collectAsState()
+      var pcLiveBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+      androidx.compose.runtime.LaunchedEffect(pcState.screenBase64) {
+        val raw = pcState.screenBase64
+        pcLiveBitmap = if (raw.isBlank()) null else kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
           try {
-            val bytes = android.util.Base64.decode(pcState.screenBase64, android.util.Base64.DEFAULT)
+            val bytes = android.util.Base64.decode(raw, android.util.Base64.DEFAULT)
             android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
           } catch (_: Exception) {
             null
           }
-        } else null
+        }
+      }
+      var isDashboardResumed by remember { mutableStateOf(true) }
+      val dashboardLifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+      androidx.compose.runtime.DisposableEffect(dashboardLifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+          when (event) {
+            androidx.lifecycle.Lifecycle.Event.ON_RESUME -> isDashboardResumed = true
+            androidx.lifecycle.Lifecycle.Event.ON_PAUSE,
+            androidx.lifecycle.Lifecycle.Event.ON_STOP -> isDashboardResumed = false
+            else -> {}
+          }
+        }
+        dashboardLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { dashboardLifecycleOwner.lifecycle.removeObserver(observer) }
+      }
+      androidx.compose.runtime.LaunchedEffect(isDashboardResumed, pcState.pairingCode) {
+        if (isDashboardResumed) {
+          // 2 к/с и «Эконом» — превью на главном экране не должно сажать батарею.
+          com.example.data.pc.PcBlockerClient.startScreenStream(
+            fps = 2,
+            quality = com.example.data.pc.PcStreamQuality.ECONOMY
+          )
+        } else {
+          com.example.data.pc.PcBlockerClient.stopScreenStream()
+        }
+      }
+      androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose { com.example.data.pc.PcBlockerClient.stopScreenStream() }
       }
       val activePcWin = pcState.activeWindows.firstOrNull()
+      val dashboardPcBitmap = pcLiveFrame?.bitmap ?: pcLiveBitmap
 
       Card(
         shape = RoundedCornerShape(20.dp),
@@ -278,7 +311,7 @@ fun ParentDashboardScreen(
           }
 
           // Live PC Desktop Screen Preview or Static Window Bar directly on Main Dashboard
-          if (pcLiveBitmap != null) {
+          if (dashboardPcBitmap != null) {
             Box(
               modifier = Modifier
                 .fillMaxWidth()
@@ -288,7 +321,7 @@ fun ParentDashboardScreen(
                 .clickable { onNavigateTab(ParentTab.PC_CONTROL) }
             ) {
               androidx.compose.foundation.Image(
-                bitmap = pcLiveBitmap.asImageBitmap(),
+                bitmap = dashboardPcBitmap.asImageBitmap(),
                 contentDescription = "Живой экран ПК ребёнка",
                 contentScale = androidx.compose.ui.layout.ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
@@ -302,7 +335,7 @@ fun ParentDashboardScreen(
                   .padding(horizontal = 8.dp, vertical = 4.dp)
               ) {
                 Text(
-                  text = "🟢 ЖИВОЙ ЭКРАН ПК (pyautogui)",
+                  text = if (pcLiveFrame != null) "🟢 ЖИВОЙ ЭКРАН ПК • 2 к/с" else "🟢 ПОСЛЕДНИЙ КАДР ЭКРАНА ПК",
                   color = EmeraldShieldLight,
                   fontSize = 10.sp,
                   fontWeight = FontWeight.Bold,

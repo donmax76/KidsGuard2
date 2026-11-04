@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Base64
@@ -8,6 +9,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -37,6 +39,7 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
@@ -82,10 +85,14 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.data.model.AggregatedActivityByDateItem
 import com.example.data.pc.PcActivityItem
 import com.example.data.pc.PcBlockerClient
 import com.example.data.pc.PcEntry
+import com.example.data.pc.PcStreamQuality
 import com.example.ui.ActivityDateFilterPreset
 import com.example.ui.ActivityDateFilterState
 import com.example.ui.theme.AmberWarning
@@ -115,8 +122,10 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private fun formatDurationRu(totalSeconds: Long): String {
   val sec = totalSeconds.coerceAtLeast(0L)
@@ -218,18 +227,44 @@ fun PcControlScreen(
   var pcRecordingSeconds by remember { mutableIntStateOf(0) }
   var recordedPcVideoUri by remember { mutableStateOf<Uri?>(null) }
   var autoRefreshScreen by remember { mutableStateOf(true) }
+  var pcStreamQuality by remember { mutableStateOf(PcStreamQuality.BALANCED) }
 
-  val pcScreenBitmap = remember(pcState.screenBase64) {
-    if (pcState.screenBase64.isNotBlank()) {
+  val liveFrame by PcBlockerClient.liveFrame.collectAsState()
+  val streamStatus by PcBlockerClient.streamStatus.collectAsState()
+
+  // Живой поток экрана ПК держим включённым ТОЛЬКО пока этот экран виден и приложение
+  // на переднем плане: свернули приложение — поток сразу гаснет (экономия батареи и трафика).
+  var isAppResumed by remember { mutableStateOf(true) }
+  val lifecycleOwner = LocalLifecycleOwner.current
+  DisposableEffect(lifecycleOwner) {
+    val observer = LifecycleEventObserver { _, event ->
+      when (event) {
+        Lifecycle.Event.ON_RESUME -> isAppResumed = true
+        Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> isAppResumed = false
+        else -> {}
+      }
+    }
+    lifecycleOwner.lifecycle.addObserver(observer)
+    onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+  }
+
+  // Одиночный кадр-снимок (fallback, если ПК старой версии и живого потока ещё нет).
+  // Base64 декодируем в фоне, а не на UI-потоке, как было раньше.
+  var snapshotBitmap by remember { mutableStateOf<Bitmap?>(null) }
+  LaunchedEffect(pcState.screenBase64) {
+    val raw = pcState.screenBase64
+    if (raw.isBlank()) return@LaunchedEffect
+    snapshotBitmap = withContext(Dispatchers.Default) {
       try {
-        val clean = pcState.screenBase64.substringAfter("base64,")
-        val bytes = Base64.decode(clean, Base64.DEFAULT)
+        val bytes = Base64.decode(raw.substringAfter("base64,"), Base64.DEFAULT)
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
       } catch (_: Exception) {
         null
       }
-    } else null
+    }
   }
+
+  val pcScreenBitmap = liveFrame?.bitmap ?: snapshotBitmap
 
   val currentPcSummary = remember(pcState.activeWindows) {
     val win = pcState.activeWindows.firstOrNull()
@@ -241,11 +276,20 @@ fun PcControlScreen(
     }
   }
 
-  LaunchedEffect(autoRefreshScreen) {
-    while (autoRefreshScreen) {
-      PcBlockerClient.requestPcScreenshot()
-      delay(3500)
+  LaunchedEffect(isAppResumed, autoRefreshScreen, showFullPcScreenDialog, pcStreamQuality) {
+    if (isAppResumed && autoRefreshScreen) {
+      // На весь экран — плавнее (8 к/с), в карточке — экономные 4 к/с.
+      PcBlockerClient.startScreenStream(
+        fps = if (showFullPcScreenDialog) 8 else 4,
+        quality = pcStreamQuality
+      )
+    } else {
+      PcBlockerClient.stopScreenStream()
     }
+  }
+
+  DisposableEffect(Unit) {
+    onDispose { PcBlockerClient.stopScreenStream() }
   }
 
   LaunchedEffect(isRecordingPcVideo) {
@@ -253,7 +297,7 @@ fun PcControlScreen(
       pcRecordingSeconds = 0
       while (isRecordingPcVideo) {
         val timeNow = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-        val frameBmp = pcScreenBitmap ?: renderWatchedContentFrameBitmap(
+        val frameBmp = liveFrame?.bitmap ?: pcScreenBitmap ?: renderWatchedContentFrameBitmap(
           childName = "Компьютер (${pcState.pairingCode})",
           rawAppSummary = currentPcSummary,
           timeStr = timeNow
@@ -783,7 +827,12 @@ fun PcControlScreen(
               }
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-              Text("Авто", color = Slate200, fontSize = 11.sp)
+              Text(
+                text = if (streamStatus.isActive && streamStatus.frames > 0) "${streamStatus.fps} к/с" else "LIVE",
+                color = if (streamStatus.isActive) EmeraldShieldLight else Slate400,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold
+              )
               Switch(
                 checked = autoRefreshScreen,
                 onCheckedChange = { autoRefreshScreen = it },
@@ -795,7 +844,7 @@ fun PcControlScreen(
             }
           }
 
-          val fallbackMonitorBitmap = remember(pcState.pairingCode, currentPcSummary, pcState.lastSyncMs) {
+          val fallbackMonitorBitmap = remember(pcState.pcName, currentPcSummary) {
             val timeNow = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
             renderWatchedContentFrameBitmap(
               childName = "Компьютер (${pcState.pcName})",
@@ -831,11 +880,65 @@ fun PcControlScreen(
                 .padding(horizontal = 8.dp, vertical = 4.dp)
             ) {
               Text(
-                text = if (pcScreenBitmap != null) "🟢 LIVE ЭКРАН ПК (нажмите на весь экран)" else "🖥 МОНИТОР ПК (нажмите для открытия)",
+                text = when {
+                  streamStatus.isActive && streamStatus.frames > 0 ->
+                    "🟢 LIVE ПОТОК ${streamStatus.fps} к/с • ${streamStatus.transport} • нажмите для полного экрана"
+                  pcScreenBitmap != null ->
+                    "🖥 КАДР ЭКРАНА ПК • нажмите для полного экрана"
+                  else -> "🖥 ПОДКЛЮЧЕНИЕ К ЭКРАНУ ПК…"
+                },
                 color = if (pcScreenBitmap != null) EmeraldShieldLight else CyanLight,
-                fontSize = 10.sp,
+                fontSize = 9.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
                 fontWeight = FontWeight.ExtraBold
               )
+            }
+            streamStatus.error?.let { err ->
+              Box(
+                modifier = Modifier
+                  .align(Alignment.BottomStart)
+                  .padding(8.dp)
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(Color.Black.copy(alpha = 0.72f))
+                  .padding(horizontal = 8.dp, vertical = 4.dp)
+              ) {
+                Text(
+                  text = "⚠️ $err",
+                  color = AmberWarning,
+                  fontSize = 9.sp,
+                  maxLines = 2,
+                  overflow = TextOverflow.Ellipsis
+                )
+              }
+            }
+          }
+
+          // Качество живого потока: чем меньше кадр, тем меньше трафика и нагрузки.
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Text("Качество:", color = Slate400, fontSize = 10.sp)
+            PcStreamQuality.values().forEach { option ->
+              val selected = pcStreamQuality == option
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(if (selected) CyanLight.copy(alpha = 0.22f) else Slate950)
+                  .border(1.dp, if (selected) CyanLight else Slate800, RoundedCornerShape(8.dp))
+                  .clickable { pcStreamQuality = option }
+                  .padding(horizontal = 8.dp, vertical = 4.dp)
+              ) {
+                Text(
+                  text = "${option.label} ${option.width}×${option.height}",
+                  color = if (selected) CyanLight else Slate200,
+                  fontSize = 10.sp,
+                  fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                  maxLines = 1
+                )
+              }
             }
           }
 
@@ -1479,17 +1582,11 @@ fun PcControlScreen(
   }
 
   if (showFullPcScreenDialog) {
-    LaunchedEffect(Unit) {
-      while (true) {
-        PcBlockerClient.requestPcScreenshot()
-        delay(2500L)
-      }
-    }
     androidx.compose.ui.window.Dialog(
       onDismissRequest = { showFullPcScreenDialog = false },
       properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
     ) {
-      val fallbackBmp = remember(pcState.pairingCode, currentPcSummary, pcState.lastSyncMs) {
+      val fallbackBmp = remember(pcState.pcName, currentPcSummary) {
         val timeNow = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         renderWatchedContentFrameBitmap(
           childName = "Компьютер (${pcState.pcName})",
@@ -1497,10 +1594,11 @@ fun PcControlScreen(
           timeStr = timeNow
         )
       }
-      val fullBmp = pcScreenBitmap ?: fallbackBmp
-      val frameTimeStr = remember(pcState.screenTimestampMs) {
-        if (pcState.screenTimestampMs > 0L) {
-          SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(pcState.screenTimestampMs))
+      val fullBmp = liveFrame?.bitmap ?: pcScreenBitmap ?: fallbackBmp
+      val liveTs = liveFrame?.timestampMs ?: pcState.screenTimestampMs
+      val frameTimeStr = remember(liveTs) {
+        if (liveTs > 0L) {
+          SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(liveTs))
         } else {
           SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         }
@@ -1526,11 +1624,16 @@ fun PcControlScreen(
               fontWeight = FontWeight.ExtraBold
             )
             Text(
-              text = if (pcScreenBitmap != null) "🟢 Прямая трансляция монитора • Кадр: $frameTimeStr"
-              else "⏳ Запрос живого кадра монитора с ПК ($frameTimeStr)...",
-              color = if (pcScreenBitmap != null) EmeraldShieldLight else CyanLight,
+              text = if (liveFrame != null) {
+                "🟢 LIVE ${streamStatus.fps} к/с • ${streamStatus.transport} • кадр $frameTimeStr"
+              } else {
+                "⏳ Подключаем живой поток монитора… ($frameTimeStr)"
+              },
+              color = if (liveFrame != null) EmeraldShieldLight else CyanLight,
               fontSize = 11.sp,
-              fontWeight = FontWeight.SemiBold
+              fontWeight = FontWeight.SemiBold,
+              maxLines = 2,
+              overflow = TextOverflow.Ellipsis
             )
           }
           Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1542,7 +1645,7 @@ fun PcControlScreen(
             ) {
               Icon(Icons.Default.Refresh, contentDescription = null, tint = CyanLight, modifier = Modifier.size(16.dp))
               Spacer(modifier = Modifier.width(4.dp))
-              Text("Обновить", color = CyanLight, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+              Text("Кадр", color = CyanLight, fontSize = 12.sp, fontWeight = FontWeight.Bold)
             }
             Button(
               onClick = { showFullPcScreenDialog = false },
@@ -1570,6 +1673,18 @@ fun PcControlScreen(
             contentScale = ContentScale.Fit,
             modifier = Modifier.fillMaxSize()
           )
+          if (!streamStatus.isActive) {
+            Box(
+              modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(8.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(AmberWarning.copy(alpha = 0.9f))
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+              Text("⏸ Поток на паузе", color = Slate950, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            }
+          }
         }
 
         Column(
@@ -1580,6 +1695,60 @@ fun PcControlScreen(
             .padding(12.dp),
           verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Text(
+              text = "Плавность потока",
+              color = Slate400,
+              fontSize = 11.sp,
+              fontWeight = FontWeight.Bold
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+              listOf(3, 5, 8).forEach { fpsValue ->
+                val selected = streamStatus.isActive && kotlin.math.abs(streamStatus.fps - fpsValue.toFloat()) < 1.5f
+                Box(
+                  modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (selected) CyanLight.copy(alpha = 0.25f) else Slate950)
+                    .border(1.dp, if (selected) CyanLight else Slate800, RoundedCornerShape(8.dp))
+                    .clickable { PcBlockerClient.startScreenStream(fps = fpsValue, quality = pcStreamQuality) }
+                    .padding(horizontal = 10.dp, vertical = 5.dp)
+                ) {
+                  Text("$fpsValue к/с", color = if (selected) CyanLight else Slate200, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                }
+              }
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(if (!streamStatus.isActive) AmberWarning.copy(alpha = 0.25f) else Slate950)
+                  .border(1.dp, if (!streamStatus.isActive) AmberWarning else Slate800, RoundedCornerShape(8.dp))
+                  .clickable {
+                    if (streamStatus.isActive) PcBlockerClient.stopScreenStream()
+                    else PcBlockerClient.startScreenStream(fps = 8, quality = pcStreamQuality)
+                  }
+                  .padding(horizontal = 10.dp, vertical = 5.dp)
+                ) {
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Icon(
+                      if (streamStatus.isActive) Icons.Default.Pause else Icons.Default.PlayArrow,
+                      contentDescription = null,
+                      tint = if (streamStatus.isActive) Slate200 else AmberWarning,
+                      modifier = Modifier.size(12.dp)
+                    )
+                    Text(
+                      if (streamStatus.isActive) "Пауза" else "Пуск",
+                      color = if (streamStatus.isActive) Slate200 else AmberWarning,
+                      fontSize = 11.sp,
+                      fontWeight = FontWeight.Bold
+                    )
+                  }
+                }
+              }
+            }
+
           Text(
             text = "🎬 Активное окно на ПК: $currentPcSummary",
             color = Color.White,

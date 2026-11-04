@@ -50,25 +50,26 @@ android {
   }
 
   signingConfigs {
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+    // Проектный debug.keystore может отсутствовать (например, на CI или на новом ПК).
+    // Раньше build падал на подписи; теперь при отсутствии файла используется
+    // стандартный debug-ключ Android (AGP создаст его сам).
+    val projectDebugKeystore = file("${rootDir}/debug.keystore")
+    if (projectDebugKeystore.exists()) {
+      create("debugConfig") {
+        storeFile = projectDebugKeystore
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+      }
     }
-    create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      val releaseKeyFile = file(keystorePath)
-      if (releaseKeyFile.exists() && !System.getenv("STORE_PASSWORD").isNullOrBlank()) {
+    val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
+    val releaseKeyFile = file(keystorePath)
+    if (releaseKeyFile.exists() && !System.getenv("STORE_PASSWORD").isNullOrBlank()) {
+      create("release") {
         storeFile = releaseKeyFile
         storePassword = System.getenv("STORE_PASSWORD")
         keyAlias = "upload"
         keyPassword = System.getenv("KEY_PASSWORD")
-      } else {
-        storeFile = file("${rootDir}/debug.keystore")
-        storePassword = "android"
-        keyAlias = "androiddebugkey"
-        keyPassword = "android"
       }
     }
   }
@@ -78,9 +79,12 @@ android {
       isCrunchPngs = false
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("release")
+      val releaseSigning = signingConfigs.findByName("release") ?: signingConfigs.findByName("debugConfig")
+      if (releaseSigning != null) signingConfig = releaseSigning
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug {
+      signingConfigs.findByName("debugConfig")?.let { signingConfig = it }
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11

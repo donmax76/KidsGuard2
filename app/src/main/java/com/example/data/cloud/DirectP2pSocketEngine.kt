@@ -72,9 +72,17 @@ object DirectP2pSocketEngine {
   const val TOPIC_LOCK = "kidsguard/eb6ecfcf/v34_p2p/lock"
 
   private val TCP_RELAY_HOSTS = listOf(
-    "broker.hivemq.com" to 1883,
-    "broker.emqx.io" to 1883
+    "broker.emqx.io" to 1883,
+    "broker.hivemq.com" to 1883
   )
+
+  /**
+   * Индекс брокера, к которому последний раз удалось подключиться. Публичный hivemq иногда
+   * принимает TCP, но не отвечает на CONNECT — раньше телефон «висел» на нём бесконечно
+   * (чтение CONNACK без таймаута), и P2P/экран ПК не работали вовсе.
+   */
+  @Volatile
+  private var preferredRelayHost = 0
 
   private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -177,7 +185,9 @@ object DirectP2pSocketEngine {
     map[childId]?.let { return it }
     val canonicalId = RealtimeCloudRelay.resolveCanonicalChildId(childId)
     map[canonicalId]?.let { return it }
-    return map.values.maxByOrNull { it.third }
+    // Никакого «взять любой последний кадр»: иначе при переключении на ребёнка без
+    // кадров в диалоге мог показаться экран ДРУГОГО ребёнка.
+    return null
   }
 
   fun clearDirectFrameForChild(childId: Long) {
@@ -546,17 +556,20 @@ object DirectP2pSocketEngine {
    */
   private fun startGlobalBinaryTcpSocketLoop() {
     scope.launch {
-      var hostIdx = 0
+      var hostIdx = preferredRelayHost
       var retryDelayMs = 2_000L
       while (isActive) {
         val (host, port) = TCP_RELAY_HOSTS[hostIdx % TCP_RELAY_HOSTS.size]
         hostIdx++
         var sock: Socket? = null
+        var succeeded = false
         try {
           sock = Socket()
           sock.connect(InetSocketAddress(host, port), 5000)
           sock.keepAlive = true
           sock.tcpNoDelay = true
+          // CONNACK ждём ограниченное время: мёртвый брокер не должен вешать весь P2P.
+          sock.soTimeout = 12_000
           val inp = DataInputStream(BufferedInputStream(sock.getInputStream()))
           val out = BufferedOutputStream(sock.getOutputStream())
 
@@ -570,6 +583,9 @@ object DirectP2pSocketEngine {
 
           if ((connAckType and 0xF0) == 0x20) {
             retryDelayMs = 2_000L // Reset backoff on successful connection
+            sock.soTimeout = 0
+            succeeded = true
+            preferredRelayHost = (hostIdx - 1) % TCP_RELAY_HOSTS.size
             globalTcpOut = out
             _status.value = _status.value.copy(
               isGlobalTcpSocketConnected = true,
@@ -607,7 +623,11 @@ object DirectP2pSocketEngine {
                   try {
                     out.write(byteArrayOf(0xC0.toByte(), 0x00))
                     out.flush()
-                  } catch (_: Exception) {}
+                  } catch (_: Exception) {
+                    // Соединение умерло — закрываем сокет, чтобы разбудить блокирующее чтение
+                    // и переподключиться (иначе поток навсегда зависал на read()).
+                    try { sock.close() } catch (_: Exception) {}
+                  }
                 }
               }
             }
@@ -654,6 +674,11 @@ object DirectP2pSocketEngine {
         }
         delay(retryDelayMs)
         retryDelayMs = (retryDelayMs * 2L).coerceAtMost(30_000L)
+        // После обрыва снова идём на «любимый» брокер; если он не ответил CONNACK,
+        // hostIdx уже указывает на следующий — попробуем его.
+        if (succeeded) {
+          hostIdx = preferredRelayHost
+        }
       }
     }
   }
@@ -877,6 +902,9 @@ object DirectP2pSocketEngine {
           }
           type == "PC_STATE" || topic.contains("/pc_state") -> {
             com.example.data.pc.PcBlockerClient.ingestP2pStateJson(msg)
+          }
+          type == "PC_STREAM_FRAME" || topic.contains("/pc_stream") -> {
+            com.example.data.pc.PcBlockerClient.ingestP2pStreamFrame(msg)
           }
           type == "PC_SCREEN" || topic.contains("/pc_screen") -> {
             com.example.data.pc.PcBlockerClient.ingestP2pScreenJson(msg)

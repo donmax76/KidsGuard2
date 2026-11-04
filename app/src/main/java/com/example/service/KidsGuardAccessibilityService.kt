@@ -52,12 +52,17 @@ class KidsGuardAccessibilityService : AccessibilityService() {
     fun activateLiveStreamingWindow(durationMs: Long = 90_000L) {
       isLiveStreamingToParent = true
       liveStreamRequestedUntilMs = System.currentTimeMillis() + durationMs
+      // Сразу подключаем реальную отдачу кадров MediaProjection (до этого она отцеплена
+      // и не тратит батарею), а также делаем мгновенный снимок.
+      com.example.util.ScreenShotManager.setLiveCaptureActive(true)
       instance?.triggerImmediateCaptureNow()
     }
 
     fun stopLiveStreamingWindow() {
       isLiveStreamingToParent = false
       liveStreamRequestedUntilMs = 0L
+      // Отцепляем зеркало экрана: телефон перестаёт кодировать кадры и греться.
+      com.example.util.ScreenShotManager.setLiveCaptureActive(false)
     }
 
     fun isLiveStreamingActiveNow(): Boolean {
@@ -102,6 +107,14 @@ class KidsGuardAccessibilityService : AccessibilityService() {
   private var currentForegroundAppLabel: String = "Главный экран Android"
   private var lastContentPushTimeMs: Long = 0L
   private var lastPushedContentSummary: String = ""
+
+  // Кэш описания экрана для частых запросов «снимок сейчас»: обход дерева
+  // AccessibilityNodeInfo — дорогая операция, а в живом просмотре запросы идут каждые 1.5–2 с.
+  @Volatile
+  private var cachedCaptureSummary: String = ""
+
+  @Volatile
+  private var cachedCaptureSummaryMs: Long = 0L
 
   override fun onCreate() {
     super.onCreate()
@@ -226,20 +239,33 @@ class KidsGuardAccessibilityService : AccessibilityService() {
         val baseApp = currentForegroundAppLabel.ifBlank {
           DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
         }
-        val richSummary = extractVisibleScreenContent(baseApp)
+        val nowSummaryMs = System.currentTimeMillis()
+        val richSummary = if (cachedCaptureSummary.isNotBlank() && nowSummaryMs - cachedCaptureSummaryMs < 3_000L) {
+          cachedCaptureSummary
+        } else {
+          extractVisibleScreenContent(baseApp).also {
+            cachedCaptureSummary = it
+            cachedCaptureSummaryMs = nowSummaryMs
+          }
+        }
         val sync = CloudSyncManager(applicationContext)
+        // Во время непрерывного просмотра НЕ пишем каждый кадр в SQLite —
+        // иначе база и диск телефона молотятся каждые 2–3 секунды, а батарея тает.
+        val persistOffline = !isLiveStreamingActiveNow()
         ScreenShotManager.triggerHardwareScreenCapture(richSummary) { item ->
           serviceScope.launch(Dispatchers.IO) {
             if (!item.base64Bitmap.isNullOrBlank()) {
               sync.uploadScreenSnapshot(cid, richSummary, item.base64Bitmap)
-              com.example.data.cloud.OfflineStoreAndForwardManager.recordChildScreenshotOffline(
-                context = applicationContext,
-                childId = cid,
-                activeAppName = baseApp,
-                statusNote = richSummary,
-                base64Bitmap = item.base64Bitmap,
-                deviceType = "PHONE"
-              )
+              if (persistOffline) {
+                com.example.data.cloud.OfflineStoreAndForwardManager.recordChildScreenshotOffline(
+                  context = applicationContext,
+                  childId = cid,
+                  activeAppName = baseApp,
+                  statusNote = richSummary,
+                  base64Bitmap = item.base64Bitmap,
+                  deviceType = "PHONE"
+                )
+              }
             } else {
               sync.updateActiveAppOnly(cid, richSummary)
             }
@@ -260,8 +286,22 @@ class KidsGuardAccessibilityService : AccessibilityService() {
           DeviceUsageTracker.isInteractive(applicationContext) &&
           !com.example.location.LiveLocationTracker.isEmulator()
         if (shouldStream) {
-          triggerImmediateCaptureNow()
-          delay(2500L)
+          // Если MediaProjection уже отдаёт кадры напрямую (pushDirectScreenFrame), повторный
+          // дорогой AccessibilityService.takeScreenshot каждые 2.5 с не нужен — только активное окно.
+          if (com.example.util.ScreenShotManager.isMediaProjectionActive.value) {
+            serviceScope.launch(Dispatchers.IO) {
+              try {
+                val app = currentForegroundAppLabel.ifBlank {
+                  DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
+                }
+                CloudSyncManager(applicationContext).updateActiveAppOnly(activeChildId, app)
+              } catch (_: Exception) {}
+            }
+            delay(10_000L)
+          } else {
+            triggerImmediateCaptureNow()
+            delay(2_500L)
+          }
         } else {
           // Rest quietly when Parent is not actively watching Live Stream
           delay(12_000L)
@@ -886,6 +926,18 @@ class KidsGuardAccessibilityService : AccessibilityService() {
 
       overlayView = layout
       windowManager?.addView(overlayView, params)
+      // Не держим экран включённым бесконечно (это сильно сажает батарею, пока телефон
+      // лежит заблокированным). Через 45 секунд разрешаем экрану погаснуть — сам оверлей
+      // остаётся и снова покажется при включении экрана.
+      android.os.Handler(mainLooper).postDelayed({
+        try {
+          val p = overlayView?.layoutParams as? WindowManager.LayoutParams
+          if (p != null) {
+            p.flags = p.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
+            windowManager?.updateViewLayout(overlayView, p)
+          }
+        } catch (_: Exception) {}
+      }, 45_000L)
     } catch (e: Exception) {
       Log.e(TAG, "Error displaying overlay: ${e.message}")
       if (isDeviceTotalLock) {

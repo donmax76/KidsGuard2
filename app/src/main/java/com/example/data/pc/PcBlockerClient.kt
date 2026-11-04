@@ -1,5 +1,8 @@
 package com.example.data.pc
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Base64
 import com.example.data.cloud.DirectP2pSocketEngine
 import com.example.data.local.KidsGuardDatabase
 import com.example.data.model.OfflineActivityLogEntity
@@ -8,18 +11,26 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSource
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -109,6 +120,32 @@ data class PcConnectionState(
   val screenTimestampMs: Long = 0L,
   val lastSyncMs: Long = 0L,
   val statusMessage: String? = null
+)
+
+/** Один живой кадр экрана ПК, готовый к отрисовке в Compose. */
+data class PcLiveFrame(
+  val bitmap: Bitmap,
+  val timestampMs: Long = System.currentTimeMillis(),
+  val width: Int = bitmap.width,
+  val height: Int = bitmap.height
+)
+
+/** Профиль качества живого потока экрана ПК (влияет на размер кадра и трафик). */
+enum class PcStreamQuality(val label: String, val width: Int, val height: Int, val jpegQuality: Int) {
+  ECONOMY("Эконом", 480, 270, 45),
+  BALANCED("Баланс", 720, 405, 50),
+  HD("HD", 960, 540, 60)
+}
+
+/** Состояние живого видеопотока экрана ПК (сколько кадров/с, какой транспорт, ошибки). */
+data class PcStreamStatus(
+  val isActive: Boolean = false,
+  val transport: String = "",
+  val fps: Float = 0f,
+  val frames: Int = 0,
+  val lastFrameMs: Long = 0L,
+  val error: String? = null,
+  val quality: PcStreamQuality = PcStreamQuality.BALANCED
 )
 
 private fun defaultPcEntries(): List<PcEntry> = listOf(
@@ -221,6 +258,8 @@ object PcBlockerClient {
   }
 
   fun ingestP2pStateJson(msg: JSONObject) {
+    // Телефону ребёнка пакеты о ПК не нужны: не тратим его батарею и не пишем чужую историю.
+    if (DirectP2pSocketEngine.currentRole == "CHILD") return
     try {
       val msgCode = msg.optString("pairing_code", "").trim()
       val currentCode = _state.value.pairingCode.trim()
@@ -244,6 +283,7 @@ object PcBlockerClient {
   }
 
   fun ingestP2pScreenJson(msg: JSONObject) {
+    if (DirectP2pSocketEngine.currentRole == "CHILD") return
     val msgCode = msg.optString("pairing_code", "").trim()
     val b64 = msg.optString("screen_b64", "")
     if (b64.isNotBlank()) {
@@ -255,6 +295,266 @@ object PcBlockerClient {
         statusMessage = "Живой кадр монитора ПК получен"
       )
     }
+  }
+
+  // ==================== ЖИВОЙ ПОТОК ЭКРАНА ПК ====================
+  // Два пути доставки кадров:
+  //  1) MJPEG по домашнему Wi-Fi: GET /api/stream (multipart/x-mixed-replace) — плавно, дёшево;
+  //  2) кадры PC_STREAM_FRAME через P2P-мост по Интернету (4G/5G/другая сеть).
+  // Поток включается ТОЛЬКО когда экран ПК реально открыт на телефоне и приложение на переднем
+  // плане, и выключается сразу при уходе с экрана — это главное условие экономии батареи.
+
+  private val _liveFrame = MutableStateFlow<PcLiveFrame?>(null)
+  val liveFrame: StateFlow<PcLiveFrame?> = _liveFrame.asStateFlow()
+
+  private val _streamStatus = MutableStateFlow(PcStreamStatus())
+  val streamStatus: StateFlow<PcStreamStatus> = _streamStatus.asStateFlow()
+
+  @Volatile
+  private var streamRequested = false
+
+  @Volatile
+  private var streamFps = 4
+
+  @Volatile
+  private var streamQuality = PcStreamQuality.BALANCED
+
+  private var streamLeaseJob: Job? = null
+  private var streamMjpegJob: Job? = null
+  private var streamCall: Call? = null
+
+  private val decodeBusy = AtomicBoolean(false)
+  private val frameCounter = AtomicInteger(0)
+  private val streamEpoch = AtomicInteger(0)
+  private val frameTimes = ArrayDeque<Long>()
+  private val frameLock = Any()
+
+  @Volatile
+  private var lastAcceptedFrameTs = 0L
+
+  fun isScreenStreamActive(): Boolean = streamRequested
+
+  /** Включает живой поток экрана ПК (продлевает «аренду» на ПК и открывает MJPEG по Wi-Fi). */
+  fun startScreenStream(fps: Int = 4, quality: PcStreamQuality = PcStreamQuality.BALANCED) {
+    // Экран ПК смотрит только родитель — телефону ребёнка это не нужно.
+    if (DirectP2pSocketEngine.currentRole == "CHILD") return
+    val cleanFps = fps.coerceIn(1, 10)
+    if (streamRequested && streamFps == cleanFps && streamQuality == quality) {
+      if (streamMjpegJob?.isActive != true) startLanMjpegIfPossible()
+      return
+    }
+    performStop()
+    streamEpoch.incrementAndGet()
+    streamRequested = true
+    streamFps = cleanFps
+    streamQuality = quality
+    frameCounter.set(0)
+    synchronized(frameLock) { frameTimes.clear() }
+    _streamStatus.value = PcStreamStatus(
+      isActive = true,
+      transport = "Подключение к экрану ПК...",
+      frames = 0,
+      quality = quality
+    )
+    // Для MJPEG по Wi-Fi параметры кадра задаём отдельным LAN-запросом (сам поток
+    // продлевает аренду уже на стороне ПК).
+    if (_state.value.isLanHttpAuthenticated) {
+      scope.launch {
+        postLanAction("/api/stream_start", streamParamsJson(cleanFps, quality))
+      }
+    }
+    streamLeaseJob = scope.launch {
+      while (isActive && streamRequested) {
+        // Даём MJPEG-соединению по Wi-Fi шанс установиться, чтобы не запросить
+        // параллельно ещё и P2P-кадры.
+        if (_state.value.isLanHttpAuthenticated) delay(1_500L)
+        // Если уже идёт MJPEG по домашнему Wi-Fi, P2P-кадры не запрашиваем — иначе ПК
+        // кодировал бы одно и то же видео дважды (лишний CPU, трафик и батарея).
+        val lanStreamRunning = _state.value.isLanHttpAuthenticated && streamMjpegJob?.isActive == true
+        if (!lanStreamRunning) {
+          sendP2pCommand("/api/stream_start", streamParamsJson(cleanFps, quality).apply {
+            put("duration", 8)
+          })
+        }
+        delay(5_000L)
+      }
+    }
+    startLanMjpegIfPossible()
+  }
+
+  private fun streamParamsJson(fps: Int, quality: PcStreamQuality): JSONObject = JSONObject().apply {
+    put("fps", fps)
+    put("w", quality.width)
+    put("h", quality.height)
+    put("quality", quality.jpegQuality)
+    put("duration", 25)
+  }
+
+  /**
+   * Выключает поток. Остановка отложена на 0.7 с: при переходе между экранами
+   * (дашборд ↔ экран ПК) onDispose старого экрана срабатывает после старта нового,
+   * и мгновенная остановка гасила бы только что включённый поток.
+   */
+  fun stopScreenStream() {
+    val epoch = streamEpoch.incrementAndGet()
+    scope.launch {
+      delay(700L)
+      if (streamEpoch.get() != epoch) return@launch
+      performStop()
+    }
+  }
+
+  private fun performStop() {
+    val wasActive = streamRequested
+    streamRequested = false
+    streamLeaseJob?.cancel()
+    streamLeaseJob = null
+    streamMjpegJob?.cancel()
+    streamMjpegJob = null
+    try {
+      streamCall?.cancel()
+    } catch (_: Exception) {
+    }
+    streamCall = null
+    if (wasActive) {
+      scope.launch { sendP2pCommand("/api/stream_stop", JSONObject()) }
+    }
+    _streamStatus.value = _streamStatus.value.copy(
+      isActive = false,
+      transport = "",
+      fps = 0f,
+      error = null
+    )
+  }
+
+  private fun startLanMjpegIfPossible() {
+    val st = _state.value
+    if (!streamRequested || !st.isLanHttpAuthenticated || st.lanIp.isBlank()) return
+    streamMjpegJob?.cancel()
+    streamMjpegJob = scope.launch(Dispatchers.IO) {
+      val ip = st.lanIp
+      val port = st.port
+      val cookie = sessionCookie ?: return@launch
+      val client = httpClient.newBuilder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .build()
+      val call = client.newCall(
+        Request.Builder()
+          .url("http://$ip:$port/api/stream")
+          .header("Cookie", cookie)
+          .build()
+      )
+      streamCall = call
+      try {
+        call.execute().use { resp ->
+          val ctype = resp.header("Content-Type").orEmpty()
+          if (!resp.isSuccessful || !ctype.contains("multipart", ignoreCase = true)) {
+            _streamStatus.value = _streamStatus.value.copy(
+              error = "MJPEG недоступен (HTTP ${resp.code}) — работаем через P2P"
+            )
+            return@use
+          }
+          _streamStatus.value = _streamStatus.value.copy(
+            transport = "🟢 Wi-Fi LAN • живой MJPEG",
+            error = null
+          )
+          val source = resp.body?.source() ?: return@use
+          readMjpegStream(source)
+        }
+      } catch (e: Exception) {
+        if (streamRequested) {
+          _streamStatus.value = _streamStatus.value.copy(
+            error = "LAN-поток прерван: ${e.message ?: "нет связи"} — переключаемся на P2P"
+          )
+        }
+      } finally {
+        if (streamCall === call) streamCall = null
+      }
+    }
+  }
+
+  /** Разбор multipart/x-mixed-replace: у каждого кадра есть Content-Length, читаем ровно его. */
+  private suspend fun readMjpegStream(source: BufferedSource) {
+    var contentLength = -1
+    while (currentCoroutineContext().isActive && streamRequested) {
+      val line = try {
+        source.readUtf8Line()
+      } catch (_: Exception) {
+        null
+      } ?: break
+      when {
+        line.startsWith("--") -> contentLength = -1
+        line.startsWith("Content-Length:", ignoreCase = true) ->
+          contentLength = line.substringAfter(':').trim().toIntOrNull() ?: -1
+        line.isBlank() && contentLength in 1..5_000_000 -> {
+          val bytes = try {
+            source.readByteArray(contentLength.toLong())
+          } catch (_: Exception) {
+            break
+          }
+          publishFrameBytes(bytes, "🟢 Wi-Fi LAN • живой MJPEG")
+          contentLength = -1
+        }
+      }
+    }
+  }
+
+  /** Приём кадра живого потока, пришедшего через P2P-мост (Интернет). */
+  fun ingestP2pStreamFrame(msg: JSONObject) {
+    if (DirectP2pSocketEngine.currentRole == "CHILD") return
+    if (!streamRequested) return
+    val b64 = msg.optString("b64", "")
+    if (b64.isBlank()) return
+    val ts = msg.optLong("ts", System.currentTimeMillis())
+    if (ts <= lastAcceptedFrameTs) return
+    lastAcceptedFrameTs = ts
+    scope.launch(Dispatchers.Default) {
+      try {
+        val bytes = Base64.decode(b64, Base64.DEFAULT)
+        publishFrameBytes(bytes, "🌐 Интернет P2P • живой поток")
+      } catch (_: Exception) {
+      }
+    }
+  }
+
+  private fun publishFrameBytes(bytes: ByteArray, transport: String) {
+    if (bytes.isEmpty() || !streamRequested) return
+    if (!decodeBusy.compareAndSet(false, true)) return
+    scope.launch(Dispatchers.Default) {
+      try {
+        val opts = BitmapFactory.Options().apply {
+          inPreferredConfig = Bitmap.Config.RGB_565
+        }
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return@launch
+        val now = System.currentTimeMillis()
+        _liveFrame.value = PcLiveFrame(bitmap = bmp, timestampMs = now)
+        updateStreamStats(now, transport)
+      } catch (_: Exception) {
+      } finally {
+        decodeBusy.set(false)
+      }
+    }
+  }
+
+  private fun updateStreamStats(now: Long, transport: String) {
+    frameCounter.incrementAndGet()
+    var fps = 0f
+    synchronized(frameLock) {
+      frameTimes.addLast(now)
+      while (frameTimes.size > 12) frameTimes.removeFirst()
+      if (frameTimes.size >= 2) {
+        val span = (frameTimes.last() - frameTimes.first()).coerceAtLeast(1L)
+        fps = (frameTimes.size - 1) * 1000f / span.toFloat()
+      }
+    }
+    _streamStatus.value = _streamStatus.value.copy(
+      isActive = true,
+      transport = transport,
+      fps = (fps * 10f).toInt() / 10f,
+      frames = frameCounter.get(),
+      lastFrameMs = now,
+      error = null
+    )
   }
 
   /**
@@ -859,9 +1159,34 @@ object PcBlockerClient {
     }
   }
 
+  private val syncedPcActivityHashes = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+  @Volatile
+  private var lastPcActivitySyncMs = 0L
+
+  /**
+   * Сбрасывает историю активности ПК в SQLite, но ТОЛЬКО если данные реально изменились
+   * и не чаще раза в 15 секунд. Раньше запись шла на каждый пакет PC_STATE (раз в 3–4 с),
+   * что непрерывно дёргало диск и сажало батарею телефона.
+   */
   private fun syncPcActivityByDateToRoom(byDate: Map<String, List<PcActivityUser>>) {
     if (byDate.isEmpty()) return
     val appCtx = DirectP2pSocketEngine.appContext ?: return
+    val changed = LinkedHashMap<String, Pair<List<PcActivityUser>, Int>>()
+    for ((dateIso, users) in byDate) {
+      if (dateIso.isBlank()) continue
+      val sig = users.joinToString("|") { u ->
+        u.user + ":" + u.procs.joinToString(",") { "${it.label}=${it.seconds}" } +
+          ";" + u.titles.joinToString(",") { "${it.label}=${it.seconds}" }
+      }.hashCode()
+      if (syncedPcActivityHashes[dateIso] != sig) {
+        changed[dateIso] = Pair(users, sig)
+      }
+    }
+    if (changed.isEmpty()) return
+    val now = System.currentTimeMillis()
+    if (now - lastPcActivitySyncMs < 15_000L) return
+    lastPcActivitySyncMs = now
     scope.launch {
       try {
         val dao = KidsGuardDatabase.getDatabase(appCtx).kidsGuardDao()
@@ -872,8 +1197,8 @@ object PcBlockerClient {
           children.isNotEmpty() -> children.first().id
           else -> 1L
         }
-        for ((dateIso, users) in byDate) {
-          if (dateIso.isBlank()) continue
+        for ((dateIso, entry) in changed) {
+          val users = entry.first
           val anchorTs = parseDateIsoToTimestampMs(dateIso)
           val cal = Calendar.getInstance().apply { timeInMillis = anchorTs }
           val hour = cal.get(Calendar.HOUR_OF_DAY).coerceIn(0, 23)
@@ -918,6 +1243,7 @@ object PcBlockerClient {
             }
           }
           dao.replacePcActivitySnapshotForDate(childId, dateIso, dayLogs)
+          syncedPcActivityHashes[dateIso] = entry.second
         }
       } catch (_: Exception) {}
     }
