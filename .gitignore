@@ -17,3 +17,5 @@ local.properties
 *.log
 *.hprof
 
+__pycache__/
+*.pyc
