@@ -229,29 +229,59 @@ def secure_conf_dir():
     _secured = True
 
 
+_LAST_GOOD_CONFIG = None
+
+
 def load_config():
-    for path in (CONF_FILE, OLD_CONF_FILE):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception:
-            continue
-        if path != CONF_FILE:  # перенос из старого места
+    global _LAST_GOOD_CONFIG
+    # 1) Основной файл. Если он существует, но временно недоступен (антивирус/другой
+    # процесс), НЕ подменяем его старым конфигом из %APPDATA% — иначе список правил
+    # «прыгает» между двумя версиями настроек.
+    if os.path.exists(CONF_FILE):
+        for _ in range(3):
             try:
-                save_config(cfg)
+                with open(CONF_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                _LAST_GOOD_CONFIG = cfg
+                return cfg
             except Exception:
-                pass
+                time.sleep(0.05)
+        if _LAST_GOOD_CONFIG is not None:
+            return json.loads(json.dumps(_LAST_GOOD_CONFIG))
+        return None
+    # 2) Старое расположение — только если основного файла ещё нет (миграция).
+    try:
+        with open(OLD_CONF_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        try:
+            save_config(cfg)
+        except Exception:
+            pass
+        _LAST_GOOD_CONFIG = cfg
         return cfg
-    return None
+    except Exception:
+        return None
 
 
 def save_config(cfg):
+    global _LAST_GOOD_CONFIG
     os.makedirs(CONF_DIR, exist_ok=True)
     secure_conf_dir()
     tmp = CONF_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CONF_FILE)  # атомарно: конфиг никогда не окажется «битым»
+    # На Windows os.replace может временно упасть, если файл читает другой процесс.
+    last_err = None
+    for _ in range(6):
+        try:
+            os.replace(tmp, CONF_FILE)  # атомарно: конфиг никогда не окажется «битым»
+            _LAST_GOOD_CONFIG = json.loads(json.dumps(cfg))
+            return
+        except PermissionError as ex:
+            last_err = ex
+            time.sleep(0.1)
+    if last_err:
+        raise last_err
 
 
 _PC_ID_CACHE = ""

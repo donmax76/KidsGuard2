@@ -128,6 +128,18 @@ object DirectP2pSocketEngine {
   private var lastParentPresenceTimestampMs: Long = 0L
   private const val PARENT_PRESENCE_TIMEOUT_MS = 95_000L
 
+  // Отдельный сигнал «родитель открыл карту»: только тогда ребёнку нужен
+  // высокоточный GPS. Обычное присутствие родителя (дашборд/чат) — ещё не повод
+  // жечь GNSS-радио каждые 12 секунд.
+  @Volatile
+  private var lastParentMapViewMs: Long = 0L
+
+  fun isParentMapViewing(): Boolean {
+    if (currentRole != "CHILD") return false
+    val ts = lastParentMapViewMs
+    return ts > 0L && (System.currentTimeMillis() - ts) in 0..60_000L
+  }
+
   /**
    * Returns true ONLY if the Parent app is actively connected (either via direct LAN socket
    * or via a recent Parent heartbeat/command within the last 95 seconds).
@@ -598,16 +610,28 @@ object DirectP2pSocketEngine {
             )
             Log.d(TAG, "Connected persistent binary TCP socket to $host:$port")
 
-            // 2. Subscribe to clean v34_p2p wildcard '#' plus PC topics on v33_p2p for backward compatibility
-            sendMqttSubscribe(
-              out,
+            // 2. Подписки строго по роли. Ребёнку НЕ нужны pc_state/pc_stream и чужие
+            // state/chat: раньше wildcard '#' будил радио каждые 4 секунды от состояний ПК,
+            // даже когда родитель ничего не смотрел — это давало десятки процентов расхода.
+            val subscriptions = if (currentRole == "CHILD") {
+              listOf(
+                "$TOPIC_ROOT/cmd/#",
+                "$TOPIC_ROOT/lock/#",
+                "$TOPIC_ROOT/data/#",
+                // совместимость со старым родительским приложением (v33)
+                "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+                "$TOPIC_ROOT_LEGACY_PC/lock/#",
+                "$TOPIC_ROOT_LEGACY_PC/data/#"
+              )
+            } else {
               listOf(
                 TOPIC_WILDCARD_ALL,
                 "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
                 "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
                 "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
               )
-            )
+            }
+            sendMqttSubscribe(out, subscriptions)
 
             // 2b. Immediately flush all retained packets (such as newly created Child profiles & pairing codes!)
             for ((retTopic, retJson) in retainedPacketsOutbox) {
@@ -804,6 +828,10 @@ object DirectP2pSocketEngine {
 
   private fun handleIncomingJsonPacket(topic: String, rawJson: String, isFromLan: Boolean) {
     if (!rawJson.startsWith("{")) return
+    // Актуальный ПК публикует состояние/кадры только в v34. Старые retained-пакеты v33
+    // (с прежним списком правил) могли приходить попеременно с новыми — из-за этого
+    // список «то уменьшался, то увеличивался». Чужие v33-пакеты ПК игнорируем.
+    if (topic.contains("/v33_p2p/") && topic.contains("/pc_")) return
     scope.launch {
       try {
         val msg = JSONObject(rawJson)
@@ -888,6 +916,9 @@ object DirectP2pSocketEngine {
             if (cmd.isNotBlank() && kotlin.math.abs(now - ts) < maxAgeMs) {
               if (currentRole == "CHILD") {
                 markParentPresenceActive(cid)
+                if (cmd == "MAP_VIEWING") {
+                  lastParentMapViewMs = now
+                }
               }
               _incomingCommandsFlow.tryEmit(Triple(cid, cmd, payload))
               if (cmd == "UNLOCK") {

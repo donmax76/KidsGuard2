@@ -323,7 +323,9 @@ class KidsGuardAccessibilityService : AccessibilityService() {
           continue
         }
         val isScreenOn = DeviceUsageTracker.isInteractive(applicationContext)
-        delay(if (isScreenOn) 15_000L else 45_000L)
+        // 30 с вместо 15: вдвое меньше пробуждений CPU/Room, точность учёта времени
+        // для родителя остаётся достаточной.
+        delay(if (isScreenOn) 30_000L else 60_000L)
         if (!isScreenOn || com.example.location.LiveLocationTracker.isEmulator()) continue
         val cfg = dao.getFamilyConfigOnce()
         isChildDeviceRole = cfg?.selectedRole == "CHILD"
@@ -351,15 +353,15 @@ class KidsGuardAccessibilityService : AccessibilityService() {
           pkg == "com.android.settings"
 
         if (!isLauncherOrSystem && pkg != null && !isDeviceLocked && activeChildId > 0) {
-          secondsInForeground += 15
-          // Record 15s activity slice in offline Room DB for 24-hour Recharts hourly chart & offline sync
+          secondsInForeground += 30
+          // Record 30s activity slice in offline Room DB for 24-hour Recharts hourly chart & offline sync
           com.example.data.cloud.OfflineStoreAndForwardManager.recordChildActivityOffline(
             context = applicationContext,
             childId = activeChildId,
             packageName = pkg,
             appName = currentForegroundAppLabel,
             windowTitle = lastPushedContentSummary.ifBlank { currentForegroundAppLabel },
-            durationSeconds = 15,
+            durationSeconds = 30,
             deviceType = "PHONE"
           )
 

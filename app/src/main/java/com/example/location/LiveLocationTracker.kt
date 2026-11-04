@@ -514,7 +514,7 @@ class LiveLocationTracker(
         // Режим трекинга зависит от того, смотрит ли родитель карту прямо сейчас.
         // Раньше ВСЕГДА запрашивался PRIORITY_HIGH_ACCURACY каждые 3–8 секунд — GPS-радио
         // не спало никогда, и телефон ребёнка разряжался за несколько часов.
-        val parentViewing = com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
+        val parentViewing = com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()
         lastTrackingHighAccuracy = parentViewing
         // 1. Primary Google Play Services FusedLocationProviderClient
         try {
@@ -634,7 +634,7 @@ class LiveLocationTracker(
 
     val nowMs = System.currentTimeMillis()
     // Переключаем режим GPS при появлении/пропадании родителя на карте (не чаще раза в 30 с).
-    val parentViewingNow = com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
+    val parentViewingNow = com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()
     if (parentViewingNow != lastTrackingHighAccuracy && nowMs - lastTrackingModeSwitchMs > 30_000L) {
       lastTrackingModeSwitchMs = nowMs
       startRealLocationUpdates()

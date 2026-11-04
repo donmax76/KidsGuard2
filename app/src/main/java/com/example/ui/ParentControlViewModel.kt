@@ -451,6 +451,11 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
           val targetChildId = activeChild.value?.id ?: allChildren.value.firstOrNull()?.id ?: 0L
           if (targetChildId > 0L) {
             repository.sendRemoteCloudCommand(targetChildId, "PARENT_ONLINE_HEARTBEAT", "1")
+            // Высокоточный GPS ребёнку нужен только когда открыта карта, а не всегда,
+            // пока приложение родителя просто запущено.
+            if (_activeParentTab.value == ParentTab.LOCATION_MAP) {
+              repository.sendRemoteCloudCommand(targetChildId, "MAP_VIEWING", "1")
+            }
           }
           kotlinx.coroutines.delay(35_000L)
           continue
@@ -518,6 +523,14 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
       markChatMessagesAsRead()
     } else if (tab == ParentTab.LOCATION_MAP) {
       requestFreshChildGps()
+      if (_deviceRole.value == AppRole.PARENT) {
+        val childId = activeChild.value?.id ?: allChildren.value.firstOrNull()?.id ?: 0L
+        if (childId > 0L) {
+          viewModelScope.launch {
+            repository.sendRemoteCloudCommand(childId, "MAP_VIEWING", "1")
+          }
+        }
+      }
     } else if (tab == ParentTab.APPS && _deviceRole.value == AppRole.PARENT) {
       val childId = activeChild.value?.id ?: allChildren.value.firstOrNull()?.id ?: 0L
       if (childId > 0L) {
