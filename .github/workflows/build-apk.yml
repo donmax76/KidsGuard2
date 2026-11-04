@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 jobs:
   build:
@@ -29,12 +28,17 @@ jobs:
           # Версия из gradle/wrapper/gradle-wrapper.properties (обёртки gradlew в репозитории нет)
           gradle-version: '9.3.1'
 
-      - name: Generate debug keystore (if absent)
+      - name: Ensure stable debug keystore
         run: |
           if [ ! -f debug.keystore ]; then
             keytool -genkeypair -v -keystore debug.keystore -storepass android \
               -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
               -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            git config user.name "ci-keystore"
+            git config user.email "ci@users.noreply.github.com"
+            git add -f debug.keystore
+            git commit -m "ci: add stable debug keystore"
+            git push origin HEAD:main
           fi
 
       - name: Accept Android SDK licenses
@@ -45,33 +49,15 @@ jobs:
           set -o pipefail
           gradle :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee build-output.log
 
-      - name: Publish build error log (diagnostics)
+      - name: Show build errors in summary
         if: failure()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let log = '';
-            try { log = fs.readFileSync('build-output.log', 'utf8'); } catch (e) {}
-            const lines = log.split('\n');
-            const errs = lines.filter(l =>
-              l.startsWith('e: ') ||
-              l.includes('e: file://') ||
-              l.includes('error: ') ||
-              l.includes('Unresolved reference') ||
-              l.includes('Type mismatch') ||
-              l.includes('None of the following') ||
-              l.includes('Compilation error')
-            ).slice(0, 250);
-            const tail = lines.slice(-120).join('\n');
-            const body = '### Compiler errors\n```\n' + (errs.join('\n') || 'no e: lines') +
-              '\n```\n### Tail\n```\n' + tail + '\n```';
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: 'CI build error',
-              body: body
-            });
+        run: |
+          {
+            echo '## Build error'
+            echo '```'
+            tail -n 250 build-output.log 2>/dev/null || echo 'build-output.log not found'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
