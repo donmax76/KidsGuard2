@@ -19,3 +19,6 @@ local.properties
 
 __pycache__/
 *.pyc
+dist/
+build/
+*.spec

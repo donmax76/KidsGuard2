@@ -278,7 +278,15 @@ fun PcControlScreen(
     }
   }
 
-  LaunchedEffect(isAppResumed, autoRefreshScreen, showFullPcScreenDialog, pcStreamQuality) {
+  LaunchedEffect(
+    isAppResumed,
+    autoRefreshScreen,
+    showFullPcScreenDialog,
+    pcStreamQuality,
+    // После ввода пароля LAN-сессия появляется уже при открытом экране — нужно
+    // перезапустить поток, иначе MJPEG так и не стартует (оставался только P2P).
+    pcState.isLanHttpAuthenticated
+  ) {
     if (isAppResumed && autoRefreshScreen) {
       // На весь экран — плавнее (8 к/с), в карточке — экономные 4 к/с.
       PcBlockerClient.startScreenStream(

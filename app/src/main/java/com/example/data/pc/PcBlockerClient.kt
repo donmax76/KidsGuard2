@@ -354,10 +354,12 @@ object PcBlockerClient {
       port = if (port in 1024..65535) port else cur.port,
       pairingCode = configuredCode,
       isOnline = true,
+      // Тот же текст, что и у PC_STATE: иначе маяк и состояние переключали
+      // «ПК в сети» ↔ «Интернет P2P» каждые несколько секунд.
       transportLabel = if (cur.isLanHttpAuthenticated) {
         "🟢 Wi-Fi LAN ($updatedIp:$port) + Интернет P2P"
       } else {
-        "🟢 ПК в сети ($updatedIp:$port) • Интернет P2P активен"
+        "🌐 Интернет P2P-мост (${pcName.ifBlank { "Windows ПК" }} • Код $configuredCode)"
       }
     )
   }
@@ -443,6 +445,23 @@ object PcBlockerClient {
 
   @Volatile
   private var lastAcceptedFrameTs = 0L
+  private var lastFrameArrivalMs = 0L
+
+  /**
+   * Кадры ПК нумеруются по часам ПК. Если часы ПК прыгнули назад (синхронизация времени),
+   * старый lastAcceptedFrameTs блокировал бы все новые кадры навсегда. Поэтому при
+   * длительной паузе (5 с) начинаем отсчёт заново.
+   */
+  private fun acceptFrameTimestamp(ts: Long): Boolean {
+    val now = System.currentTimeMillis()
+    if (ts <= lastAcceptedFrameTs) {
+      if (now - lastFrameArrivalMs < 5_000L) return false
+      lastAcceptedFrameTs = 0L
+    }
+    lastAcceptedFrameTs = ts
+    lastFrameArrivalMs = now
+    return true
+  }
 
   fun isScreenStreamActive(): Boolean = streamRequested
 
@@ -462,6 +481,8 @@ object PcBlockerClient {
     streamFps = cleanFps
     streamQuality = quality
     frameCounter.set(0)
+    lastAcceptedFrameTs = 0L
+    lastFrameArrivalMs = 0L
     synchronized(frameLock) { frameTimes.clear() }
     _streamStatus.value = PcStreamStatus(
       isActive = true,
@@ -521,6 +542,8 @@ object PcBlockerClient {
   private fun performStop() {
     val wasActive = streamRequested
     streamRequested = false
+    lastAcceptedFrameTs = 0L
+    lastFrameArrivalMs = 0L
     streamLeaseJob?.cancel()
     streamLeaseJob = null
     streamMjpegJob?.cancel()
@@ -631,8 +654,7 @@ object PcBlockerClient {
       val buf = ByteBuffer.wrap(bytes, offset, length).order(ByteOrder.BIG_ENDIAN)
       buf.getInt() // seq
       val ts = buf.getLong()
-      if (ts <= lastAcceptedFrameTs) return
-      lastAcceptedFrameTs = ts
+      if (!acceptFrameTimestamp(ts)) return
       val jpeg = ByteArray(buf.remaining())
       buf.get(jpeg)
       publishFrameBytes(jpeg, "🌐 Интернет P2P • живой поток")
@@ -652,8 +674,7 @@ object PcBlockerClient {
     val b64 = msg.optString("b64", "")
     if (b64.isBlank()) return
     val ts = msg.optLong("ts", System.currentTimeMillis())
-    if (ts <= lastAcceptedFrameTs) return
-    lastAcceptedFrameTs = ts
+    if (!acceptFrameTimestamp(ts)) return
     scope.launch(Dispatchers.Default) {
       try {
         val bytes = Base64.decode(b64, Base64.DEFAULT)
