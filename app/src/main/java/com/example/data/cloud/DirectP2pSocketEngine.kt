@@ -214,7 +214,35 @@ object DirectP2pSocketEngine {
     childLanIps.clear()
   }
 
+  /** Wi-Fi сеть телефона: LAN-сокеты и UDP-обнаружение должны идти по Wi-Fi,
+   *  даже если мобильный интернет выбран системой сетью по умолчанию. */
+  private fun wifiNetwork(): android.net.Network? {
+    val ctx = appContext ?: return null
+    val cm = ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+      as? android.net.ConnectivityManager ?: return null
+    return cm.allNetworks.firstOrNull { n ->
+      cm.getNetworkCapabilities(n)
+        ?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+    }
+  }
+
+  private fun wifiIpv4(): String? {
+    val ctx = appContext ?: return null
+    val cm = ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+      as? android.net.ConnectivityManager ?: return null
+    val net = wifiNetwork() ?: return null
+    val lp = cm.getLinkProperties(net) ?: return null
+    return lp.linkAddresses
+      .map { it.address }
+      .filterIsInstance<Inet4Address>()
+      .firstOrNull { !it.isLoopbackAddress }
+      ?.hostAddress
+  }
+
   fun getLocalIpv4Address(): String {
+    // Сначала именно Wi-Fi: иначе при включённом мобильном интернете можно
+    // «найти» себя в сотовой сети и решить, что ребёнок в другой подсети.
+    wifiIpv4()?.let { return it }
     try {
       val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "127.0.0.1"
       for (intf in interfaces) {
@@ -311,7 +339,14 @@ object DirectP2pSocketEngine {
           return@launch
         }
         try { parentClientSocket?.close() } catch (_: Exception) {}
-        val sock = Socket()
+        val wifi = wifiNetwork()
+        val sock = if (wifi != null) {
+          try {
+            wifi.socketFactory.createSocket() as Socket
+          } catch (_: Exception) {
+            Socket()
+          }
+        } else Socket()
         sock.connect(InetSocketAddress(cleanIp, TCP_PORT), 2500)
         sock.keepAlive = true
         sock.tcpNoDelay = true
@@ -399,7 +434,12 @@ object DirectP2pSocketEngine {
     scope.launch {
       var udpSocket: DatagramSocket? = null
       try {
-        udpSocket = DatagramSocket()
+        val localIp = wifiIpv4()
+        udpSocket = if (localIp != null) {
+          DatagramSocket(0, InetAddress.getByName(localIp))
+        } else {
+          DatagramSocket()
+        }
         udpSocket.broadcast = true
         val bytes = json.toString().toByteArray(Charsets.UTF_8)
         if (bytes.size > 16000) return@launch
@@ -447,7 +487,12 @@ object DirectP2pSocketEngine {
     scope.launch {
       var udpSocket: DatagramSocket? = null
       try {
-        udpSocket = DatagramSocket()
+        val localIp = wifiIpv4()
+        udpSocket = if (localIp != null) {
+          DatagramSocket(0, InetAddress.getByName(localIp))
+        } else {
+          DatagramSocket()
+        }
         udpSocket.broadcast = true
         while (isActive) {
           val myIp = getLocalIpv4Address()
@@ -485,11 +530,12 @@ object DirectP2pSocketEngine {
               RealtimeCloudRelay.broadcastCachedChildrenOverLanUdp()
             }
           }
-          // Battery-friendly UDP discovery intervals: 90s when already connected, 45s when discovering
+          // Пока LAN не найден — маяк раз в 10 с, чтобы не ждать 45 с и не уходить
+          // в P2P при том, что оба телефона в одной Wi-Fi. После соединения — реже.
           val isAlreadyConnected = _status.value.isLanSocketConnected ||
             _status.value.isGlobalTcpSocketConnected ||
             connectedParentClients.isNotEmpty()
-          val beaconDelay = if (isAlreadyConnected) 90_000L else 45_000L
+          val beaconDelay = if (isAlreadyConnected) 60_000L else 10_000L
           delay(beaconDelay)
         }
       } catch (_: Exception) {
@@ -505,7 +551,12 @@ object DirectP2pSocketEngine {
       try {
         socket = DatagramSocket(null)
         socket.reuseAddress = true
-        socket.bind(InetSocketAddress(UDP_DISCOVERY_PORT))
+        val localIp = wifiIpv4()
+        val bindAddr = if (localIp != null) InetAddress.getByName(localIp) else null
+        socket.bind(
+          if (bindAddr != null) InetSocketAddress(bindAddr, UDP_DISCOVERY_PORT)
+          else InetSocketAddress(UDP_DISCOVERY_PORT)
+        )
         val buf = ByteArray(16384)
         while (isActive) {
           val packet = DatagramPacket(buf, buf.size)
@@ -1006,7 +1057,10 @@ object DirectP2pSocketEngine {
       put("lanIp", getLocalIpv4Address())
       put("timestamp", now)
     }
-    return publishTcpSocketPacket("$TOPIC_SCREEN/$cid", packet, retain = true)
+    // Если есть прямой LAN-сокет — кадр идёт и по Wi-Fi, без мобильного трафика.
+    val sentLan = pushDirectLanPacket(packet)
+    val sentCloud = publishTcpSocketPacket("$TOPIC_SCREEN/$cid", packet, retain = true)
+    return sentLan || sentCloud
   }
 
   fun pushDirectLanPacket(json: JSONObject): Boolean {
