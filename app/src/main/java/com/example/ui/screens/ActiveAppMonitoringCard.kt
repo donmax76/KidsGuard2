@@ -163,6 +163,21 @@ fun ActiveAppMonitoringCard(
     }
   }
 
+  // Переключение LIVE → ЭКО-РЕЖИМ должно реально гасить поток на телефоне ребёнка,
+  // а не только прекращать опрос. Иначе «живое окно» продолжает снимать экран.
+  var wasPollingActive by androidx.compose.runtime.remember {
+    androidx.compose.runtime.mutableStateOf(false)
+  }
+  androidx.compose.runtime.LaunchedEffect(isPollingActive) {
+    val cId = child?.id ?: return@LaunchedEffect
+    if (wasPollingActive && !isPollingActive) {
+      try {
+        cloudSync.sendRemoteCommand(cId, "STOP_LIVE_STREAM", "")
+      } catch (_: Exception) {}
+    }
+    wasPollingActive = isPollingActive
+  }
+
   val rawForegroundApp = when {
     child == null -> "Нет добавленного ребёнка — нажмите «+ Добавить»"
     !cloudActiveApp.isNullOrBlank() -> cloudActiveApp!!
