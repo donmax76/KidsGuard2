@@ -135,7 +135,8 @@ fun ScreenStreamDialog(
   // Пауза/ЭКО должны не просто перестать опрашивать, а реально погасить «живое окно»
   // на телефоне ребёнка — иначе он продолжает снимать экран и тратить батарею.
   LaunchedEffect(isAutoStreamActive) {
-    if (!isAutoStreamActive && childId > 0L) {
+    val id = child?.id ?: 0L
+    if (!isAutoStreamActive && id > 0L) {
       onSendCloudCommand("STOP_LIVE_STREAM", "")
     }
   }
