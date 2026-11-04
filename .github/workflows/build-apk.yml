@@ -47,18 +47,12 @@ jobs:
       - name: Publish build error log (diagnostics)
         if: failure()
         run: |
-          git config user.name "ci-diagnostics"
-          git config user.email "ci@users.noreply.github.com"
           {
-            echo "sha: $GITHUB_SHA"
-            echo "run: $GITHUB_RUN_ID"
-            echo "---"
-            tail -n 300 build-output.log 2>/dev/null || true
-          } > build-error.log
-          git checkout -B ci-build-log
-          git add build-error.log
-          git commit -m "ci: build error for $GITHUB_SHA" || exit 0
-          git push --force origin ci-build-log
+            echo "## Build error"
+            echo '```'
+            tail -n 250 build-output.log 2>/dev/null || echo "build-output.log not found"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
