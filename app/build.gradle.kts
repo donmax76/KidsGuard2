@@ -26,28 +26,11 @@ val versionProps = Properties().apply {
   }
 }
 
-val isAssembleOrBundleBuild = gradle.startParameter.taskNames.any { taskName ->
-  val lower = taskName.lowercase()
-  lower.contains("assemble") || lower.contains("bundle") || lower.contains("install")
-}
-
 val verMajor = versionProps.getProperty("VERSION_MAJOR", "3").toIntOrNull() ?: 3
 val verMinor = versionProps.getProperty("VERSION_MINOR", "3").toIntOrNull() ?: 3
-val prevPatch = versionProps.getProperty("VERSION_PATCH", "5").toIntOrNull() ?: 5
-val prevCode = versionProps.getProperty("VERSION_CODE", "35").toIntOrNull() ?: 35
-
-val currentPatch = if (isAssembleOrBundleBuild) prevPatch + 1 else prevPatch
-val currentVerCode = if (isAssembleOrBundleBuild) prevCode + 1 else prevCode
+val currentPatch = maxOf(34, versionProps.getProperty("VERSION_PATCH", "34").toIntOrNull() ?: 34)
+val currentVerCode = maxOf(64, versionProps.getProperty("VERSION_CODE", "64").toIntOrNull() ?: 64)
 val currentVerName = "$verMajor.$verMinor.$currentPatch Pro"
-
-if (isAssembleOrBundleBuild) {
-  versionProps.setProperty("VERSION_MAJOR", verMajor.toString())
-  versionProps.setProperty("VERSION_MINOR", verMinor.toString())
-  versionProps.setProperty("VERSION_PATCH", currentPatch.toString())
-  versionProps.setProperty("VERSION_CODE", currentVerCode.toString())
-  versionPropsFile.outputStream().use { versionProps.store(it, "Auto-incremented by Gradle build") }
-  println("🚀 KidsGuard Build Version auto-incremented to v$currentVerName (versionCode=$currentVerCode)")
-}
 
 android {
   namespace = "com.example"
@@ -60,8 +43,8 @@ android {
     versionCode = currentVerCode
     versionName = currentVerName
 
-    buildConfigField("String", "LIVE_APK_URL", "\"https://kappa.lol/A2Z4uW.apk\"")
-    buildConfigField("String", "PRE_APK_URL", "\"https://kappa.lol/A2Z4uW.apk\"")
+    buildConfigField("String", "LIVE_APK_URL", "\"https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk\"")
+    buildConfigField("String", "PRE_APK_URL", "\"https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

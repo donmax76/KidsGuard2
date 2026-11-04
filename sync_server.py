@@ -478,6 +478,7 @@ def build_live_snapshot():
                 apps = list(seen_pkgs.values())
 
             ch_out = dict(ch)
+            ch_out["appVersion"] = "3.3.34 Pro"
             ch_out["aliasIds"] = all_ids
             ch_out["aliasCodes"] = all_codes
             ch_out["activeForegroundApp"] = (best_screen or {}).get("activeAppName") or "Активный экран Android"
@@ -784,7 +785,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 file_path = os.path.join(DIRECTORY, path.lstrip('/'))
             if not os.path.exists(file_path):
                 file_path = os.path.join(DIRECTORY, 'KidsGuard-latest.apk')
-            filename = os.path.basename(path) if path.endswith('.apk') else "KidsGuard-v3.3.5-Pro.apk"
+            filename = os.path.basename(path) if path.endswith('.apk') else "KidsGuard-v3.3.34-Pro.apk"
             if self._serve_custom_file(file_path, 'application/vnd.android.package-archive', filename, head_only=head_only):
                 return
 

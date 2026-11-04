@@ -142,14 +142,8 @@ object CoreEngineHotUpdater {
   fun resolveHighestChildVersion(context: Context, childId: Long, reportedVersion: String?): String {
     val cleanReported = reportedVersion?.trim().orEmpty()
     val unifiedBuildVer = BuildConfig.VERSION_NAME
-    // If the child has updated or is bound, unify to BuildConfig.VERSION_NAME so shell & core match 100%
     return if (cleanReported.isNotBlank() &&
-        ApkUpdateInstaller.compareVersions(cleanReported, unifiedBuildVer) >= 0) {
-      unifiedBuildVer
-    } else if (cleanReported.isNotBlank() &&
-        !cleanReported.startsWith("3.3.9") &&
-        !cleanReported.startsWith("3.2.") &&
-        !cleanReported.startsWith("3.1.")) {
+        ApkUpdateInstaller.compareVersions(cleanReported, unifiedBuildVer) > 0) {
       cleanReported
     } else {
       unifiedBuildVer

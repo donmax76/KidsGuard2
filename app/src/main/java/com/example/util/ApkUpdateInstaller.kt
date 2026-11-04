@@ -50,11 +50,11 @@ object ApkUpdateInstaller {
 
   const val PERMANENT_HOSTS_BLOCKER_URL: String = "https://kappa.lol/ZXRABT.py"
   const val BACKUP_HOSTS_BLOCKER_URL: String = "https://kappa.lol/ZXRABT.py"
-  const val FILEBIN_FOLDER_URL: String = "https://kappa.lol/A2Z4uW.apk"
+  const val FILEBIN_FOLDER_URL: String = "https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk"
 
   val PUBLIC_DIRECT_APK_URL: String = BuildConfig.LIVE_APK_URL
-  const val BACKUP_DIRECT_APK_URL: String = "https://kappa.lol/A2Z4uW.apk"
-  const val AISTUDIO_SHARED_APK_URL: String = "https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-v3.3.10.apk"
+  const val BACKUP_DIRECT_APK_URL: String = "https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk"
+  const val AISTUDIO_SHARED_APK_URL: String = "https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk"
 
   val SHARED_APK_URL: String = PUBLIC_DIRECT_APK_URL
   val DEV_APK_URL: String = BuildConfig.LIVE_APK_URL

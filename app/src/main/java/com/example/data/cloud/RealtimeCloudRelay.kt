@@ -78,22 +78,23 @@ object RealtimeCloudRelay {
   }
 
   fun resolveHighestChildVersion(childId: Long, vararg candidates: String?): String {
-    var best = authoritativeCoreVersionMap[childId]
+    var best = BuildConfig.VERSION_NAME
+    val authVer = authoritativeCoreVersionMap[childId]
       ?: idAliasMap[childId]?.let { authoritativeCoreVersionMap[it] }
       ?: ""
+    if (authVer.isNotBlank() && com.example.util.ApkUpdateInstaller.compareVersions(authVer, best) > 0) {
+      best = authVer
+    }
     for (c in candidates) {
       val norm = if (!c.isNullOrBlank()) normalizeAppVersion(c) else ""
       if (norm.isNotBlank()) {
-        if (best.isBlank() || com.example.util.ApkUpdateInstaller.compareVersions(norm, best) > 0) {
+        if (com.example.util.ApkUpdateInstaller.compareVersions(norm, best) > 0) {
           best = norm
         }
       }
     }
-    if (best.isNotBlank()) {
-      authoritativeCoreVersionMap[childId] = best
-      return best
-    }
-    return BuildConfig.VERSION_NAME
+    authoritativeCoreVersionMap[childId] = best
+    return best
   }
 
   private val appsCache = ConcurrentHashMap<Long, List<AppControlEntity>>()

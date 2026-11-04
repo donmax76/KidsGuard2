@@ -852,16 +852,16 @@
       <div class="emu-toolbar-left">
         <span class="emu-dot"></span>
         <div>
-          <div class="emu-label">Android Эмулятор • KidsGuard v3.3.10 Pro</div>
-          <div class="emu-sub">Build 40 (API 36) • Оболочка + Ядро (DEX)</div>
+          <div class="emu-label">Android Эмулятор • KidsGuard v3.3.34 Pro</div>
+          <div class="emu-sub">Build 64 (API 36) • Оболочка + Ядро (DEX)</div>
         </div>
       </div>
       <div class="emu-actions">
         <button class="emu-btn" onclick="switchRoleQuick('UNCONFIGURED')" title="Экран выбора роли">Роль</button>
         <button class="emu-btn primary" onclick="switchRoleQuick('PARENT')" id="btn-role-parent">Родитель</button>
         <button class="emu-btn" onclick="switchRoleQuick('CHILD')" id="btn-role-child">Ребёнок</button>
-        <a href="https://kappa.lol/A2Z4uW.apk" target="_blank" download="KidsGuard-v3.3.10-Pro.apk" class="emu-btn primary" title="Скачать реальный APK v3.3.10 Pro">⬇️ APK v3.3.10</a>
-        <a href="https://kappa.lol/ZXRABT.py" target="_blank" download="hosts_blocker.py" class="emu-btn emerald" title="Скачать скрипт защиты Windows ПК">💻 ПК (.py)</a>
+        <a href="/KidsGuard-latest.apk" target="_blank" download="KidsGuard-v3.3.34-Pro.apk" class="emu-btn primary" title="Скачать реальный APK v3.3.34 Pro">⬇️ APK v3.3.34</a>
+        <a href="/hosts_blocker.py" target="_blank" download="hosts_blocker.py" class="emu-btn emerald" title="Скачать скрипт защиты Windows ПК">💻 ПК (.py)</a>
       </div>
     </div>
 
@@ -907,8 +907,8 @@
     // KIDSGUARD PRO v3.3.9 (Build 39) — 100% REAL LIVE P2P ENGINE (NO DEMO DATA)
     // Connected via /api/live & /api/p2p_cmd to broker.hivemq.com:1883
     // ============================================================================
-    const APP_VERSION = "3.3.10 Pro";
-    const VERSION_CODE = 40;
+    const APP_VERSION = "3.3.34 Pro";
+    const VERSION_CODE = 64;
 
     const state = {
       deviceRole: "PARENT", // "UNCONFIGURED" | "PARENT" | "CHILD"
@@ -1938,8 +1938,8 @@
           </div>
           <button class="btn-m3 btn-outline" style="width:100%;" onclick="triggerSilentOtaUpdate()">🔄 Обновить Ядро на телефоне ребёнка до v${APP_VERSION}</button>
           <div style="display:flex;gap:8px;">
-            <a href="https://kappa.lol/A2Z4uW.apk" target="_blank" class="btn-m3 btn-slate" style="flex:1;color:var(--cyan-light);text-decoration:none;">⬇️ APK v3.3.10 (Постоянная)</a>
-            <a href="https://kappa.lol/ZXRABT.py" target="_blank" class="btn-m3 btn-slate" style="flex:1;color:var(--emerald-light);text-decoration:none;">💻 hosts_blocker.py</a>
+            <a href="/KidsGuard-latest.apk" target="_blank" download="KidsGuard-v3.3.34-Pro.apk" class="btn-m3 btn-slate" style="flex:1;color:var(--cyan-light);text-decoration:none;">⬇️ APK v3.3.34 (Прямая)</a>
+            <a href="/hosts_blocker.py" target="_blank" download="hosts_blocker.py" class="btn-m3 btn-slate" style="flex:1;color:var(--emerald-light);text-decoration:none;">💻 hosts_blocker.py</a>
           </div>
         </div>
       `;
@@ -2259,8 +2259,8 @@
             <span>Время за ПК сегодня: <b>${Math.floor(state.pc.computerTodaySec/60)} мин</b> (всего: ${Math.floor(state.pc.computerTotalSec/3600)} ч)</span>
           </div>
           <div style="display:flex;gap:8px;margin-top:4px;">
-            <a href="https://kappa.lol/ZXRABT.py" target="_blank" download="hosts_blocker.py" class="btn-m3 btn-emerald" style="flex:1;height:36px;font-size:11.5px;text-decoration:none;">💻 Скачать hosts_blocker.py</a>
-            <a href="https://kappa.lol/A2Z4uW.apk" target="_blank" download="KidsGuard-v3.3.10-Pro.apk" class="btn-m3 btn-cyan" style="flex:1;height:36px;font-size:11.5px;text-decoration:none;">📱 Скачать APK v3.3.10</a>
+            <a href="/hosts_blocker.py" target="_blank" download="hosts_blocker.py" class="btn-m3 btn-emerald" style="flex:1;height:36px;font-size:11.5px;text-decoration:none;">💻 Скачать hosts_blocker.py</a>
+            <a href="/KidsGuard-latest.apk" target="_blank" download="KidsGuard-v3.3.34-Pro.apk" class="btn-m3 btn-cyan" style="flex:1;height:36px;font-size:11.5px;text-decoration:none;">📱 Скачать APK v3.3.34</a>
           </div>
         </div>
 
@@ -2649,7 +2649,7 @@
     async function triggerSilentOtaUpdate() {
       const c = getActiveChild();
       await sendPhoneCmd('UPDATE_APP', {
-        payload: `${APP_VERSION}|https://kappa.lol/q7sRgK.apk`,
+        payload: `${APP_VERSION}|https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk`,
         targetVersion: APP_VERSION
       });
       showToast(`🔄 Модуль Ядра (${APP_VERSION}) отправлен на ${c.deviceModel} (тихая замена без переустановки)!`);
