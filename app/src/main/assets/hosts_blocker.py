@@ -58,7 +58,7 @@ except ImportError:
 IS_WIN = os.name == "nt"
 
 # Версия скрипта: по ней приложение/панель понимают, что на ПК действительно новый файл.
-SCRIPT_VERSION = "5.2"
+SCRIPT_VERSION = "5.3"
 SCRIPT_BUILD = "2026-11-04"
 if IS_WIN:
     import winreg
@@ -2071,6 +2071,7 @@ def stream_touch(duration=25.0, fps=None, w=None, h=None, quality=None, channel=
             STREAM_ST["until_p2p"] = until
         STREAM_ST["until"] = max(float(STREAM_ST.get("until_lan") or 0.0),
                                  float(STREAM_ST.get("until_p2p") or 0.0))
+        _write_stream_flag()
         return dict(STREAM_ST)
 
 
@@ -2079,6 +2080,7 @@ def stream_stop():
         STREAM_ST["until"] = 0.0
         STREAM_ST["until_p2p"] = 0.0
         STREAM_ST["until_lan"] = 0.0
+    _clear_stream_flag()
 
 
 def stream_is_active():
@@ -2101,6 +2103,48 @@ def stream_params():
     return {"fps": fps, "w": w, "h": h, "quality": q, "binary": bool(p.get("binary"))}
 
 
+STREAM_FLAG_FILE = os.path.join(PUB_DIR, "stream.json")
+
+
+def _write_stream_flag():
+    """Сообщает агенту пользовательской сессии, что нужен живой захват экрана."""
+    try:
+        os.makedirs(PUB_DIR, exist_ok=True)
+        p = stream_params()
+        p["ts"] = time.time()
+        tmp = STREAM_FLAG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(p, f)
+        os.replace(tmp, STREAM_FLAG_FILE)
+    except Exception:
+        pass
+
+
+def _clear_stream_flag():
+    try:
+        os.remove(STREAM_FLAG_FILE)
+    except Exception:
+        pass
+
+
+def agent_screen_frame(max_age=2.0):
+    """Свежий кадр от агента (сеанс пользователя). Для потока из SYSTEM-движка:
+    прямой GDI-захват в сессии 0 даёт чёрный экран, а агент видит рабочий стол."""
+    path = os.path.join(PUB_DIR, "screen.png")
+    try:
+        if time.time() - os.path.getmtime(path) > max_age:
+            return None
+        with open(path, "rb") as f:
+            data = f.read()
+        if data.startswith(b"\xff\xd8"):
+            return data, "image/jpeg"
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return data, "image/png"
+    except Exception:
+        pass
+    return None
+
+
 def agent_main():
     if not single_instance("Local\\HostsBlockerAgent"):
         return
@@ -2109,6 +2153,7 @@ def agent_main():
     act_path = _activity_path(user)
     scr_path = os.path.join(PUB_DIR, "screen.png")
     req_path = os.path.join(PUB_DIR, "screen_req.flag")
+    stream_flag = os.path.join(PUB_DIR, "stream.json")
     today = datetime.date.today().isoformat()
     proc_sec, title_sec = {}, {}
     try:
@@ -2131,6 +2176,13 @@ def agent_main():
     last_hist_save = 0.0
     while True:
         title, proc = foreground_info()
+        stream_cfg = None
+        try:
+            if os.path.exists(stream_flag) and time.time() - os.path.getmtime(stream_flag) < 8:
+                with open(stream_flag, "r", encoding="utf-8") as f:
+                    stream_cfg = json.load(f)
+        except Exception:
+            stream_cfg = None
         day = datetime.date.today().isoformat()
         if day != today:  # новый день — архивируем вчерашний день и считаем активность заново
             save_activity_history_day(today, user, proc_sec, title_sec)
@@ -2171,6 +2223,22 @@ def agent_main():
                 pass
         # Снимок для превью: по запросу телефона/панели либо раз в 20 секунд (а не каждые 4 с).
         want_scr = os.path.exists(req_path) or (time.time() - last_scr > 20)
+        if stream_cfg:
+            # Живой поток: агент пользовательской сессии снимает экран чаще и пишет
+            # screen.png, а SYSTEM-движок отдаёт этот кадр в MJPEG/P2P.
+            try:
+                sw = int(stream_cfg.get("w") or 640)
+                sh = int(stream_cfg.get("h") or 360)
+                sq = int(stream_cfg.get("quality") or 55)
+                frame = capture_screen_frame(sw, sh, quality=sq)
+                if frame:
+                    with open(scr_path + ".tmp", "wb") as f:
+                        f.write(frame[0])
+                    os.replace(scr_path + ".tmp", scr_path)
+                last_scr = time.time()
+            except Exception:
+                pass
+            want_scr = False
         if want_scr:
             last_scr = time.time()
             try:
@@ -2202,7 +2270,14 @@ def agent_main():
                     save_activity_history_day(today, user, proc_sec, title_sec)
             except Exception:
                 pass
-        time.sleep(1)
+        if stream_cfg:
+            try:
+                fps = max(1.0, min(12.0, float(stream_cfg.get("fps") or 4.0)))
+            except (TypeError, ValueError):
+                fps = 4.0
+            time.sleep(max(0.12, 1.0 / fps))
+        else:
+            time.sleep(1)
 
 
 # ---------- движок (SYSTEM) ----------
@@ -2569,7 +2644,9 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             deadline = time.time() + 180.0
             while time.time() < deadline:
                 params = stream_params()
-                frame = capture_screen_frame(params["w"], params["h"], quality=params["quality"])
+                frame = agent_screen_frame() or capture_screen_frame(
+                    params["w"], params["h"], quality=params["quality"]
+                )
                 if not frame:
                     time.sleep(0.25)
                     continue
@@ -3252,7 +3329,9 @@ def p2p_stream_worker(st, host, port):
                     time.sleep(min(0.15, next_frame - now))
                     continue
                 params = stream_params()
-                frame = capture_screen_frame(params["w"], params["h"], quality=params["quality"])
+                frame = agent_screen_frame() or capture_screen_frame(
+                    params["w"], params["h"], quality=params["quality"]
+                )
                 if not frame:
                     next_frame = time.time() + 0.2
                     continue
@@ -3278,6 +3357,7 @@ def p2p_stream_worker(st, host, port):
                     }, ensure_ascii=False)
                     for r in roots:
                         sock.sendall(_mqtt_pub_pkt(f"{r}/pc_stream/{code}", payload, retain=False))
+                _write_stream_flag()  # агент продолжает снимать экран, пока идёт поток
                 interval = 1.0 / max(1.0, params["fps"])
                 next_frame = max(next_frame + interval, time.time())
         except Exception:
