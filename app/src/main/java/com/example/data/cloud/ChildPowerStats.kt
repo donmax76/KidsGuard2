@@ -33,7 +33,11 @@ object ChildPowerStats {
       percentPerHour = msg.optDouble("percentPerHour", 0.0).toFloat(),
       updatedAtMs = System.currentTimeMillis()
     )
-    _byChild.value = _byChild.value + (id to snapshot)
+    val canonical = msg.optLong("canonicalChildId", id)
+    var updated = _byChild.value + (id to snapshot)
+    // ID ребёнка на телефоне и канонический ID в семье могут отличаться — кладём под оба.
+    if (canonical > 0L && canonical != id) updated = updated + (canonical to snapshot)
+    _byChild.value = updated
   }
 
   fun snapshotFor(childId: Long): Snapshot? = _byChild.value[childId]

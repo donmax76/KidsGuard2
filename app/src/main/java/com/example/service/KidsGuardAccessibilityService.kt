@@ -421,7 +421,9 @@ class KidsGuardAccessibilityService : AccessibilityService() {
             child?.let {
               val authLock = com.example.data.cloud.RealtimeCloudRelay.getAuthoritativeLock(activeChildId)
               isDeviceLocked = authLock?.first == true
-              com.example.location.LiveLocationTracker.isGpsTrackingAllowed = it.gpsTrackingEnabled
+              // Именно через setGpsTrackingAllowed: он не только меняет флаг,
+              // но и СРАЗУ останавливает FusedLocation/LocationManager у ребёнка.
+              com.example.location.LiveLocationTracker.setGpsTrackingAllowed(it.gpsTrackingEnabled)
               launch(Dispatchers.Main) {
                 if (isDeviceLocked && isChildDeviceRole) {
                   enforceTotalLockFromService("Экран заблокирован родителем.\nРазблокируйте через телефон родителя или введите PIN-код ниже.")

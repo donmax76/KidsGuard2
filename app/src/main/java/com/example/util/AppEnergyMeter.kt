@@ -91,7 +91,7 @@ object AppEnergyMeter {
 
       // Зарядили/перезагрузили/счётчик недоступен — начинаем окно заново.
       if (baseCounter <= 0 || counter >= baseCounter || appMahNow <= 0.0 ||
-        appMahNow < baseAppMah.toDouble() || baseTs <= 0L || now - baseTs < 5 * 60_000L
+        appMahNow < baseAppMah.toDouble() || baseTs <= 0L || now - baseTs < 2 * 60_000L
       ) {
         if (counter >= baseCounter || appMahNow < baseAppMah.toDouble()) startWindow(context)
         return null

@@ -1200,20 +1200,22 @@ object RealtimeCloudRelay {
     }
   }.flowOn(Dispatchers.IO)
 
-  /** Лёгкая телеметрия расхода энергии приложения (раз в 5 минут, без истории). */
+  /** Лёгкая телеметрия расхода энергии приложения (раз в минуту, без истории). */
   suspend fun publishPowerStats(childId: Long, appPercent: Int, mahPerHour: Float, percentPerHour: Float) {
     if (DirectP2pSocketEngine.currentRole != "CHILD") return
-    val targetId = resolveCanonicalChildId(if (childId > 0L) childId else 1L)
+    val rawId = if (childId > 0L) childId else 1L
+    val canonicalId = resolveCanonicalChildId(rawId)
     val json = JSONObject().apply {
       put("type", "POWER_STATS")
-      put("childId", targetId)
+      put("childId", rawId)
+      put("canonicalChildId", canonicalId)
       put("appEnergyPercent", appPercent)
       put("appMahPerHour", mahPerHour.toDouble())
       put("percentPerHour", percentPerHour.toDouble())
       put("timestamp", System.currentTimeMillis())
     }
     DirectP2pSocketEngine.publishTcpSocketPacket(
-      topic = "${DirectP2pSocketEngine.TOPIC_DATA}/power_$targetId",
+      topic = "${DirectP2pSocketEngine.TOPIC_DATA}/power_$rawId",
       json = json,
       retain = false
     )

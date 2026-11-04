@@ -407,10 +407,10 @@ class KidsGuardBackgroundService : Service() {
                   cloudSync.syncChildAppVersion(activeChildId, effectiveVer)
                 }
               }
-              // Оценка расхода энергии приложения — раз в 5 минут и только когда родитель
+              // Оценка расхода энергии приложения — раз в минуту и только когда родитель
               // на связи (одно чтение системных счётчиков, без истории и без сети зря).
               val energyNow = System.currentTimeMillis()
-              if (energyNow - lastEnergyPublishMs >= 300_000L &&
+              if (energyNow - lastEnergyPublishMs >= 60_000L &&
                 com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
               ) {
                 lastEnergyPublishMs = energyNow

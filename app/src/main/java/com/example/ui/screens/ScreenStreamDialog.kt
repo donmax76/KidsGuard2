@@ -132,6 +132,14 @@ fun ScreenStreamDialog(
   var isAutoStreamActive by remember { mutableStateOf(true) }
   var refreshIntervalSec by remember { mutableFloatStateOf(2.0f) }
 
+  // Пауза/ЭКО должны не просто перестать опрашивать, а реально погасить «живое окно»
+  // на телефоне ребёнка — иначе он продолжает снимать экран и тратить батарею.
+  LaunchedEffect(isAutoStreamActive) {
+    if (!isAutoStreamActive && childId > 0L) {
+      onSendCloudCommand("STOP_LIVE_STREAM", "")
+    }
+  }
+
   // Пока приложение свёрнуто — не опрашиваем телефон ребёнка и не держим его экран
   // в режиме трансляции (это зря жжёт батарею у обоих устройств).
   var isAppResumed by remember { mutableStateOf(true) }

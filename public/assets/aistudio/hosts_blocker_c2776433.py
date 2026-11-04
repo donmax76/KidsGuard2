@@ -58,7 +58,7 @@ except ImportError:
 IS_WIN = os.name == "nt"
 
 # Версия скрипта: по ней приложение/панель понимают, что на ПК действительно новый файл.
-SCRIPT_VERSION = "5.3"
+SCRIPT_VERSION = "5.4"
 SCRIPT_BUILD = "2026-11-04"
 if IS_WIN:
     import winreg
@@ -2145,10 +2145,23 @@ def agent_screen_frame(max_age=2.0):
     return None
 
 
+def _is_active_console_session():
+    """Только консольный сеанс снимает screen.png. Агент неактивного/RDP-сеанса
+    иначе перезаписывал кадр чёрным экраном — из-за этого поток был чёрным."""
+    try:
+        sid = ctypes.c_ulong()
+        ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
+        active = int(ctypes.windll.kernel32.WTSGetActiveConsoleSessionId())
+        return int(sid.value) == active
+    except Exception:
+        return True
+
+
 def agent_main():
     if not single_instance("Local\\HostsBlockerAgent"):
         return
     user = re.sub(r"[^\w.-]", "_", os.environ.get("USERNAME", "user"))
+    is_console = _is_active_console_session()
     path = os.path.join(PUB_DIR, f"agent_{user}.json")
     act_path = _activity_path(user)
     scr_path = os.path.join(PUB_DIR, "screen.png")
@@ -2198,7 +2211,8 @@ def agent_main():
             try:
                 os.makedirs(PUB_DIR, exist_ok=True)
                 with open(path + ".tmp", "w", encoding="utf-8") as f:
-                    json.dump({"ts": time.time(), "title": title, "proc": proc, "user": user}, f)
+                    json.dump({"ts": time.time(), "title": title, "proc": proc, "user": user,
+                               "script_version": SCRIPT_VERSION, "console": is_console}, f)
                 os.replace(path + ".tmp", path)
             except Exception:
                 pass
@@ -2223,7 +2237,7 @@ def agent_main():
                 pass
         # Снимок для превью: по запросу телефона/панели либо раз в 20 секунд (а не каждые 4 с).
         want_scr = os.path.exists(req_path) or (time.time() - last_scr > 20)
-        if stream_cfg:
+        if stream_cfg and is_console:
             # Живой поток: агент пользовательской сессии снимает экран чаще и пишет
             # screen.png, а SYSTEM-движок отдаёт этот кадр в MJPEG/P2P.
             try:
@@ -2239,7 +2253,7 @@ def agent_main():
             except Exception:
                 pass
             want_scr = False
-        if want_scr:
+        if want_scr and is_console:
             last_scr = time.time()
             try:
                 if os.path.exists(req_path):
@@ -2270,7 +2284,7 @@ def agent_main():
                     save_activity_history_day(today, user, proc_sec, title_sec)
             except Exception:
                 pass
-        if stream_cfg:
+        if stream_cfg and is_console:
             try:
                 fps = max(1.0, min(12.0, float(stream_cfg.get("fps") or 4.0)))
             except (TypeError, ValueError):
@@ -2579,6 +2593,7 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             cfg = load_config() or {}
             web = cfg.get("web") or {}
             return self._send(200, {"ok": True, "app": "HostsBlocker", "pc_name": socket.gethostname(),
+                                    "pc_id": pc_id(),
                                     "script_version": SCRIPT_VERSION, "script_build": SCRIPT_BUILD,
                                     "ip": local_ip(), "port": int(web.get("port") or 8765),
                                     "pairing_code": str(web.get("pairing_code") or "101-701")})
