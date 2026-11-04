@@ -94,6 +94,7 @@ fun HeroBannerCard(
   childName: String,
   isLocked: Boolean,
   batteryPercent: Int,
+  appEnergyPercent: Int = -1,
   modifier: Modifier = Modifier
 ) {
   Card(
@@ -196,7 +197,12 @@ fun HeroBannerCard(
             .padding(horizontal = 10.dp, vertical = 5.dp)
         ) {
           Text(
-            text = if (batteryPercent in 1..100) "🔋 $batteryPercent% • Онлайн" else "🔋 Ожидание связи",
+            text = when {
+              batteryPercent in 1..100 && appEnergyPercent in 0..100 ->
+                "🔋 $batteryPercent% • прил. $appEnergyPercent%"
+              batteryPercent in 1..100 -> "🔋 $batteryPercent% • Онлайн"
+              else -> "🔋 Ожидание связи"
+            },
             color = if (batteryPercent in 1..100) EmeraldShieldLight else AmberWarning,
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
@@ -372,6 +378,7 @@ fun CommercialKpiBentoGrid(
   totalAppsCount: Int,
   locationAddress: String,
   batteryPercent: Int,
+  appEnergyPercent: Int = -1,
   onScreenTimeClick: () -> Unit,
   onAppsClick: () -> Unit,
   onMapClick: () -> Unit,
@@ -597,7 +604,11 @@ fun CommercialKpiBentoGrid(
               overflow = TextOverflow.Ellipsis
             )
             Text(
-              text = if (batteryPercent in 1..100) "Связь активна" else "Ждём телеметрию",
+              text = if (batteryPercent in 1..100) {
+                if (appEnergyPercent in 0..100) "Приложение: $appEnergyPercent% расхода" else "Связь активна"
+              } else {
+                "Ждём телеметрию"
+              },
               color = if (batteryPercent in 1..100) EmeraldShieldLight else AmberWarning,
               fontSize = 11.sp,
               maxLines = 1,

@@ -594,6 +594,29 @@ object ApkUpdateInstaller {
           return@launch
         }
 
+        // Защита от отката: публичные зеркала могут отдавать старый APK. Если скачанный
+        // versionCode меньше установленного — установку не запускаем (Android всё равно
+        // отклонит downgrade, а ребёнок увидит непонятную ошибку).
+        try {
+          val archive = context.packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0)
+          val installed = context.packageManager.getPackageInfo(context.packageName, 0)
+          val newCode = archive?.versionCode ?: 0
+          if (newCode in 1 until installed.versionCode) {
+            isInstallingUpdate = false
+            isSilentChildInstall = false
+            _updateProgress.value = null
+            _updateStatusText.value = "APK на сервере старее установленной — обновление отменено"
+            DeviceControlDebugger.logEvent(
+              "OTA_DOWNGRADE_BLOCKED",
+              "APK ${archive?.versionName} (code=$newCode) < installed ${installed.versionName} (code=${installed.versionCode})",
+              "WARNING"
+            )
+            apkFile.delete()
+            return@launch
+          }
+        } catch (_: Exception) {
+        }
+
         // Also update hot-core version preferences so even before process restart the target version is recorded
         if (targetChildId > 0L) {
           CoreEngineHotUpdater.setChildCoreVersionName(context.applicationContext, targetChildId, resolvedTargetVer)
@@ -641,16 +664,29 @@ object ApkUpdateInstaller {
             }
 
             scope.launch {
+              var granted = false
               for (attempt in 1..60) {
                 delay(1000)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && context.packageManager.canRequestPackageInstalls()) {
-                  withContext(Dispatchers.Main) {
-                    _updateStatusText.value = "Разрешение получено! Установка..."
-                    launchPackageInstallerSession(context, apkFile, isSilentChildUpdate)
-                  }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                  context.packageManager.canRequestPackageInstalls()
+                ) {
+                  granted = true
                   break
                 }
               }
+              if (granted) {
+                _updateStatusText.value = "Разрешение получено! Установка..."
+                launchPackageInstallerSession(context, apkFile, isSilentChildUpdate)
+                // Держим флаг, чтобы accessibility-автокликер успел подтвердить установку.
+                delay(60_000)
+              } else {
+                _updateStatusText.value = "Разрешение не выдано — обновление отменено"
+              }
+              // ВАЖНО: раньше на этой ветке флаги не сбрасывались, и после первого
+              // отказа все следующие OTA-обновления молча блокировались навсегда.
+              isInstallingUpdate = false
+              isSilentChildInstall = false
+              _updateProgress.value = null
             }
             return@withContext
           }

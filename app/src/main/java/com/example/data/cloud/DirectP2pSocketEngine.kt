@@ -951,6 +951,9 @@ object DirectP2pSocketEngine {
           type == "PC_SCREEN" || topic.contains("/pc_screen") -> {
             com.example.data.pc.PcBlockerClient.ingestP2pScreenJson(msg)
           }
+          type == "POWER_STATS" -> {
+            com.example.data.cloud.ChildPowerStats.ingest(msg)
+          }
           type == "OFFLINE_HISTORY_BUNDLE" -> {
             _incomingOfflineBundlesFlow.tryEmit(msg)
           }

@@ -46,11 +46,43 @@ class KidsGuardBackgroundService : Service() {
   private var activeChildId: Long = 0L
   private var isGpsTrackingStarted = false
 
+  // Окно измерения расхода энергии приложения начинается при отключении зарядки.
+  private val powerConnectionReceiver = object : android.content.BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+      when (intent?.action) {
+        Intent.ACTION_POWER_CONNECTED -> com.example.util.AppEnergyMeter.reset(applicationContext)
+        Intent.ACTION_POWER_DISCONNECTED -> com.example.util.AppEnergyMeter.startWindow(applicationContext)
+      }
+    }
+  }
+
+  private fun registerPowerMeter() {
+    try {
+      val filter = android.content.IntentFilter().apply {
+        addAction(Intent.ACTION_POWER_CONNECTED)
+        addAction(Intent.ACTION_POWER_DISCONNECTED)
+      }
+      androidx.core.content.ContextCompat.registerReceiver(
+        applicationContext,
+        powerConnectionReceiver,
+        filter,
+        androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+      )
+      if (com.example.util.AppEnergyMeter.isCharging(applicationContext)) {
+        com.example.util.AppEnergyMeter.reset(applicationContext)
+      } else {
+        com.example.util.AppEnergyMeter.startWindow(applicationContext)
+      }
+    } catch (_: Exception) {
+    }
+  }
+
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onCreate() {
     super.onCreate()
     createNotificationChannel()
+    registerPowerMeter()
     val persistedLive = ScreenShotManager.restorePersistentLiveStreamState(applicationContext)
     promoteToForeground(includeMediaProjection = persistedLive)
 
@@ -352,6 +384,7 @@ class KidsGuardBackgroundService : Service() {
         var lastSyncedBattery = -1
         var lastSyncedChildId = -1L
         var lastSyncTimeMs = 0L
+        var lastEnergyPublishMs = 0L
         while (isActive) {
           try {
             val latestCfg = dao.getFamilyConfigOnce()
@@ -372,6 +405,22 @@ class KidsGuardBackgroundService : Service() {
                 if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) {
                   cloudSync.upsertBatteryLevel(activeChildId, batteryLevel)
                   cloudSync.syncChildAppVersion(activeChildId, effectiveVer)
+                }
+              }
+              // Оценка расхода энергии приложения — раз в 5 минут и только когда родитель
+              // на связи (одно чтение системных счётчиков, без истории и без сети зря).
+              val energyNow = System.currentTimeMillis()
+              if (energyNow - lastEnergyPublishMs >= 300_000L &&
+                com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
+              ) {
+                lastEnergyPublishMs = energyNow
+                com.example.util.AppEnergyMeter.read(applicationContext)?.let { reading ->
+                  com.example.data.cloud.RealtimeCloudRelay.publishPowerStats(
+                    activeChildId,
+                    reading.appPercent,
+                    reading.mahPerHour,
+                    reading.percentPerHour
+                  )
                 }
               }
             }
@@ -847,9 +896,16 @@ class KidsGuardBackgroundService : Service() {
       .build()
   }
 
+  override fun onDestroy() {
+    try {
+      unregisterReceiver(powerConnectionReceiver)
+    } catch (_: Exception) {
+    }
+    super.onDestroy()
+  }
+
   companion object {
-    fun start(context: Context, childId: Long = 0L, enableProjectionFgs: Boolean = false) {
-      try {
+    fun start(context: Context, childId: Long = 0L, enableProjectionFgs: Boolean = false) {      try {
         val intent = Intent(context, KidsGuardBackgroundService::class.java).apply {
           putExtra("CHILD_ID", childId)
           putExtra("ENABLE_PROJECTION_FGS", enableProjectionFgs)

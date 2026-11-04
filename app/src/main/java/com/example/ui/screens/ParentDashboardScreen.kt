@@ -146,6 +146,10 @@ fun ParentDashboardScreen(
   val remainingMinutes = (dailyLimit - usedMinutes).coerceAtLeast(0)
   val blockedAppsCount = apps.count { it.isBlocked }
 
+  // Расход энергии самого приложения ребёнка (оценка, приходит по P2P раз в 5 минут).
+  val childPowerStats by com.example.data.cloud.ChildPowerStats.byChild.collectAsState()
+  val childEnergyPercent = currentChild?.id?.let { childPowerStats[it]?.appPercent } ?: -1
+
   LazyColumn(
     modifier = modifier
       .fillMaxSize()
@@ -158,7 +162,8 @@ fun ParentDashboardScreen(
       HeroBannerCard(
         childName = if (hasChildren) "$childName (${currentChild?.age ?: 10} лет)" else "Семейный контроль активен",
         isLocked = isLocked,
-        batteryPercent = currentChild?.batteryLevel ?: -1
+        batteryPercent = currentChild?.batteryLevel ?: -1,
+        appEnergyPercent = childEnergyPercent
       )
     }
 
@@ -198,6 +203,7 @@ fun ParentDashboardScreen(
         totalAppsCount = apps.size,
         locationAddress = effectiveAddr,
         batteryPercent = currentChild?.batteryLevel ?: -1,
+        appEnergyPercent = childEnergyPercent,
         onScreenTimeClick = { onNavigateTab(ParentTab.SCREEN_TIME) },
         onAppsClick = { onNavigateTab(ParentTab.APPS) },
         onMapClick = { onNavigateTab(ParentTab.LOCATION_MAP) }
@@ -222,34 +228,8 @@ fun ParentDashboardScreen(
           }
         }
       }
-      var isDashboardResumed by remember { mutableStateOf(true) }
-      val dashboardLifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-      androidx.compose.runtime.DisposableEffect(dashboardLifecycleOwner) {
-        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-          when (event) {
-            androidx.lifecycle.Lifecycle.Event.ON_RESUME -> isDashboardResumed = true
-            androidx.lifecycle.Lifecycle.Event.ON_PAUSE,
-            androidx.lifecycle.Lifecycle.Event.ON_STOP -> isDashboardResumed = false
-            else -> {}
-          }
-        }
-        dashboardLifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { dashboardLifecycleOwner.lifecycle.removeObserver(observer) }
-      }
-      androidx.compose.runtime.LaunchedEffect(isDashboardResumed, pcState.pairingCode) {
-        if (isDashboardResumed) {
-          // 2 к/с и «Эконом» — превью на главном экране не должно сажать батарею.
-          com.example.data.pc.PcBlockerClient.startScreenStream(
-            fps = 2,
-            quality = com.example.data.pc.PcStreamQuality.ECONOMY
-          )
-        } else {
-          com.example.data.pc.PcBlockerClient.stopScreenStream()
-        }
-      }
-      androidx.compose.runtime.DisposableEffect(Unit) {
-        onDispose { com.example.data.pc.PcBlockerClient.stopScreenStream() }
-      }
+      // Превью на дашборде НЕ запускает поток: кадры с ПК идут только когда открыт
+      // экран ПК («💻 ПК»). Здесь показываем последний полученный кадр/снимок.
       val activePcWin = pcState.activeWindows.firstOrNull()
       val dashboardPcBitmap = pcLiveFrame?.bitmap ?: pcLiveBitmap
 
@@ -335,7 +315,11 @@ fun ParentDashboardScreen(
                   .padding(horizontal = 8.dp, vertical = 4.dp)
               ) {
                 Text(
-                  text = if (pcLiveFrame != null) "🟢 ЖИВОЙ ЭКРАН ПК • 2 к/с" else "🟢 ПОСЛЕДНИЙ КАДР ЭКРАНА ПК",
+                  text = if (pcLiveFrame != null && System.currentTimeMillis() - pcLiveFrame!!.timestampMs < 5_000L) {
+                    "🟢 ЖИВОЙ ЭКРАН ПК"
+                  } else {
+                    "🖥 ПОСЛЕДНИЙ КАДР ЭКРАНА ПК"
+                  },
                   color = EmeraldShieldLight,
                   fontSize = 10.sp,
                   fontWeight = FontWeight.Bold,
