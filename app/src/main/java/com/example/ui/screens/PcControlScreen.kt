@@ -302,11 +302,15 @@ fun PcControlScreen(
     onDispose { PcBlockerClient.stopScreenStream() }
   }
 
-  // Пароль уже сохранялся раньше — автоматически входим в LAN-панель, как только
-  // появился IP ПК, чтобы MJPEG работал после перезапуска без повторного ввода.
+  // Пароль уже сохранялся раньше — автоматически входим в LAN-панель. Если IP ПК
+  // неизвестен (UDP-маяк не дошёл), один раз ищем компьютер по Wi-Fi подсети.
   LaunchedEffect(pcState.lanIp, pcState.isLanHttpAuthenticated) {
-    if (pcState.lanIp.isNotBlank() && !pcState.isLanHttpAuthenticated) {
-      PcBlockerClient.ensureSavedLanLogin()
+    if (!pcState.isLanHttpAuthenticated) {
+      if (pcState.lanIp.isBlank()) {
+        PcBlockerClient.discoverLanPc()
+      } else {
+        PcBlockerClient.ensureSavedLanLogin()
+      }
     }
   }
 
@@ -623,6 +627,41 @@ fun PcControlScreen(
                   color = Color(0xFF94A3B8)
                 )
               }
+            }
+          }
+        }
+      }
+    }
+
+    if (pcState.lanIp.isNotBlank() && !pcState.isLanHttpAuthenticated &&
+      !PcBlockerClient.hasSavedPassword()
+    ) {
+      item {
+        Card(
+          shape = RoundedCornerShape(16.dp),
+          colors = CardDefaults.cardColors(containerColor = Slate900),
+          border = BorderStroke(1.dp, CyanLight.copy(alpha = 0.4f)),
+          modifier = Modifier.fillMaxWidth()
+        ) {
+          Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Icon(
+              Icons.Default.Wifi,
+              contentDescription = null,
+              tint = CyanLight,
+              modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+              "ПК в вашем Wi-Fi. Введите пароль панели — поток пойдёт напрямую, без интернета.",
+              color = Color.White,
+              fontSize = 11.sp,
+              modifier = Modifier.weight(1f)
+            )
+            androidx.compose.material3.TextButton(onClick = { showConnectionSetup = true }) {
+              Text("Ввести", color = CyanLight, fontSize = 12.sp, fontWeight = FontWeight.Bold)
             }
           }
         }

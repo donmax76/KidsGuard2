@@ -2579,6 +2579,7 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             cfg = load_config() or {}
             web = cfg.get("web") or {}
             return self._send(200, {"ok": True, "app": "HostsBlocker", "pc_name": socket.gethostname(),
+                                    "pc_id": pc_id(),
                                     "script_version": SCRIPT_VERSION, "script_build": SCRIPT_BUILD,
                                     "ip": local_ip(), "port": int(web.get("port") or 8765),
                                     "pairing_code": str(web.get("pairing_code") or "101-701")})

@@ -24,6 +24,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -255,8 +257,46 @@ object PcBlockerClient {
   @Volatile
   private var lanLoginInFlight: Boolean = false
 
+  @Volatile
+  private var lanScanRunning: Boolean = false
+
+  @Volatile
+  private var lastLanScanMs: Long = 0L
+
   private fun pcPrefs() = DirectP2pSocketEngine.appContext
     ?.getSharedPreferences("kidsguard_pc_client", android.content.Context.MODE_PRIVATE)
+
+  /**
+   * Wi-Fi сеть телефона. LAN-запросы к ПК нельзя пускать через мобильный интернет:
+   * если активна сотовая сеть, OkHttp по умолчанию уйдёт в неё и не найдёт 192.168.x.x.
+   */
+  private fun wifiNetwork(): android.net.Network? {
+    val ctx = DirectP2pSocketEngine.appContext ?: return null
+    val cm = ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+      as? android.net.ConnectivityManager ?: return null
+    return cm.allNetworks.firstOrNull { n ->
+      cm.getNetworkCapabilities(n)
+        ?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+    }
+  }
+
+  private fun lanHttpClient(): okhttp3.OkHttpClient {
+    val net = wifiNetwork() ?: return httpClient
+    return httpClient.newBuilder().socketFactory(net.socketFactory).build()
+  }
+
+  private fun wifiIpv4(): String? {
+    val ctx = DirectP2pSocketEngine.appContext ?: return null
+    val cm = ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+      as? android.net.ConnectivityManager ?: return null
+    val net = wifiNetwork() ?: return null
+    val lp = cm.getLinkProperties(net) ?: return null
+    return lp.linkAddresses
+      .map { it.address }
+      .filterIsInstance<java.net.Inet4Address>()
+      .firstOrNull { !it.isLoopbackAddress }
+      ?.hostAddress
+  }
 
   private fun loadPersistedPcIdentity() {
     if (pcIdentityLoaded) return
@@ -575,7 +615,7 @@ object PcBlockerClient {
       val ip = st.lanIp
       val port = st.port
       val cookie = sessionCookie ?: return@launch
-      val client = httpClient.newBuilder()
+      val client = lanHttpClient().newBuilder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
       val call = client.newCall(
@@ -771,7 +811,7 @@ object PcBlockerClient {
           .post(loginBody)
           .build()
 
-        httpClient.newCall(loginReq).execute().use { resp ->
+        lanHttpClient().newCall(loginReq).execute().use { resp ->
           val bodyStr = resp.body?.string().orEmpty()
           val json = if (bodyStr.startsWith("{")) JSONObject(bodyStr) else JSONObject()
           if (resp.isSuccessful && json.optBoolean("ok", false)) {
@@ -831,6 +871,85 @@ object PcBlockerClient {
     connectLanWithPassword(st.lanIp, st.port, "", "")
   }
 
+  /**
+   * Если UDP-маяк не дошёл (Android часто фильтрует broadcast), ищем ПК по Wi-Fi подсети:
+   * опрашиваем /api/ping на 8765 и сверяем pairing_code/pc_id. Только по действию
+   * пользователя (открытие экрана ПК), не в фоне — чтобы не сажать батарею.
+   */
+  fun discoverLanPc(force: Boolean = false) {
+    if (DirectP2pSocketEngine.currentRole == "CHILD") return
+    loadPersistedPcIdentity()
+    val now = System.currentTimeMillis()
+    if (lanScanRunning || (!force && now - lastLanScanMs < 30_000L)) return
+    val wifiIp = wifiIpv4() ?: return
+    val prefix = wifiIp.substringBeforeLast('.', "")
+    if (prefix.isBlank()) return
+    val net = wifiNetwork() ?: return
+    lanScanRunning = true
+    lastLanScanMs = now
+    scope.launch(Dispatchers.IO) {
+      try {
+        val client = httpClient.newBuilder()
+          .socketFactory(net.socketFactory)
+          .connectTimeout(400, TimeUnit.MILLISECONDS)
+          .readTimeout(400, TimeUnit.MILLISECONDS)
+          .build()
+        var hitIp: String? = null
+        var hitJson: JSONObject? = null
+        for (batch in (1..254).chunked(32)) {
+          if (hitIp != null) break
+          val results = batch.map { host ->
+            async {
+              try {
+                val req = Request.Builder().url("http://$prefix.$host:8765/api/ping").build()
+                client.newCall(req).execute().use { resp ->
+                  if (!resp.isSuccessful) return@use null
+                  val body = resp.body?.string().orEmpty()
+                  if (!body.startsWith("{")) return@use null
+                  val json = JSONObject(body)
+                  if (!json.optBoolean("ok", false)) return@use null
+                  val code = json.optString("pairing_code", "")
+                  val id = json.optString("pc_id", "")
+                  val codeOk = configuredCode.isBlank() ||
+                    normalizePcCode(code) == normalizePcCode(configuredCode)
+                  // ПК старых версий может не отдавать pc_id в /api/ping — тогда
+                  // доверяем совпадению кода, иначе поиск не находил такой ПК.
+                  val idOk = id.isBlank() || configuredPcId.isBlank() || id == configuredPcId
+                  if (codeOk && idOk) Pair("$prefix.$host", json) else null
+                }
+              } catch (_: Exception) {
+                null
+              }
+            }
+          }.awaitAll()
+          val found = results.filterNotNull().firstOrNull()
+          if (found != null) {
+            hitIp = found.first
+            hitJson = found.second
+          }
+        }
+        val ip = hitIp ?: return@launch
+        val json = hitJson ?: return@launch
+        val code = json.optString("pairing_code", configuredCode)
+        val id = json.optString("pc_id", "")
+        if (code.isNotBlank()) configuredCode = code
+        if (id.isNotBlank()) configuredPcId = id
+        codeExplicitlySet = true
+        persistPcIdentity()
+        _state.value = _state.value.copy(
+          lanIp = ip,
+          port = json.optInt("port", 8765).coerceIn(1024, 65535),
+          pcName = json.optString("pc_name", _state.value.pcName),
+          isOnline = true,
+          pairingCode = configuredCode
+        )
+        ensureSavedLanLogin()
+      } finally {
+        lanScanRunning = false
+      }
+    }
+  }
+
   private suspend fun fetchLanStateNow(ip: String = _state.value.lanIp, port: Int = _state.value.port): Boolean =
     withContext(Dispatchers.IO) {
       val cookie = sessionCookie ?: return@withContext false
@@ -841,7 +960,7 @@ object PcBlockerClient {
           .header("Cookie", cookie)
           .get()
           .build()
-        httpClient.newCall(req).execute().use { resp ->
+        lanHttpClient().newCall(req).execute().use { resp ->
           if (resp.code == 401) {
             sessionCookie = null
             _state.value = _state.value.copy(isLanHttpAuthenticated = false)
@@ -877,7 +996,7 @@ object PcBlockerClient {
         .header("X-CSRF", csrfToken)
         .post(payload.toString().toRequestBody(jsonMediaType))
         .build()
-      httpClient.newCall(req).execute().use { resp ->
+      lanHttpClient().newCall(req).execute().use { resp ->
         if (resp.isSuccessful) {
           val bodyStr = resp.body?.string().orEmpty()
           if (bodyStr.startsWith("{")) {
