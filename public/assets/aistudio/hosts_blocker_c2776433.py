@@ -56,6 +56,10 @@ except ImportError:
 
 
 IS_WIN = os.name == "nt"
+
+# Версия скрипта: по ней приложение/панель понимают, что на ПК действительно новый файл.
+SCRIPT_VERSION = "5.2"
+SCRIPT_BUILD = "2026-11-04"
 if IS_WIN:
     import winreg
 
@@ -2500,6 +2504,7 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             cfg = load_config() or {}
             web = cfg.get("web") or {}
             return self._send(200, {"ok": True, "app": "HostsBlocker", "pc_name": socket.gethostname(),
+                                    "script_version": SCRIPT_VERSION, "script_build": SCRIPT_BUILD,
                                     "ip": local_ip(), "port": int(web.get("port") or 8765),
                                     "pairing_code": str(web.get("pairing_code") or "101-701")})
         self._send(404, {"ok": False})
@@ -2709,6 +2714,8 @@ def panel_state(csrf, full=True):
         "csrf": csrf,
         "pc_name": socket.gethostname(),
         "pc_id": pc_id(),
+        "script_version": SCRIPT_VERSION,
+        "script_build": SCRIPT_BUILD,
         "local_ip": local_ip(),
         "port": int(web.get("port") or 8765),
         "pairing_code": str(web.get("pairing_code") or "101-701"),
