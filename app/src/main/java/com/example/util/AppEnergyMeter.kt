@@ -151,7 +151,8 @@ object AppEnergyMeter {
       var total = 0.0
       for (key in powerKeyCache) {
         try {
-          if (stats.hasStats(key)) total += stats.getStats(key).toDouble()
+          // STATS_POWER_* — это measurement-ключи (мА·ч), а не вложенные stats-карты.
+          if (stats.hasMeasurement(key)) total += stats.getMeasurement(key).toDouble()
         } catch (_: Exception) {
         }
       }
