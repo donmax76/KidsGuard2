@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   build:
@@ -46,13 +47,18 @@ jobs:
 
       - name: Publish build error log (diagnostics)
         if: failure()
-        run: |
-          {
-            echo "## Build error"
-            echo '```'
-            tail -n 250 build-output.log 2>/dev/null || echo "build-output.log not found"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = 'build-output.log not found';
+            try { log = fs.readFileSync('build-output.log', 'utf8').slice(-14000); } catch (e) {}
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'CI build error',
+              body: '```\n' + log + '\n```'
+            });
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
