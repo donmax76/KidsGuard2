@@ -302,6 +302,14 @@ fun PcControlScreen(
     onDispose { PcBlockerClient.stopScreenStream() }
   }
 
+  // Пароль уже сохранялся раньше — автоматически входим в LAN-панель, как только
+  // появился IP ПК, чтобы MJPEG работал после перезапуска без повторного ввода.
+  LaunchedEffect(pcState.lanIp, pcState.isLanHttpAuthenticated) {
+    if (pcState.lanIp.isNotBlank() && !pcState.isLanHttpAuthenticated) {
+      PcBlockerClient.ensureSavedLanLogin()
+    }
+  }
+
   LaunchedEffect(isRecordingPcVideo) {
     if (isRecordingPcVideo) {
       pcRecordingSeconds = 0
@@ -553,7 +561,17 @@ fun PcControlScreen(
                 OutlinedTextField(
                   value = passwordInput,
                   onValueChange = { passwordInput = it },
-                  label = { Text("Пароль программы ПК", fontSize = 11.sp) },
+                  label = {
+                    Text(
+                      if (PcBlockerClient.hasSavedPassword()) "Пароль ПК (сохранён)" else "Пароль программы ПК",
+                      fontSize = 11.sp
+                    )
+                  },
+                  placeholder = {
+                    if (PcBlockerClient.hasSavedPassword()) {
+                      Text("можно оставить пустым", fontSize = 10.sp)
+                    }
+                  },
                   visualTransformation = PasswordVisualTransformation(),
                   singleLine = true,
                   colors = textFieldColors,

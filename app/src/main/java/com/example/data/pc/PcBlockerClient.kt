@@ -252,6 +252,9 @@ object PcBlockerClient {
   @Volatile
   private var pcIdentityLoaded: Boolean = false
 
+  @Volatile
+  private var lanLoginInFlight: Boolean = false
+
   private fun pcPrefs() = DirectP2pSocketEngine.appContext
     ?.getSharedPreferences("kidsguard_pc_client", android.content.Context.MODE_PRIVATE)
 
@@ -733,9 +736,12 @@ object PcBlockerClient {
     val cleanIp = ip.trim()
     val cleanPort = if (port in 1024..65535) port else 8765
     loadPersistedPcIdentity()
-    if (password.isNotBlank()) {
-      pcPassword = password
-      pcPrefs()?.edit()?.putString("pc_password", password)?.apply()
+    // Если поле пароля пустое (частый случай после перезапуска) — используем сохранённый,
+    // а не отправляем пустую строку, из-за которой вход «терялся».
+    val effectivePassword = password.ifBlank { pcPassword }
+    if (effectivePassword.isNotBlank()) {
+      pcPassword = effectivePassword
+      pcPrefs()?.edit()?.putString("pc_password", effectivePassword)?.apply()
     }
     if (pairingCode.isNotBlank()) {
       configuredCode = pairingCode.trim()
@@ -744,8 +750,10 @@ object PcBlockerClient {
       persistPcIdentity()
       _state.value = _state.value.copy(pairingCode = configuredCode)
     }
+    lanLoginInFlight = true
     scope.launch {
       if (cleanIp.isBlank()) {
+        lanLoginInFlight = false
         _state.value = _state.value.copy(
           transportLabel = "🌐 Интернет P2P-мост (Код ${_state.value.pairingCode})",
           statusMessage = "Подключение через Интернет по коду P2P (${_state.value.pairingCode})..."
@@ -755,7 +763,7 @@ object PcBlockerClient {
       }
       try {
         val loginBody = JSONObject().apply {
-          put("password", password)
+          put("password", effectivePassword)
         }.toString().toRequestBody(jsonMediaType)
 
         val loginReq = Request.Builder()
@@ -804,8 +812,23 @@ object PcBlockerClient {
           statusMessage = "Вне домашнего Wi-Fi ($cleanIp недоступен) — работаем через Интернет P2P-мост"
         )
         requestSync()
+      } finally {
+        lanLoginInFlight = false
       }
     }
+  }
+
+  fun hasSavedPassword(): Boolean {
+    loadPersistedPcIdentity()
+    return pcPassword.isNotBlank()
+  }
+
+  /** Автовход по сохранённому паролю, когда появился LAN-IP (маяк/состояние). */
+  fun ensureSavedLanLogin() {
+    loadPersistedPcIdentity()
+    val st = _state.value
+    if (lanLoginInFlight || st.isLanHttpAuthenticated || pcPassword.isBlank() || st.lanIp.isBlank()) return
+    connectLanWithPassword(st.lanIp, st.port, "", "")
   }
 
   private suspend fun fetchLanStateNow(ip: String = _state.value.lanIp, port: Int = _state.value.port): Boolean =
