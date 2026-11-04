@@ -256,11 +256,11 @@ fun ScreenStreamDialog(
       onSendCloudCommand("TAKE_SCREENSHOT", "")
       val fetched = cloudSync.pollLatestScreenSnapshot(childId)
       if (fetched != null) {
-        val (activeApp, b64, ts) = fetched
+        val (activeApp, b64, _) = fetched
         remoteAppName = activeApp
-        if (ts > remoteTimestamp) {
-          remoteTimestamp = ts
-        }
+        // Время кадра — по часам РОДИТЕЛЬСКОГО телефона: часы ребёнка могут быть
+        // сдвинуты на час/пояс, и подпись «Обновлено» тогда врёт.
+        remoteTimestamp = System.currentTimeMillis()
         if (b64.isNotBlank()) {
           val bmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
             try {

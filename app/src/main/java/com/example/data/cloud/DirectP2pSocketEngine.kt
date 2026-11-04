@@ -648,8 +648,17 @@ object DirectP2pSocketEngine {
                     val qos = (header and 0x06) shr 1
                     val msgOffset = if (qos > 0) 2 + topicLen + 2 else 2 + topicLen
                     if (remLen > msgOffset) {
-                      val jsonStr = String(payloadBytes, msgOffset, remLen - msgOffset, Charsets.UTF_8)
-                      handleIncomingJsonPacket(topic, jsonStr, isFromLan = false)
+                      if (topic.contains("/pc_stream_bin")) {
+                        // Живой кадр ПК в бинарном виде: без Base64 и без JSON-парсинга.
+                        com.example.data.pc.PcBlockerClient.ingestP2pStreamFrameBinary(
+                          payloadBytes,
+                          msgOffset,
+                          remLen - msgOffset
+                        )
+                      } else {
+                        val jsonStr = String(payloadBytes, msgOffset, remLen - msgOffset, Charsets.UTF_8)
+                        handleIncomingJsonPacket(topic, jsonStr, isFromLan = false)
+                      }
                     }
                   }
                 }

@@ -7,6 +7,8 @@ import com.example.data.cloud.DirectP2pSocketEngine
 import com.example.data.local.KidsGuardDatabase
 import com.example.data.model.OfflineActivityLogEntity
 import java.text.SimpleDateFormat
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
@@ -118,6 +120,9 @@ data class PcConnectionState(
   val offlineHistory: List<PcOfflineHistoryItem> = emptyList(),
   val screenBase64: String = "",
   val screenTimestampMs: Long = 0L,
+  // Время ПОЛУЧЕНИЯ кадра на телефоне (часы телефона). Часы ПК могут быть сдвинуты
+  // на час/пояс — для подписи «кадр получен в …» используем именно это значение.
+  val screenReceivedAtMs: Long = 0L,
   val lastSyncMs: Long = 0L,
   val statusMessage: String? = null
 )
@@ -133,7 +138,7 @@ data class PcLiveFrame(
 /** Профиль качества живого потока экрана ПК (влияет на размер кадра и трафик). */
 enum class PcStreamQuality(val label: String, val width: Int, val height: Int, val jpegQuality: Int) {
   ECONOMY("Эконом", 480, 270, 45),
-  BALANCED("Баланс", 720, 405, 50),
+  BALANCED("Баланс", 640, 360, 50),
   HD("HD", 960, 540, 60)
 }
 
@@ -291,6 +296,7 @@ object PcBlockerClient {
         pairingCode = if (msgCode.isNotBlank()) msgCode else _state.value.pairingCode,
         screenBase64 = b64,
         screenTimestampMs = msg.optLong("ts", System.currentTimeMillis()),
+        screenReceivedAtMs = System.currentTimeMillis(),
         isOnline = true,
         statusMessage = "Живой кадр монитора ПК получен"
       )
@@ -387,6 +393,7 @@ object PcBlockerClient {
     put("w", quality.width)
     put("h", quality.height)
     put("quality", quality.jpegQuality)
+    put("binary", true) // JPEG без Base64 — в 1.33 раза меньше трафика и без лишнего парсинга
     put("duration", 25)
   }
 
@@ -496,6 +503,26 @@ object PcBlockerClient {
           contentLength = -1
         }
       }
+    }
+  }
+
+  /**
+   * Бинарный кадр P2P: 4 байта seq + 8 байт timestamp (big-endian) + JPEG.
+   * Без Base64 — меньше трафика и нет парсинга килобайтных JSON-строк на каждый кадр.
+   */
+  fun ingestP2pStreamFrameBinary(bytes: ByteArray, offset: Int, length: Int) {
+    if (DirectP2pSocketEngine.currentRole == "CHILD") return
+    if (!streamRequested || length <= 12) return
+    try {
+      val buf = ByteBuffer.wrap(bytes, offset, length).order(ByteOrder.BIG_ENDIAN)
+      buf.getInt() // seq
+      val ts = buf.getLong()
+      if (ts <= lastAcceptedFrameTs) return
+      lastAcceptedFrameTs = ts
+      val jpeg = ByteArray(buf.remaining())
+      buf.get(jpeg)
+      publishFrameBytes(jpeg, "🌐 Интернет P2P • живой поток")
+    } catch (_: Exception) {
     }
   }
 
@@ -691,6 +718,7 @@ object PcBlockerClient {
                 _state.value = _state.value.copy(
                   screenBase64 = j.optString("screen_b64"),
                   screenTimestampMs = j.optLong("ts", System.currentTimeMillis()),
+                  screenReceivedAtMs = System.currentTimeMillis(),
                   statusMessage = "Скриншот экрана ПК получен по Wi-Fi"
                 )
               } else {
@@ -1132,6 +1160,7 @@ object PcBlockerClient {
       offlineHistory = offlineList,
       screenBase64 = resolvedScrB64,
       screenTimestampMs = resolvedScrTs,
+      screenReceivedAtMs = if (embeddedScrB64.isNotBlank()) System.currentTimeMillis() else current.screenReceivedAtMs,
       lastSyncMs = System.currentTimeMillis()
     )
   }

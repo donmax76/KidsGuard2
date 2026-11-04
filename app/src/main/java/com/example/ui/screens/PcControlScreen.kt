@@ -280,7 +280,7 @@ fun PcControlScreen(
     if (isAppResumed && autoRefreshScreen) {
       // На весь экран — плавнее (8 к/с), в карточке — экономные 4 к/с.
       PcBlockerClient.startScreenStream(
-        fps = if (showFullPcScreenDialog) 8 else 4,
+        fps = if (showFullPcScreenDialog) 6 else 4,
         quality = pcStreamQuality
       )
     } else {
@@ -1595,7 +1595,11 @@ fun PcControlScreen(
         )
       }
       val fullBmp = liveFrame?.bitmap ?: pcScreenBitmap ?: fallbackBmp
-      val liveTs = liveFrame?.timestampMs ?: pcState.screenTimestampMs
+      // Время получения кадра по часам ТЕЛЕФОНА: часы ПК могут быть сдвинуты на час/пояс,
+      // и подпись «кадр 12:34» тогда выглядела бы неверной.
+      val liveTs = liveFrame?.timestampMs
+        ?: pcState.screenReceivedAtMs.takeIf { it > 0L }
+        ?: pcState.screenTimestampMs
       val frameTimeStr = remember(liveTs) {
         if (liveTs > 0L) {
           SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(liveTs))

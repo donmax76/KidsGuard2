@@ -261,7 +261,7 @@ object ScreenShotManager {
             lastHardwareBitmap = cropped
             lastProjectionFrameMs = now
 
-            if (now - lastAutoStreamMs >= 1000L) {
+            if (now - lastAutoStreamMs >= 700L) {
               lastAutoStreamMs = now
               screenshotExecutor.execute {
                 try {
@@ -584,13 +584,13 @@ object ScreenShotManager {
 
   fun bitmapToBase64(bitmap: Bitmap): String {
     val stream = ByteArrayOutputStream()
-    val scaled = if (bitmap.width > 480) {
-      val ratio = 480f / bitmap.width
-      Bitmap.createScaledBitmap(bitmap, 480, (bitmap.height * ratio).toInt().coerceAtLeast(1), true)
+    val scaled = if (bitmap.width > 420) {
+      val ratio = 420f / bitmap.width
+      Bitmap.createScaledBitmap(bitmap, 420, (bitmap.height * ratio).toInt().coerceAtLeast(1), true)
     } else {
       bitmap
     }
-    scaled.compress(Bitmap.CompressFormat.JPEG, 60, stream)
+    scaled.compress(Bitmap.CompressFormat.JPEG, 55, stream)
     return Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
   }
 

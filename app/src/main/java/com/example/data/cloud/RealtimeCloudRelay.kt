@@ -650,6 +650,24 @@ object RealtimeCloudRelay {
         if (!m.optBoolean("isFromChildHardware", false)) {
           return
         }
+        // Не принимаем список, снятый на ЭТОМ ЖЕ телефоне (родительском): иначе во вкладке
+        // «Приложения» и на дашборде показывались программы родителя вместо ребёнка.
+        if (DirectP2pSocketEngine.currentRole != "CHILD") {
+          val incomingAndroidId = m.optString("deviceAndroidId", "").trim()
+          if (incomingAndroidId.isNotBlank()) {
+            val localAndroidId = try {
+              android.provider.Settings.Secure.getString(
+                DirectP2pSocketEngine.appContext?.contentResolver,
+                android.provider.Settings.Secure.ANDROID_ID
+              ).orEmpty()
+            } catch (_: Exception) {
+              ""
+            }
+            if (localAndroidId.isNotBlank() && incomingAndroidId == localAndroidId) {
+              return
+            }
+          }
+        }
         val rawArr = m.optJSONArray("apps")
         val key = m.optString("blobKey", "")
         val jsonText = when {
@@ -1186,7 +1204,7 @@ object RealtimeCloudRelay {
     val targetId = if (childId > 0L) childId else 1L
     val now = System.currentTimeMillis()
     val prevMs = lastScreenPublishByChild[targetId] ?: 0L
-    if (now - prevMs < 950L) return
+    if (now - prevMs < 500L) return
     lastScreenPublishByChild[targetId] = now
     // Send frame directly inside the binary TCP socket packet (with RETAIN=true on per-child topic) + LAN P2P socket!
     DirectP2pSocketEngine.pushDirectScreenFrame(targetId, activeAppName, base64Bitmap)
@@ -1295,6 +1313,21 @@ object RealtimeCloudRelay {
       put("childId", targetId)
       put("isFromChildHardware", true)
       put("usageDateIso", todayIso)
+      // Отпечаток устройства-источника: родитель отбросит список, если он пришёл
+      // с его собственного телефона (бывает после тестового включения режима ребёнка).
+      put("deviceModel", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim())
+      put("deviceFingerprint", android.os.Build.FINGERPRINT)
+      put(
+        "deviceAndroidId",
+        try {
+          android.provider.Settings.Secure.getString(
+            ctx?.contentResolver,
+            android.provider.Settings.Secure.ANDROID_ID
+          ).orEmpty()
+        } catch (_: Exception) {
+          ""
+        }
+      )
       if (!cachedProfile?.pairingCode.isNullOrBlank()) {
         put("pairingCode", cachedProfile?.pairingCode)
       }
@@ -1423,9 +1456,8 @@ object RealtimeCloudRelay {
     idAliasMap[targetId]?.let { alias ->
       appsCache[alias]?.let { if (it.isNotEmpty()) return it.map { a -> a.copy(childId = childId) } }
     }
-    if (appsCache.size == 1) {
-      appsCache.values.firstOrNull()?.let { if (it.isNotEmpty()) return it.map { a -> a.copy(childId = childId) } }
-    }
+    // Никакого «если в кэше один список — отдать его любому ребёнку»: иначе родитель
+    // видел список программ другого устройства (например, своего собственного телефона).
     return emptyList()
   }
 

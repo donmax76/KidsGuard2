@@ -168,11 +168,12 @@ class ParentalControlRepository(private val context: Context) {
       } else {
         com.example.service.LockOverlayService.stop(context)
         com.example.service.KidsGuardBackgroundService.stop(context)
-        // One-time strict purge of any stale/mixed Parent apps in Parent's SQLite DB from earlier versions
+        // One-time strict purge of any stale/mixed Parent apps in Parent's SQLite DB
+        // (including lists that older versions scanned on the parent phone itself).
         val segPrefs = context.getSharedPreferences("kidsguard_app_segregation_prefs", Context.MODE_PRIVATE)
-        if (!segPrefs.getBoolean("strict_parent_apps_purge_v3330", false)) {
+        if (!segPrefs.getBoolean("strict_parent_apps_purge_v3360", false)) {
           dao.clearAllApps()
-          segPrefs.edit().putBoolean("strict_parent_apps_purge_v3330", true).apply()
+          segPrefs.edit().putBoolean("strict_parent_apps_purge_v3360", true).apply()
         }
         for (c in dao.getAllChildrenOnce()) {
           cloudSync.sendRemoteCommand(c.id, "REFRESH_APPS", "")

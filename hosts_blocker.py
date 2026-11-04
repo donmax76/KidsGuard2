@@ -1968,22 +1968,24 @@ STREAM_LOCK = threading.RLock()
 # until_p2p — аренда для кадров через Интернет; until_lan — для MJPEG по домашнему Wi-Fi.
 # Разделяем их, чтобы при просмотре по Wi-Fi ПК не кодировал те же кадры ещё и в P2P.
 STREAM_ST = {"until": 0.0, "until_p2p": 0.0, "until_lan": 0.0,
-             "fps": 4.0, "w": 800, "h": 450, "quality": 55}
+             "fps": 4.0, "w": 640, "h": 360, "quality": 50, "binary": False}
 
 
-def stream_touch(duration=25.0, fps=None, w=None, h=None, quality=None, channel="p2p"):
+def stream_touch(duration=25.0, fps=None, w=None, h=None, quality=None, channel="p2p", binary=None):
     """Продлевает аренду живого потока и (опционально) меняет параметры кадров."""
     with STREAM_LOCK:
         now = time.time()
         try:
             if fps is not None:
-                STREAM_ST["fps"] = max(1.0, min(10.0, float(fps)))
+                STREAM_ST["fps"] = max(1.0, min(12.0, float(fps)))
             if w is not None:
                 STREAM_ST["w"] = max(320, min(1600, int(w)))
             if h is not None:
                 STREAM_ST["h"] = max(180, min(900, int(h)))
             if quality is not None:
                 STREAM_ST["quality"] = max(25, min(90, int(quality)))
+            if binary is not None:
+                STREAM_ST["binary"] = bool(binary)
         except (TypeError, ValueError):
             pass
         try:
@@ -2020,11 +2022,11 @@ def stream_p2p_active():
 def stream_params():
     with STREAM_LOCK:
         p = dict(STREAM_ST)
-    fps = max(1.0, min(10.0, float(p.get("fps") or 4.0)))
-    w = max(320, min(1600, int(p.get("w") or 800))) // 2 * 2
-    h = max(180, min(900, int(p.get("h") or 450))) // 2 * 2
-    q = max(25, min(90, int(p.get("quality") or 55)))
-    return {"fps": fps, "w": w, "h": h, "quality": q}
+    fps = max(1.0, min(12.0, float(p.get("fps") or 4.0)))
+    w = max(320, min(1600, int(p.get("w") or 640))) // 2 * 2
+    h = max(180, min(900, int(p.get("h") or 360))) // 2 * 2
+    q = max(25, min(90, int(p.get("quality") or 50)))
+    return {"fps": fps, "w": w, "h": h, "quality": q, "binary": bool(p.get("binary"))}
 
 
 def agent_main():
@@ -2461,6 +2463,7 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
                 w=data.get("w"),
                 h=data.get("h"),
                 quality=data.get("quality"),
+                binary=data.get("binary"),
                 channel="lan"
             )
             return self._send(200, {"ok": True, "stream": stream_params(), "lease_until": params["until"]})
@@ -2905,6 +2908,13 @@ def _mqtt_pub_pkt(topic, payload_str, retain=False):
     return bytes([hdr]) + _mqtt_rem_len(len(var)) + var
 
 
+def _mqtt_pub_pkt_bytes(topic, payload_bytes, retain=False):
+    """PUBLISH с бинарным payload (кадр JPEG без Base64 — меньше трафика и нагрузки)."""
+    var = _mqtt_utf8(topic) + payload_bytes
+    hdr = 0x31 if retain else 0x30
+    return bytes([hdr]) + _mqtt_rem_len(len(var)) + var
+
+
 def _mqtt_read_exact(sock, n):
     buf = bytearray()
     while len(buf) < n:
@@ -3032,7 +3042,8 @@ def p2p_bridge_worker(st, host, port):
                                             fps=data.get("fps"),
                                             w=data.get("w"),
                                             h=data.get("h"),
-                                            quality=data.get("quality")
+                                            quality=data.get("quality"),
+                                            binary=data.get("binary")
                                         )
                                     else:
                                         res = panel_mutate(action, data)
@@ -3135,7 +3146,12 @@ def p2p_stream_worker(st, host, port):
                 _mqtt_read_exact(sock, rl)
             if (hdr & 0xF0) != 0x20:
                 raise RuntimeError("CONNACK failed (stream)")
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
             seq = 0
+            next_frame = time.time()
             while stream_p2p_active():
                 cur_cfg = st.get("cfg") or cfg or {}
                 cur_web = cur_cfg.get("web") or {}
@@ -3146,26 +3162,40 @@ def p2p_stream_worker(st, host, port):
                 cur_target = st.get("stream_broker")
                 if cur_target and cur_target != (host, port):
                     break
+                # Держим ровный темп: если сеть не успевает — кадр пропускаем, но НЕ копим
+                # очередь, иначе видео начинает отставать на секунды и «зависает».
+                now = time.time()
+                if now < next_frame:
+                    time.sleep(min(0.15, next_frame - now))
+                    continue
                 params = stream_params()
                 frame = capture_screen_frame(params["w"], params["h"], quality=params["quality"])
                 if not frame:
-                    time.sleep(0.4)
+                    next_frame = time.time() + 0.2
                     continue
                 data, ctype = frame
                 seq += 1
-                payload = json.dumps({
-                    "type": "PC_STREAM_FRAME",
-                    "pairing_code": code,
-                    "seq": seq,
-                    "ts": int(time.time() * 1000),
-                    "w": params["w"],
-                    "h": params["h"],
-                    "fmt": ctype,
-                    "b64": base64.b64encode(data).decode("ascii")
-                }, ensure_ascii=False)
-                for r in roots:
-                    sock.sendall(_mqtt_pub_pkt(f"{r}/pc_stream/{code}", payload, retain=False))
-                time.sleep(1.0 / max(1.0, params["fps"]))
+                ts = int(time.time() * 1000)
+                if params.get("binary"):
+                    # 4 байта seq + 8 байт timestamp (мс) + JPEG
+                    payload_bytes = struct.pack(">IQ", seq, ts) + data
+                    for r in roots:
+                        sock.sendall(_mqtt_pub_pkt_bytes(f"{r}/pc_stream_bin/{code}", payload_bytes, retain=False))
+                else:
+                    payload = json.dumps({
+                        "type": "PC_STREAM_FRAME",
+                        "pairing_code": code,
+                        "seq": seq,
+                        "ts": ts,
+                        "w": params["w"],
+                        "h": params["h"],
+                        "fmt": ctype,
+                        "b64": base64.b64encode(data).decode("ascii")
+                    }, ensure_ascii=False)
+                    for r in roots:
+                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_stream/{code}", payload, retain=False))
+                interval = 1.0 / max(1.0, params["fps"])
+                next_frame = max(next_frame + interval, time.time())
         except Exception:
             time.sleep(2)
         finally:
