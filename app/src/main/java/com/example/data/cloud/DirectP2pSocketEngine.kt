@@ -828,10 +828,6 @@ object DirectP2pSocketEngine {
 
   private fun handleIncomingJsonPacket(topic: String, rawJson: String, isFromLan: Boolean) {
     if (!rawJson.startsWith("{")) return
-    // Актуальный ПК публикует состояние/кадры только в v34. Старые retained-пакеты v33
-    // (с прежним списком правил) могли приходить попеременно с новыми — из-за этого
-    // список «то уменьшался, то увеличивался». Чужие v33-пакеты ПК игнорируем.
-    if (topic.contains("/v33_p2p/") && topic.contains("/pc_")) return
     scope.launch {
       try {
         val msg = JSONObject(rawJson)

@@ -584,6 +584,19 @@ fun PcControlScreen(
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Подключить и синхронизировать ПК", fontWeight = FontWeight.Bold, fontSize = 13.sp)
               }
+              androidx.compose.material3.TextButton(
+                onClick = {
+                  PcBlockerClient.resetPcIdentity()
+                  showConnectionSetup = false
+                },
+                modifier = Modifier.fillMaxWidth()
+              ) {
+                Text(
+                  "Сбросить привязку к ПК (если компьютер не находится)",
+                  fontSize = 11.sp,
+                  color = Color(0xFF94A3B8)
+                )
+              }
             }
           }
         }

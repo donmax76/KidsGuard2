@@ -322,6 +322,22 @@ object PcBlockerClient {
     requestSync()
   }
 
+  /**
+   * Сбросить запомненный pc_id. Нужно, если ПК переустановили/сменили конфиг и его id
+   * изменился: приложение заново опознает компьютер по коду.
+   */
+  fun resetPcIdentity() {
+    loadPersistedPcIdentity()
+    configuredPcId = ""
+    codeExplicitlySet = false
+    persistPcIdentity()
+    _state.value = _state.value.copy(
+      pairingCode = configuredCode,
+      statusMessage = "Привязка к ПК сброшена — ищу компьютер заново по коду"
+    )
+    requestSync()
+  }
+
   fun onUdpBeaconReceived(pcName: String, ip: String, port: Int, pairingCode: String, pcId: String = "") {
     loadPersistedPcIdentity()
     // Маяк приходит по локальной сети от реального ПК — он главнее случайно
@@ -848,9 +864,11 @@ object PcBlockerClient {
   }
 
   private fun sendP2pCommand(action: String, data: JSONObject) {
-    // Пока ПК не опознан (нет маяка/сохранённого кода), НЕ отправляем команды на код
-    // по умолчанию: на публичном брокере так можно задеть чужой компьютер.
-    if (configuredPcId.isBlank() && !codeExplicitlySet) {
+    // Просмотр (синхронизация/снимок/поток) должен работать сразу, даже пока ПК ещё
+    // не опознан по pc_id. Блокируем только ИЗМЕНЕНИЕ правил, чтобы не задеть чужой ПК.
+    val isReadOnly = action == "/api/sync" || action == "/api/screen" ||
+      action == "/api/stream_start" || action == "/api/stream_stop"
+    if (!isReadOnly && configuredPcId.isBlank() && !codeExplicitlySet) {
       _state.value = _state.value.copy(
         statusMessage = "Укажите код P2P компьютера в «⚙ Настройка подключения к ПК»"
       )

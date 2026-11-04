@@ -3111,43 +3111,35 @@ def p2p_bridge_worker(st, host, port):
                                 st["mtime"] = 0
                                 st["sig"] = None
                             elif action == "/api/stream_start":
-                                # Просмотр экрана — тоже приватная операция: без пароля панели
-                                # чужое приложение с кодом по умолчанию могло смотреть экран ПК.
-                                if cur_cfg.get("hash") and not (
-                                        pwd and check_password(pwd, cur_cfg["salt"], cur_cfg["hash"])):
-                                    auth_error = "ПК защищён паролем: укажите пароль панели для просмотра экрана"
-                                else:
-                                    # Запоминаем брокер, через который телефон попросил поток:
-                                    # кадры пойдут только туда (без двойного трафика).
-                                    st["stream_broker"] = (host, port)
-                                    stream_touch(
-                                        duration=data.get("duration", 25.0),
-                                        fps=data.get("fps"),
-                                        w=data.get("w"),
-                                        h=data.get("h"),
-                                        quality=data.get("quality"),
-                                        binary=data.get("binary")
-                                    )
+                                # Просмотр разрешаем по коду привязки (пароль нужен только
+                                # для ИЗМЕНЕНИЯ правил), иначе поток пропадал у пользователей,
+                                # которые не вводили пароль панели в приложении.
+                                st["stream_broker"] = (host, port)
+                                stream_touch(
+                                    duration=data.get("duration", 25.0),
+                                    fps=data.get("fps"),
+                                    w=data.get("w"),
+                                    h=data.get("h"),
+                                    quality=data.get("quality"),
+                                    binary=data.get("binary")
+                                )
                             if action == "/api/stream_stop":
                                 stream_stop()
                             if action == "/api/screen":
-                                if cur_cfg.get("hash") and not (
-                                        pwd and check_password(pwd, cur_cfg["salt"], cur_cfg["hash"])):
-                                    auth_error = "ПК защищён паролем: укажите пароль панели для снимка экрана"
-                                else:
-                                    scr_res = panel_screen(force=True)
-                                    if scr_res.get("ok"):
-                                        scr_json_str = json.dumps({
-                                            "type": "PC_SCREEN",
-                                            "pairing_code": code,
-                                            "pc_id": pc_id(),
-                                            "screen_b64": scr_res["screen_b64"],
-                                            "fmt": scr_res.get("fmt", "image/png"),
-                                            "ts": scr_res.get("ts", int(time.time() * 1000))
-                                        }, ensure_ascii=False)
-                                        for r in roots:
-                                            sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
-                                    last_screen_pub = time.time()
+                                # Снимок — просмотр, не изменение правил: пароль панели не требуем.
+                                scr_res = panel_screen(force=True)
+                                if scr_res.get("ok"):
+                                    scr_json_str = json.dumps({
+                                        "type": "PC_SCREEN",
+                                        "pairing_code": code,
+                                        "pc_id": pc_id(),
+                                        "screen_b64": scr_res["screen_b64"],
+                                        "fmt": scr_res.get("fmt", "image/png"),
+                                        "ts": scr_res.get("ts", int(time.time() * 1000))
+                                    }, ensure_ascii=False)
+                                    for r in roots:
+                                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+                                last_screen_pub = time.time()
                             if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
                                           "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync",
                                           "/api/stream_start", "/api/screen"):
