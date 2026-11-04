@@ -314,6 +314,8 @@ object PcBlockerClient {
     loadPersistedPcIdentity()
     val clean = code.trim().ifBlank { "101-701" }
     configuredCode = clean
+    // Пользователь явно указал код — заново опознаём ПК по этому коду.
+    configuredPcId = ""
     codeExplicitlySet = true
     _state.value = _state.value.copy(pairingCode = clean)
     persistPcIdentity()
@@ -322,15 +324,11 @@ object PcBlockerClient {
 
   fun onUdpBeaconReceived(pcName: String, ip: String, port: Int, pairingCode: String, pcId: String = "") {
     loadPersistedPcIdentity()
-    // Чужой ПК в той же сети с тем же кодом не должен перебивать настройки.
-    if (!matchesConfiguredPc(pairingCode, pcId)) return
-    if (!codeExplicitlySet && pairingCode.isNotBlank()) {
-      configuredCode = pairingCode.trim()
-    }
-    if (configuredPcId.isBlank() && pcId.isNotBlank()) {
-      configuredPcId = pcId.trim()
-      codeExplicitlySet = true
-    }
+    // Маяк приходит по локальной сети от реального ПК — он главнее случайно
+    // «пойманного» чужого состояния из интернета. Переключаемся на этот ПК.
+    if (pairingCode.isNotBlank()) configuredCode = pairingCode.trim()
+    if (pcId.isNotBlank()) configuredPcId = pcId.trim()
+    codeExplicitlySet = true
     persistPcIdentity()
     val cur = _state.value
     val updatedIp = if (ip.isNotBlank() && ip != "127.0.0.1") ip else cur.lanIp
@@ -704,6 +702,7 @@ object PcBlockerClient {
     }
     if (pairingCode.isNotBlank()) {
       configuredCode = pairingCode.trim()
+      configuredPcId = ""
       codeExplicitlySet = true
       persistPcIdentity()
       _state.value = _state.value.copy(pairingCode = configuredCode)
