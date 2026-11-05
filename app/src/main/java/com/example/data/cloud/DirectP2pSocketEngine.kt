@@ -530,12 +530,12 @@ object DirectP2pSocketEngine {
               RealtimeCloudRelay.broadcastCachedChildrenOverLanUdp()
             }
           }
-          // Пока LAN не найден — маяк раз в 10 с, чтобы не ждать 45 с и не уходить
-          // в P2P при том, что оба телефона в одной Wi-Fi. После соединения — реже.
+          // Пока LAN не найден — маяк раз в 30 с (вместо 10 с), чтобы не будить Wi-Fi
+          // радио каждые 10 секунд на простаивающем телефоне ребёнка. После соединения — реже.
           val isAlreadyConnected = _status.value.isLanSocketConnected ||
             _status.value.isGlobalTcpSocketConnected ||
             connectedParentClients.isNotEmpty()
-          val beaconDelay = if (isAlreadyConnected) 60_000L else 10_000L
+          val beaconDelay = if (isAlreadyConnected) 60_000L else 30_000L
           delay(beaconDelay)
         }
       } catch (_: Exception) {

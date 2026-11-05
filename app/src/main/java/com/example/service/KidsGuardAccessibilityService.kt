@@ -361,8 +361,9 @@ class KidsGuardAccessibilityService : AccessibilityService() {
             delay(2_500L)
           }
         } else {
-          // Rest quietly when Parent is not actively watching Live Stream
-          delay(12_000L)
+          // Rest quietly when Parent is not actively watching Live Stream.
+          // 30 с вместо 12 с — меньше пробуждений CPU на простаивающем телефоне.
+          delay(30_000L)
         }
       }
     }

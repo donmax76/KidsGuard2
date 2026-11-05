@@ -288,7 +288,7 @@ class KidsGuardBackgroundService : Service() {
           val isLiveStreamActive = KidsGuardAccessibilityService.isLiveStreamingActiveNow()
           val isA11yActive = KidsGuardAccessibilityService.isAccessibilityEnabled()
           val loopDelayMs = when {
-            !isScreenInteractive -> 45_000L
+            !isScreenInteractive -> 120_000L
             isLiveStreamActive -> 3_500L
             isA11yActive -> 20_000L // AccessibilityService already intercepts apps instantaneously
             else -> 6_000L
@@ -363,29 +363,28 @@ class KidsGuardBackgroundService : Service() {
         }
       }
 
-      // 3. Screen Usage Loop (every 45 seconds, zero network calls when screen is off)
+      // 3. Screen Usage Loop (45 с при включённом экране, 120 с при выключенном — экономия батареи)
       launch {
         var screenOnSeconds = 0
         while (isActive) {
-          delay(45_000)
+          val isScreenOn = DeviceUsageTracker.isInteractive(applicationContext)
+          delay(if (isScreenOn) 45_000L else 120_000L)
           try {
             if (com.example.location.LiveLocationTracker.isEmulator()) continue
             val latestCfg = dao.getFamilyConfigOnce()
             val boundId = latestCfg?.thisDeviceChildId?.takeIf { it > 0 } ?: activeChildId
             if (boundId > 0) activeChildId = boundId
+            // Полуночный сброс проверяем всегда, но при выключенном экране — реже (120 с).
+            DeviceUsageTracker.ensureDailyMidnightReset(applicationContext, activeChildId)
+            if (!isScreenOn) continue
             if (!isGpsTrackingStarted && com.example.location.LiveLocationTracker.isGpsTrackingAllowed) {
               launch(Dispatchers.Main) { startGpsTracking(requestImmediateFix = false) }
             }
             if (activeChildId > 0) {
-              val isScreenOn = DeviceUsageTracker.isInteractive(applicationContext)
-              // Always check 00:00 midnight reset even if screen is off
-              DeviceUsageTracker.ensureDailyMidnightReset(applicationContext, activeChildId)
-              if (isScreenOn) {
-                screenOnSeconds += 45
-                if (screenOnSeconds >= 90) {
-                  screenOnSeconds = 0
-                  DeviceUsageTracker.syncRealUsageStats(applicationContext, activeChildId)
-                }
+              screenOnSeconds += 45
+              if (screenOnSeconds >= 90) {
+                screenOnSeconds = 0
+                DeviceUsageTracker.syncRealUsageStats(applicationContext, activeChildId)
               }
             }
           } catch (e: Exception) {
@@ -444,7 +443,8 @@ class KidsGuardBackgroundService : Service() {
           } catch (e: Exception) {
             Log.e(TAG, "Battery sync error: ${e.message}")
           }
-          delay(60_000)
+          // Родитель не на связи — нет смысла просыпаться каждую минуту: раз в 3 минуты.
+          delay(if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) 60_000L else 180_000L)
         }
       }
 
