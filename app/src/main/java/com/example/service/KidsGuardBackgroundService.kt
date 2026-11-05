@@ -56,6 +56,19 @@ class KidsGuardBackgroundService : Service() {
     }
   }
 
+  // Погас экран — живого просмотра быть не может: сразу гасим стрим и GPS,
+  // чтобы телефон ребёнка не тратил батарею, пока лежит заблокированным.
+  private val screenOffReceiver = object : android.content.BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+      if (intent?.action == Intent.ACTION_SCREEN_OFF) {
+        try {
+          KidsGuardAccessibilityService.stopLiveStreamingWindow()
+        } catch (_: Exception) {}
+        stopGpsTracking()
+      }
+    }
+  }
+
   private fun registerPowerMeter() {
     try {
       val filter = android.content.IntentFilter().apply {
@@ -83,6 +96,7 @@ class KidsGuardBackgroundService : Service() {
     super.onCreate()
     createNotificationChannel()
     registerPowerMeter()
+    registerScreenOffReceiver()
     val persistedLive = ScreenShotManager.restorePersistentLiveStreamState(applicationContext)
     promoteToForeground(includeMediaProjection = persistedLive)
 
@@ -252,7 +266,7 @@ class KidsGuardBackgroundService : Service() {
 
       launch {
         dao.getChildById(activeChildId).collect { child ->
-          val gpsEnabled = child?.gpsTrackingEnabled ?: true
+          val gpsEnabled = child?.gpsTrackingEnabled ?: false
           com.example.location.LiveLocationTracker.setGpsTrackingAllowed(gpsEnabled)
           launch(Dispatchers.Main) {
             if (gpsEnabled) {
@@ -691,8 +705,18 @@ class KidsGuardBackgroundService : Service() {
       Log.w(TAG, "Location permission not granted yet")
       return
     }
+
+    // КЛЮЧЕВАЯ ЭКОНОМИЯ: непрерывные обновления координат включаем ТОЛЬКО пока родитель
+    // реально смотрит карту (команда MAP_VIEWING). В остальное время GNSS-радио должно
+    // спать — фоновый GPS каждые 25–60 секунд был главной причиной разряда и нагрева.
+    val parentOnMap = com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()
+    if (!parentOnMap && isGpsTrackingStarted) {
+      stopGpsTracking()
+      return
+    }
+
     try {
-      // 1. Primary Eco-Smart FusedLocationProviderClient (Balanced power in background, High Accuracy only on explicit on-demand request)
+      // 1. Primary Eco-Smart FusedLocationProviderClient
       val fc = fusedClient
       if (fc != null) {
         try {
@@ -701,7 +725,9 @@ class KidsGuardBackgroundService : Service() {
               onNewLocation(loc)
             }
           }
-          if (requestImmediateFix) {
+          // Разовый точный фикс — только по явному запросу (REQUEST_GPS_NOW) или пока
+          // родитель на карте; без этого только пассивный кэш lastLocation.
+          if (requestImmediateFix || parentOnMap) {
             val highAccReq = com.google.android.gms.location.CurrentLocationRequest.Builder()
               .setPriority(com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY)
               .setMaxUpdateAgeMillis(10_000L)
@@ -714,7 +740,7 @@ class KidsGuardBackgroundService : Service() {
                 }
               }
           }
-          if (!isGpsTrackingStarted) {
+          if (parentOnMap && !isGpsTrackingStarted) {
             fusedCallback?.let { prev -> try { fc.removeLocationUpdates(prev) } catch (_: Exception) {} }
             val cb = object : com.google.android.gms.location.LocationCallback() {
               override fun onLocationResult(result: com.google.android.gms.location.LocationResult) {
@@ -728,15 +754,13 @@ class KidsGuardBackgroundService : Service() {
               }
             }
             fusedCallback = cb
-            // Use PRIORITY_BALANCED_POWER_ACCURACY with 60s interval and 20m displacement for continuous tracking
-            // so the GNSS radio sleeps when the child is stationary indoors!
             val req = com.google.android.gms.location.LocationRequest.Builder(
-              com.google.android.gms.location.Priority.PRIORITY_BALANCED_POWER_ACCURACY,
-              60_000L
+              com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY,
+              12_000L
             )
-              .setMinUpdateIntervalMillis(25_000L)
-              .setMinUpdateDistanceMeters(20f)
-              .setWaitForAccurateLocation(false)
+              .setMinUpdateIntervalMillis(8_000L)
+              .setMinUpdateDistanceMeters(10f)
+              .setWaitForAccurateLocation(true)
               .build()
             fc.requestLocationUpdates(req, cb, android.os.Looper.getMainLooper())
             isGpsTrackingStarted = true
@@ -745,7 +769,8 @@ class KidsGuardBackgroundService : Service() {
         } catch (_: Exception) {}
       }
 
-      // 2. Fallback LocationManager ONLY if Google Play Services FusedLocationProviderClient is unavailable
+      // 2. Fallback LocationManager — только пока родитель смотрит карту.
+      if (!parentOnMap) return
       val lm = locationManager ?: return
       val listener = bgLocationListener ?: object : LocationListener {
         override fun onLocationChanged(location: Location) {
@@ -769,7 +794,7 @@ class KidsGuardBackgroundService : Service() {
         for (provider in bgProviders) {
           try {
             if (lm.allProviders.contains(provider)) {
-              lm.requestLocationUpdates(provider, 60_000L, 20f, listener, android.os.Looper.getMainLooper())
+              lm.requestLocationUpdates(provider, 12_000L, 10f, listener, android.os.Looper.getMainLooper())
             }
           } catch (_: Exception) {}
         }
@@ -898,9 +923,28 @@ class KidsGuardBackgroundService : Service() {
       .build()
   }
 
+  private fun registerScreenOffReceiver() {
+    try {
+      val filter = android.content.IntentFilter().apply {
+        addAction(Intent.ACTION_SCREEN_OFF)
+      }
+      androidx.core.content.ContextCompat.registerReceiver(
+        applicationContext,
+        screenOffReceiver,
+        filter,
+        androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+      )
+    } catch (_: Exception) {
+    }
+  }
+
   override fun onDestroy() {
     try {
       unregisterReceiver(powerConnectionReceiver)
+    } catch (_: Exception) {
+    }
+    try {
+      unregisterReceiver(screenOffReceiver)
     } catch (_: Exception) {
     }
     super.onDestroy()

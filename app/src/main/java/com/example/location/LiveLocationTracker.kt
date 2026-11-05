@@ -61,7 +61,7 @@ class LiveLocationTracker(
     const val DEFAULT_BAKU_ADDRESS = "Ожидание точного GPS-сигнала с телефона ребёнка..."
 
     @Volatile
-    var isGpsTrackingAllowed: Boolean = true
+    var isGpsTrackingAllowed: Boolean = false
 
     private val activeInstances = java.util.Collections.synchronizedSet(java.util.LinkedHashSet<LiveLocationTracker>())
 
@@ -525,84 +525,85 @@ class LiveLocationTracker(
                 processNewLocation(loc)
               }
             }
-            val currentReq = CurrentLocationRequest.Builder()
-              .setPriority(
-                if (parentViewing) Priority.PRIORITY_HIGH_ACCURACY
-                else Priority.PRIORITY_BALANCED_POWER_ACCURACY
+            // Активный GPS-фикс — тоже только когда родитель смотрит карту; иначе
+            // читаем лишь пассивный кэш (lastLocation), не будя GNSS-радио.
+            if (parentViewing) {
+              val currentReq = CurrentLocationRequest.Builder()
+                .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+                .setMaxUpdateAgeMillis(10_000L)
+                .setDurationMillis(8_000L)
+                .build()
+              fused.getCurrentLocation(currentReq, null)
+                .addOnSuccessListener { loc ->
+                  if (loc != null && !isEmulatorSyntheticUsLocation(loc.latitude, loc.longitude)) {
+                    processNewLocation(loc)
+                  }
+                }
+            }
+            // Непрерывные обновления координат включаем ТОЛЬКО пока родитель смотрит карту.
+            // Иначе (приложение свёрнуто / родитель на другом экране) GPS-радио не должно
+            // просыпаться каждые 90 секунд — это и был главный фоновый расход батареи.
+            if (parentViewing) {
+              fusedLocationCallback?.let { prevCb ->
+                try { fused.removeLocationUpdates(prevCb) } catch (_: Exception) {}
+              }
+              val cb = object : com.google.android.gms.location.LocationCallback() {
+                override fun onLocationResult(result: com.google.android.gms.location.LocationResult) {
+                  if (!isGpsTrackingAllowed) {
+                    stopLocationUpdates()
+                    return
+                  }
+                  val bestInBatch = result.locations
+                    .filter { !isEmulatorSyntheticUsLocation(it.latitude, it.longitude) }
+                    .minByOrNull { if (it.accuracy > 0f) it.accuracy else 999f }
+                    ?: result.lastLocation
+                  if (bestInBatch != null) {
+                    processNewLocation(bestInBatch)
+                  }
+                }
+              }
+              fusedLocationCallback = cb
+              val fusedReq = com.google.android.gms.location.LocationRequest.Builder(
+                Priority.PRIORITY_HIGH_ACCURACY,
+                12_000L
               )
-              .setMaxUpdateAgeMillis(if (parentViewing) 10_000L else 60_000L)
-              .setDurationMillis(if (parentViewing) 8_000L else 20_000L)
-              .build()
-            fused.getCurrentLocation(currentReq, null)
-              .addOnSuccessListener { loc ->
-                if (loc != null && !isEmulatorSyntheticUsLocation(loc.latitude, loc.longitude)) {
-                  processNewLocation(loc)
-                }
-              }
-            fusedLocationCallback?.let { prevCb ->
-              try { fused.removeLocationUpdates(prevCb) } catch (_: Exception) {}
+                .setMinUpdateIntervalMillis(8_000L)
+                .setMinUpdateDistanceMeters(10f)
+                .setWaitForAccurateLocation(true)
+                .build()
+              fused.requestLocationUpdates(fusedReq, cb, Looper.getMainLooper())
+              anyActive = true
             }
-            val cb = object : com.google.android.gms.location.LocationCallback() {
-              override fun onLocationResult(result: com.google.android.gms.location.LocationResult) {
-                if (!isGpsTrackingAllowed) {
-                  stopLocationUpdates()
-                  return
-                }
-                val bestInBatch = result.locations
-                  .filter { !isEmulatorSyntheticUsLocation(it.latitude, it.longitude) }
-                  .minByOrNull { if (it.accuracy > 0f) it.accuracy else 999f }
-                  ?: result.lastLocation
-                if (bestInBatch != null) {
-                  processNewLocation(bestInBatch)
-                }
-              }
-            }
-            fusedLocationCallback = cb
-            val fusedInterval = if (parentViewing) 12_000L else 90_000L
-            val fusedReq = com.google.android.gms.location.LocationRequest.Builder(
-              if (parentViewing) Priority.PRIORITY_HIGH_ACCURACY
-              else Priority.PRIORITY_BALANCED_POWER_ACCURACY,
-              fusedInterval
-            )
-              .setMinUpdateIntervalMillis(if (parentViewing) 8_000L else 60_000L)
-              .setMinUpdateDistanceMeters(if (parentViewing) 10f else 30f)
-              .setWaitForAccurateLocation(parentViewing)
-              .build()
-            fused.requestLocationUpdates(fusedReq, cb, Looper.getMainLooper())
-            anyActive = true
           }
         } catch (_: Exception) {}
 
-        // 2. Hardware LocationManager fallback for devices without Play Services
-        for (provider in providers) {
-          try {
-            if (lm.allProviders.contains(provider)) {
-              val isSatelliteGps = provider == LocationManager.GPS_PROVIDER
-              val intervalMs = when {
-                parentViewing && isSatelliteGps -> 15_000L
-                parentViewing -> 20_000L
-                isSatelliteGps -> 180_000L
-                else -> 300_000L
-              }
-              val minDistanceM = if (parentViewing) 10f else 50f
-              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val quality = if (parentViewing && isSatelliteGps) {
-                  android.location.LocationRequest.QUALITY_HIGH_ACCURACY
+        // 2. Hardware LocationManager fallback — тоже только пока родитель смотрит карту.
+        if (parentViewing) {
+          for (provider in providers) {
+            try {
+              if (lm.allProviders.contains(provider)) {
+                val isSatelliteGps = provider == LocationManager.GPS_PROVIDER
+                val intervalMs = if (isSatelliteGps) 15_000L else 20_000L
+                val minDistanceM = 10f
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                  val quality = if (isSatelliteGps) {
+                    android.location.LocationRequest.QUALITY_HIGH_ACCURACY
+                  } else {
+                    android.location.LocationRequest.QUALITY_BALANCED_POWER_ACCURACY
+                  }
+                  val req = android.location.LocationRequest.Builder(intervalMs)
+                    .setQuality(quality)
+                    .setMinUpdateDistanceMeters(minDistanceM)
+                    .setMinUpdateIntervalMillis(10_000L)
+                    .build()
+                  lm.requestLocationUpdates(provider, req, context.mainExecutor, listener)
                 } else {
-                  android.location.LocationRequest.QUALITY_BALANCED_POWER_ACCURACY
+                  lm.requestLocationUpdates(provider, intervalMs, minDistanceM, listener, Looper.getMainLooper())
                 }
-                val req = android.location.LocationRequest.Builder(intervalMs)
-                  .setQuality(quality)
-                  .setMinUpdateDistanceMeters(minDistanceM)
-                  .setMinUpdateIntervalMillis(if (parentViewing) 10_000L else 120_000L)
-                  .build()
-                lm.requestLocationUpdates(provider, req, context.mainExecutor, listener)
-              } else {
-                lm.requestLocationUpdates(provider, intervalMs, minDistanceM, listener, Looper.getMainLooper())
+                anyActive = true
               }
-              anyActive = true
-            }
-          } catch (_: Exception) {}
+            } catch (_: Exception) {}
+          }
         }
 
         _locationState.value = _locationState.value.copy(

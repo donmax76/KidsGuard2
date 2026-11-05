@@ -504,7 +504,7 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
             else -> AppRole.PARENT
           }
           _deviceRole.value = role
-          val gpsAllowed = child?.gpsTrackingEnabled ?: true
+          val gpsAllowed = child?.gpsTrackingEnabled ?: false
           com.example.location.LiveLocationTracker.setGpsTrackingAllowed(gpsAllowed)
           if (role == AppRole.CHILD && !com.example.location.LiveLocationTracker.isEmulator() && gpsAllowed) {
             locationTracker.startRealLocationUpdates()
