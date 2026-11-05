@@ -154,7 +154,7 @@ fun ChildModeScreen(
       com.example.service.KidsGuardBackgroundService.start(context, childId)
     }
     val cloud = com.example.data.cloud.CloudSyncManager(context)
-    cloud.syncChildAppVersion(childId, com.example.BuildConfig.VERSION_NAME)
+    cloud.syncChildAppVersion(childId, com.example.util.AppVersionInfo.installedApkVersion(context))
 
     var tick = 0
     while (true) {

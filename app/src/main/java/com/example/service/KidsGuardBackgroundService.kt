@@ -399,9 +399,9 @@ class KidsGuardBackgroundService : Service() {
                 lastSyncedBattery = batteryLevel
                 lastSyncedChildId = activeChildId
                 lastSyncTimeMs = now
-                // В профиль ребёнка пишем версию установленного APK, а не «ядра»:
-                // иначе родитель видит .22 при старом APK и не предлагает установку.
-                val apkVer = com.example.BuildConfig.VERSION_NAME
+                // В профиль ребёнка пишем версию установленного APK (PackageManager),
+                // а не BuildConfig горячего ядра.
+                val apkVer = com.example.util.AppVersionInfo.installedApkVersion(applicationContext)
                 dao.updateChildBattery(activeChildId, batteryLevel)
                 dao.updateChildAppVersion(activeChildId, apkVer)
                 if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) {

@@ -197,7 +197,7 @@ class ParentalControlRepository(private val context: Context) {
           val currentCfg = dao.getFamilyConfigOnce()
           val isThisChildDevice = currentCfg?.selectedRole == "CHILD"
           val thisDeviceChildId = currentCfg?.thisDeviceChildId ?: 0L
-          val currentInstalledVer = com.example.util.CoreEngineHotUpdater.getEffectiveVersionName(context)
+          val currentInstalledVer = com.example.util.AppVersionInfo.installedApkVersion(context)
 
           val allLocalSnap = dao.getAllChildrenOnce()
           for (cloudChild in cloudChildren) {
@@ -696,8 +696,8 @@ class ParentalControlRepository(private val context: Context) {
               )
             }
           }
-          if (alert.type == "REMOTE_UPDATE_COMPLETED" && alert.extraPayload.isNotBlank()) {
-            dao.updateChildAppVersion(resolvedChildId, alert.extraPayload)
+          if (alert.type == "REMOTE_UPDATE_COMPLETED") {
+            // extraPayload — версия ЯДРА; appVersion (APK) не трогаем.
             dao.setChildUpdatePending(resolvedChildId, false)
           }
         }
@@ -735,8 +735,8 @@ class ParentalControlRepository(private val context: Context) {
                 )
               }
             }
-            if (alert.type == "REMOTE_UPDATE_COMPLETED" && alert.extraPayload.isNotBlank()) {
-              dao.updateChildAppVersion(resolvedChildId, alert.extraPayload)
+            if (alert.type == "REMOTE_UPDATE_COMPLETED") {
+              // extraPayload — версия ЯДРА; appVersion (APK) не трогаем.
               dao.setChildUpdatePending(resolvedChildId, false)
             }
           }
@@ -817,13 +817,13 @@ class ParentalControlRepository(private val context: Context) {
       cloudSync.markChildPaired(child.id, child.pairingCode, model)
     }
     if (!com.example.location.LiveLocationTracker.isEmulator()) {
-      val effectiveVer = com.example.util.CoreEngineHotUpdater.getEffectiveVersionName(context)
+      val apkVer = com.example.util.AppVersionInfo.installedApkVersion(context)
       com.example.service.KidsGuardBackgroundService.start(context, childId)
       val batt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(context)
       dao.updateChildBattery(childId, batt)
-      dao.updateChildAppVersion(childId, effectiveVer)
+      dao.updateChildAppVersion(childId, apkVer)
       cloudSync.upsertBatteryLevel(childId, batt)
-      cloudSync.syncChildAppVersion(childId, effectiveVer)
+      cloudSync.syncChildAppVersion(childId, apkVer)
       val realApps = com.example.util.DeviceAppsProvider.getInstalledLaunchableApps(context, childId)
       if (realApps.isNotEmpty()) {
         dao.deleteAppsForChild(childId)
@@ -1598,11 +1598,12 @@ class ParentalControlRepository(private val context: Context) {
     val cleanVer = com.example.data.cloud.RealtimeCloudRelay.normalizeAppVersion(targetVersion)
     com.example.util.CoreEngineHotUpdater.setChildCoreVersionName(context, childId, cleanVer)
     com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeChildCoreVersion(childId, cleanVer)
-    dao.updateChildAppVersion(childId, cleanVer)
+    val apkVer = com.example.util.AppVersionInfo.installedApkVersion(context)
+    dao.updateChildAppVersion(childId, apkVer)
     dao.setChildUpdatePending(childId, false)
     val child = dao.getChildByIdOnce(childId)
     if (child != null) {
-      val updated = child.copy(appVersion = cleanVer, updatePending = false)
+      val updated = child.copy(appVersion = apkVer, updatePending = false)
       dao.updateChild(updated)
       com.example.data.cloud.RealtimeCloudRelay.publishChildFields(
         childId,

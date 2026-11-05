@@ -233,19 +233,22 @@ object CoreEngineHotUpdater {
         setChildCoreVersionName(context.applicationContext, cid, resolvedTargetVersion)
         RealtimeCloudRelay.setAuthoritativeChildCoreVersion(cid, resolvedTargetVersion)
 
-        dao.updateChildAppVersion(cid, resolvedTargetVersion)
+        // appVersion — это установленный APK. Горячее ядро обновляется отдельно
+        // (setChildCoreVersionName), иначе родитель видел .24 при APK .22.
+        val installedApkVer = AppVersionInfo.installedApkVersion(context.applicationContext)
+        dao.updateChildAppVersion(cid, installedApkVer)
         dao.setChildUpdatePending(cid, false)
         val childEntity = dao.getChildByIdOnce(cid)
         if (childEntity != null) {
           val updatedEntity = childEntity.copy(
-            appVersion = resolvedTargetVersion,
+            appVersion = installedApkVer,
             updatePending = false
           )
           dao.updateChild(updatedEntity)
           RealtimeCloudRelay.publishChildProfile(updatedEntity, isChildDevice = cfg?.selectedRole == "CHILD")
         }
         val cloudSync = CloudSyncManager(context.applicationContext)
-        cloudSync.syncChildAppVersion(cid, resolvedTargetVersion)
+        cloudSync.syncChildAppVersion(cid, installedApkVer)
         cloudSync.sendAlert(
           com.example.data.model.AlertNotificationEntity(
             childId = cid,

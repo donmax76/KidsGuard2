@@ -69,9 +69,8 @@ object RealtimeCloudRelay {
         authoritativeCoreVersionMap[tid] = clean
       }
       childrenCache[tid]?.let { prev ->
-        if (com.example.util.ApkUpdateInstaller.compareVersions(clean, prev.appVersion) >= 0) {
-          childrenCache[tid] = prev.copy(appVersion = clean, updatePending = false)
-        }
+        // Не подменяем appVersion версией ядра: это отдельные сущности.
+        childrenCache[tid] = prev.copy(updatePending = false)
       }
     }
     _liveChildrenFlow.value = deduplicateChildrenCache()

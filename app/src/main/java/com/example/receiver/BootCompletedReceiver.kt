@@ -170,13 +170,6 @@ class BootCompletedReceiver : BroadcastReceiver() {
         val dao = database.kidsGuardDao()
         val config = dao.getFamilyConfigOnce()
 
-        // Ensure all local child profiles reflect the unified BuildConfig.VERSION_NAME post-update
-        for (c in dao.getAllChildrenOnce()) {
-          if (c.appVersion != unifiedBuildVer) {
-            dao.updateChildAppVersion(c.id, unifiedBuildVer)
-          }
-        }
-
         if (config != null && config.selectedRole == "CHILD") {
           val childId = config.thisDeviceChildId.takeIf { it > 0 }
             ?: config.currentActiveChildId.takeIf { it > 0 }
@@ -186,24 +179,25 @@ class BootCompletedReceiver : BroadcastReceiver() {
           com.example.util.CoreEngineHotUpdater.syncUnifiedBuildConfigVersion(appContext, childId)
           com.example.util.CoreEngineHotUpdater.setChildCoreVersionName(appContext, childId, unifiedBuildVer)
           com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeChildCoreVersion(childId, unifiedBuildVer)
+          val apkVer = com.example.util.AppVersionInfo.installedApkVersion(appContext)
 
-          Log.i(TAG, "Child device restored on boot/update for Child ID: $childId (unifiedVer=$unifiedBuildVer)")
+          Log.i(TAG, "Child device restored on boot/update for Child ID: $childId (unifiedVer=$unifiedBuildVer, apk=$apkVer)")
 
           // 1. Ensure P2P Socket Engine is running in CHILD role
           DirectP2pSocketEngine.startEngine("CHILD", childId)
 
           // 2. Update local DB version & clear updatePending flag
-          dao.updateChildAppVersion(childId, unifiedBuildVer)
+          dao.updateChildAppVersion(childId, apkVer)
           dao.setChildUpdatePending(childId, false)
 
           // 3. Restart 24/7 Background service immediately with all persisted permissions (including live stream)
           val liveStreamEnabled = com.example.util.ScreenShotManager.isLiveStreamEnabled(appContext)
           KidsGuardBackgroundService.start(appContext, childId, enableProjectionFgs = liveStreamEnabled)
 
-          // 4. Push updated unified BuildConfig.VERSION_NAME, battery, and completion alert to Parent phone
+          // 4. Push updated APK version, battery, and completion alert to Parent phone
           try {
             val cloudSync = CloudSyncManager(appContext)
-            cloudSync.syncChildAppVersion(childId, unifiedBuildVer)
+            cloudSync.syncChildAppVersion(childId, apkVer)
             val batt = DeviceBatteryUtil.getAccurateBatteryPercentage(appContext)
             dao.updateChildBattery(childId, batt)
             cloudSync.upsertBatteryLevel(childId, batt)

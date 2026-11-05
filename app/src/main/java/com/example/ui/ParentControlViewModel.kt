@@ -843,9 +843,7 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
         _deviceRole.value = AppRole.CHILD
         repository.setDeviceRole(AppRole.CHILD.name)
         repository.setActiveChild(pairedChild.id)
-        // Immediately sync app version & battery
-        val effectiveVer = com.example.util.CoreEngineHotUpdater.getEffectiveVersionName(getApplication())
-        repository.cloudSync.syncChildAppVersion(pairedChild.id, effectiveVer)
+        // Версию APK ребёнка сообщит сам ребёнок; версию родителя сюда писать нельзя.
         val curBatt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(getApplication())
         repository.cloudSync.upsertBatteryLevel(pairedChild.id, curBatt)
         // Warm up cloud screen snapshot

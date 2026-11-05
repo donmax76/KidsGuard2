@@ -498,7 +498,10 @@ object ApkUpdateInstaller {
 
         // 1. Update Hot-Core metadata so if APK package is already at target version, Core is immediately synced
         if (isSilentChildUpdate || dbRole == "CHILD") {
-          val isInstalledApkOlder = compareVersions(BuildConfig.VERSION_NAME, resolvedTargetVer) < 0
+          // Сравниваем именно установленный APK, а не BuildConfig горячего ядра:
+          // иначе ядро .24 при APK .22 считалось «актуальным» и APK не обновлялся.
+          val installedApkVer = com.example.util.AppVersionInfo.installedApkVersion(context)
+          val isInstalledApkOlder = compareVersions(installedApkVer, resolvedTargetVer) < 0
           if (!isInstalledApkOlder) {
             CoreEngineHotUpdater.performSilentCoreUpdate(
               context = context.applicationContext,
