@@ -97,8 +97,10 @@ class KidsGuardBackgroundService : Service() {
     createNotificationChannel()
     registerPowerMeter()
     registerScreenOffReceiver()
-    val persistedLive = ScreenShotManager.restorePersistentLiveStreamState(applicationContext)
-    promoteToForeground(includeMediaProjection = persistedLive)
+    // Проекция экрана не может быть активна сразу при старте процесса (токен согласия
+    // хранится только в памяти). Не объявляем MEDIA_PROJECTION FGS без реальной проекции —
+    // иначе система всё время считает приложение «транслирующим экран» и держит его в разряде.
+    promoteToForeground(includeMediaProjection = false)
 
     cloudSync = CloudSyncManager(applicationContext)
     locationManager = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
@@ -153,8 +155,7 @@ class KidsGuardBackgroundService : Service() {
     if (childId > 0) {
       activeChildId = childId
     }
-    val persistedLive = ScreenShotManager.restorePersistentLiveStreamState(applicationContext)
-    val enableProj = intent?.getBooleanExtra("ENABLE_PROJECTION_FGS", false) == true || persistedLive
+    val enableProj = intent?.getBooleanExtra("ENABLE_PROJECTION_FGS", false) == true
     if (enableProj) {
       promoteToForeground(includeMediaProjection = true)
       val projCode = intent?.getIntExtra("PROJECTION_RESULT_CODE", 0) ?: 0
@@ -181,10 +182,10 @@ class KidsGuardBackgroundService : Service() {
 
   override fun onTaskRemoved(rootIntent: Intent?) {
     super.onTaskRemoved(rootIntent)
-    // Keep foreground protection & persisted live screen streaming active when user closes active windows from Recents
+    // Держим только фоновую защиту (без проекции экрана): пользователь свёл приложение
+    // из Recents, живой просмотр в этот момент не нужен и не должен жечь батарею.
     try {
-      val keepLive = ScreenShotManager.restorePersistentLiveStreamState(applicationContext)
-      start(applicationContext, activeChildId, enableProjectionFgs = keepLive)
+      start(applicationContext, activeChildId, enableProjectionFgs = false)
     } catch (_: Exception) {}
   }
 
