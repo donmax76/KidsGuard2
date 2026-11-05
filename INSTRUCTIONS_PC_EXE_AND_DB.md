@@ -167,13 +167,14 @@
 
 ```bat
 pip install pillow pyinstaller
-pyinstaller --noconsole --onefile --uac-admin --name hosts_blocker hosts_blocker.py
+pyinstaller --noconsole --onefile --name hosts_blocker hosts_blocker.py
 ```
 
 * `--noconsole` — без чёрного окна консоли;
 * `--onefile` — один файл (`dist\hosts_blocker.exe`);
-* `--uac-admin` — запрос прав администратора при первом запуске (нужен для `hosts`,
-  брандмауэра и Планировщика).
+* **НЕ добавляйте `--uac-admin`**: агент запускается автозапуском при входе пользователя и
+  не может пройти UAC молча — без агента не будет ни активности, ни экрана пользователя.
+  Права администратора GUI запрашивает сам (`relaunch_as_admin`), а движок работает как SYSTEM.
 
 Готовый `hosts_blocker.exe` скопируйте на ПК ребёнка (например, в
 `C:\ProgramData\HostsBlocker\`) и запустите один раз от администратора. Дальше программу
