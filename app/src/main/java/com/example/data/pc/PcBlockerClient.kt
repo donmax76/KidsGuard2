@@ -369,6 +369,23 @@ object PcBlockerClient {
    * Сбросить запомненный pc_id. Нужно, если ПК переустановили/сменили конфиг и его id
    * изменился: приложение заново опознает компьютер по коду.
    */
+  fun savedStreamQuality(): PcStreamQuality {
+    loadPersistedPcIdentity()
+    return try {
+      val name = pcPrefs()?.getString("pc_stream_quality", null)
+      if (name.isNullOrBlank()) PcStreamQuality.BALANCED else PcStreamQuality.valueOf(name)
+    } catch (_: Exception) {
+      PcStreamQuality.BALANCED
+    }
+  }
+
+  fun saveStreamQuality(quality: PcStreamQuality) {
+    try {
+      pcPrefs()?.edit()?.putString("pc_stream_quality", quality.name)?.apply()
+    } catch (_: Exception) {
+    }
+  }
+
   fun resetPcIdentity() {
     loadPersistedPcIdentity()
     configuredPcId = ""

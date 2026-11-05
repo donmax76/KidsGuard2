@@ -1298,13 +1298,11 @@ fun ParentDashboardScreen(
       // REMOTE SILENT CORE ENGINE UPDATE CARD (ОБОЛОЧКА HOST SHELL + ГОРЯЧЕЕ ОБНОВЛЕНИЕ ЯДРА БЕЗ УСТАНОВКИ APK)
       item {
         val localCtx = androidx.compose.ui.platform.LocalContext.current
-        val latestVer = com.example.util.CoreEngineHotUpdater.getEffectiveVersionName(localCtx)
+        // Сравниваем версии установленных APK, а не «горячего ядра»: иначе при старом
+        // APK карточка писала «актуально», и обновление ребёнку не предлагалось.
+        val latestVer = com.example.BuildConfig.VERSION_NAME
         val rawChildVer = com.example.data.cloud.RealtimeCloudRelay.normalizeAppVersion(currentChild?.appVersion)
-        val displayVersion = com.example.util.CoreEngineHotUpdater.resolveHighestChildVersion(
-          localCtx,
-          currentChild?.id ?: 0L,
-          rawChildVer
-        )
+        val displayVersion = rawChildVer
         val isChildUpToDate = com.example.util.ApkUpdateInstaller.compareVersions(displayVersion, latestVer) >= 0 ||
           com.example.util.ApkUpdateInstaller.isSameVersion(displayVersion, latestVer)
         val isUpdatePendingOnChild = (currentChild?.updatePending == true && !isChildUpToDate) || isRemoteUpdating
@@ -1356,9 +1354,9 @@ fun ParentDashboardScreen(
                   )
                   Text(
                     text = when {
-                      isUpdatePendingOnChild -> "⏳ Горячая замена ядра: v$displayVersion → v$latestVer"
-                      isChildUpToDate -> "Ядро актуально на обоих телефонах (v$latestVer)"
-                      else -> "Доступно обновление ядра: v$displayVersion → v$latestVer"
+                      isUpdatePendingOnChild -> "⏳ Обновление приложения: v$displayVersion → v$latestVer"
+                      isChildUpToDate -> "APK у ребёнка актуален (v$latestVer)"
+                      else -> "У ребёнка APK v$displayVersion — доступно v$latestVer"
                     },
                     color = when {
                       isUpdatePendingOnChild -> CyanLight

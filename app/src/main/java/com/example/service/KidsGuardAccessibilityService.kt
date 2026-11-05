@@ -223,10 +223,10 @@ class KidsGuardAccessibilityService : AccessibilityService() {
             ?: cfg.currentActiveChildId.takeIf { it > 0 }
             ?: 1L
           activeChildId = cid
-          val effectiveVer = com.example.util.CoreEngineHotUpdater.getEffectiveVersionName(applicationContext)
-          dao.updateChildAppVersion(cid, effectiveVer)
+          val apkVer = com.example.BuildConfig.VERSION_NAME
+          dao.updateChildAppVersion(cid, apkVer)
           try {
-            CloudSyncManager(applicationContext).syncChildAppVersion(cid, effectiveVer)
+            CloudSyncManager(applicationContext).syncChildAppVersion(cid, apkVer)
           } catch (_: Exception) {}
           KidsGuardBackgroundService.start(applicationContext, cid)
         }

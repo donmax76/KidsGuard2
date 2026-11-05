@@ -399,12 +399,14 @@ class KidsGuardBackgroundService : Service() {
                 lastSyncedBattery = batteryLevel
                 lastSyncedChildId = activeChildId
                 lastSyncTimeMs = now
-                val effectiveVer = com.example.util.CoreEngineHotUpdater.getEffectiveVersionName(applicationContext)
+                // В профиль ребёнка пишем версию установленного APK, а не «ядра»:
+                // иначе родитель видит .22 при старом APK и не предлагает установку.
+                val apkVer = com.example.BuildConfig.VERSION_NAME
                 dao.updateChildBattery(activeChildId, batteryLevel)
-                dao.updateChildAppVersion(activeChildId, effectiveVer)
+                dao.updateChildAppVersion(activeChildId, apkVer)
                 if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) {
                   cloudSync.upsertBatteryLevel(activeChildId, batteryLevel)
-                  cloudSync.syncChildAppVersion(activeChildId, effectiveVer)
+                  cloudSync.syncChildAppVersion(activeChildId, apkVer)
                 }
               }
               // Оценка расхода энергии приложения — раз в минуту и только когда родитель

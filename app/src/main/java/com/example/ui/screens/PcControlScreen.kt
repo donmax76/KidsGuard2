@@ -71,6 +71,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -199,7 +200,7 @@ fun PcControlScreen(
   var showConnectionSetup by remember { mutableStateOf(false) }
   var showFullLockSchedule by remember { mutableStateOf(false) }
   var showAddRuleDialog by remember { mutableStateOf(false) }
-  var showFullPcScreenDialog by remember { mutableStateOf(false) }
+  var showFullPcScreenDialog by rememberSaveable { mutableStateOf(false) }
   var showCustomDateRangeDialog by remember { mutableStateOf(false) }
   var expandedEntryName by remember { mutableStateOf<String?>(null) }
 
@@ -228,8 +229,18 @@ fun PcControlScreen(
   var isRecordingPcVideo by remember { mutableStateOf(false) }
   var pcRecordingSeconds by remember { mutableIntStateOf(0) }
   var recordedPcVideoUri by remember { mutableStateOf<Uri?>(null) }
-  var autoRefreshScreen by remember { mutableStateOf(true) }
-  var pcStreamQuality by remember { mutableStateOf(PcStreamQuality.BALANCED) }
+  var autoRefreshScreen by rememberSaveable { mutableStateOf(true) }
+  // Качество сохраняем между поворотами и перезапусками: иначе после поворота
+  // HD сбрасывался на «Баланс» 640×360.
+  var pcStreamQuality by rememberSaveable(
+    stateSaver = androidx.compose.runtime.saveable.Saver(
+      save = { it.name },
+      restore = { name -> PcStreamQuality.valueOf(name) }
+    )
+  ) { mutableStateOf(PcBlockerClient.savedStreamQuality()) }
+  LaunchedEffect(pcStreamQuality) {
+    PcBlockerClient.saveStreamQuality(pcStreamQuality)
+  }
 
   val liveFrame by PcBlockerClient.liveFrame.collectAsState()
   val streamStatus by PcBlockerClient.streamStatus.collectAsState()
@@ -1664,7 +1675,10 @@ fun PcControlScreen(
   if (showFullPcScreenDialog) {
     androidx.compose.ui.window.Dialog(
       onDismissRequest = { showFullPcScreenDialog = false },
-      properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+      properties = androidx.compose.ui.window.DialogProperties(
+        usePlatformDefaultWidth = false,
+        decorFitsSystemWindows = false
+      )
     ) {
       val fallbackBmp = remember(pcState.pcName, currentPcSummary) {
         val timeNow = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
@@ -1675,8 +1689,6 @@ fun PcControlScreen(
         )
       }
       val fullBmp = liveFrame?.bitmap ?: pcScreenBitmap ?: fallbackBmp
-      // Время получения кадра по часам ТЕЛЕФОНА: часы ПК могут быть сдвинуты на час/пояс,
-      // и подпись «кадр 12:34» тогда выглядела бы неверной.
       val liveTs = liveFrame?.timestampMs
         ?: pcState.screenReceivedAtMs.takeIf { it > 0L }
         ?: pcState.screenTimestampMs
@@ -1688,204 +1700,99 @@ fun PcControlScreen(
         }
       }
 
-      Column(
+      // Полноэкранный режим: кадр ПК занимает весь экран, элементы управления —
+      // полупрозрачные оверлеи сверху/снизу, а не отдельные панели, отнимающие место.
+      Box(
         modifier = Modifier
           .fillMaxSize()
-          .background(Slate950)
-          .padding(14.dp),
-        verticalArrangement = Arrangement.SpaceBetween
+          .background(Color.Black)
       ) {
+        Image(
+          bitmap = fullBmp.asImageBitmap(),
+          contentDescription = "Полный экран ПК",
+          contentScale = ContentScale.Fit,
+          modifier = Modifier.fillMaxSize()
+        )
+
         Row(
-          modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.SpaceBetween,
+          modifier = Modifier
+            .align(Alignment.TopCenter)
+            .fillMaxWidth()
+            .background(Color.Black.copy(alpha = 0.55f))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
           verticalAlignment = Alignment.CenterVertically
         ) {
           Column(modifier = Modifier.weight(1f)) {
             Text(
-              text = "🖥 Живой экран ПК: ${pcState.pcName}",
+              text = "🖥 ${pcState.pcName}",
               color = Color.White,
-              fontSize = 16.sp,
-              fontWeight = FontWeight.ExtraBold
+              fontSize = 14.sp,
+              fontWeight = FontWeight.ExtraBold,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis
             )
             Text(
               text = if (liveFrame != null) {
-                "🟢 LIVE ${streamStatus.fps} к/с • ${streamStatus.transport} • кадр $frameTimeStr"
+                "🟢 ${streamStatus.fps} к/с • ${pcStreamQuality.label} • кадр $frameTimeStr"
               } else {
-                "⏳ Подключаем живой поток монитора… ($frameTimeStr)"
+                "⏳ Подключение к потоку… ($frameTimeStr)"
               },
               color = if (liveFrame != null) EmeraldShieldLight else CyanLight,
-              fontSize = 11.sp,
-              fontWeight = FontWeight.SemiBold,
-              maxLines = 2,
+              fontSize = 10.sp,
+              maxLines = 1,
               overflow = TextOverflow.Ellipsis
             )
           }
-          Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            OutlinedButton(
-              onClick = { PcBlockerClient.requestPcScreenshot() },
-              border = BorderStroke(1.dp, CyanLight),
-              shape = RoundedCornerShape(10.dp),
-              contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-            ) {
-              Icon(Icons.Default.Refresh, contentDescription = null, tint = CyanLight, modifier = Modifier.size(16.dp))
-              Spacer(modifier = Modifier.width(4.dp))
-              Text("Кадр", color = CyanLight, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-            }
-            Button(
-              onClick = { showFullPcScreenDialog = false },
-              colors = ButtonDefaults.buttonColors(containerColor = Slate800, contentColor = Color.White),
-              shape = RoundedCornerShape(10.dp),
-              contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-            ) {
-              Text("✕ Закрыть", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-            }
+          androidx.compose.material3.TextButton(onClick = { showFullPcScreenDialog = false }) {
+            Text("✕", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
           }
         }
 
-        Box(
+        Row(
           modifier = Modifier
+            .align(Alignment.BottomCenter)
             .fillMaxWidth()
-            .weight(1f)
-            .padding(vertical = 10.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(Color.Black),
-          contentAlignment = Alignment.Center
+            .background(Color.Black.copy(alpha = 0.55f))
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+          horizontalArrangement = Arrangement.SpaceBetween,
+          verticalAlignment = Alignment.CenterVertically
         ) {
-          Image(
-            bitmap = fullBmp.asImageBitmap(),
-            contentDescription = "Полный экран ПК",
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize()
+          Text(
+            text = "Качество: ${pcStreamQuality.label} (${pcStreamQuality.width}×${pcStreamQuality.height})",
+            color = Slate200,
+            fontSize = 10.sp,
+            maxLines = 1
           )
-          if (!streamStatus.isActive) {
-            Box(
-              modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(8.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .background(AmberWarning.copy(alpha = 0.9f))
-                .padding(horizontal = 8.dp, vertical = 4.dp)
-            ) {
-              Text("⏸ Поток на паузе", color = Slate950, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-            }
-          }
-        }
-
-        Column(
-          modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(Slate900)
-            .padding(12.dp),
-          verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
           Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
           ) {
+            androidx.compose.material3.TextButton(onClick = { PcBlockerClient.requestPcScreenshot() }) {
+              Text("Кадр", color = CyanLight, fontSize = 11.sp)
+            }
             Text(
-              text = "Плавность потока",
-              color = Slate400,
+              text = if (streamStatus.isActive) "● LIVE" else "⏸ ПАУЗА",
+              color = if (streamStatus.isActive) EmeraldShieldLight else AmberWarning,
               fontSize = 11.sp,
               fontWeight = FontWeight.Bold
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-              listOf(3, 5, 8).forEach { fpsValue ->
-                val selected = streamStatus.isActive && kotlin.math.abs(streamStatus.fps - fpsValue.toFloat()) < 1.5f
-                Box(
-                  modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(if (selected) CyanLight.copy(alpha = 0.25f) else Slate950)
-                    .border(1.dp, if (selected) CyanLight else Slate800, RoundedCornerShape(8.dp))
-                    .clickable { PcBlockerClient.startScreenStream(fps = fpsValue, quality = pcStreamQuality) }
-                    .padding(horizontal = 10.dp, vertical = 5.dp)
-                ) {
-                  Text("$fpsValue к/с", color = if (selected) CyanLight else Slate200, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                }
-              }
-              Box(
-                modifier = Modifier
-                  .clip(RoundedCornerShape(8.dp))
-                  .background(if (!streamStatus.isActive) AmberWarning.copy(alpha = 0.25f) else Slate950)
-                  .border(1.dp, if (!streamStatus.isActive) AmberWarning else Slate800, RoundedCornerShape(8.dp))
-                  .clickable {
-                    if (streamStatus.isActive) PcBlockerClient.stopScreenStream()
-                    else PcBlockerClient.startScreenStream(fps = 8, quality = pcStreamQuality)
-                  }
-                  .padding(horizontal = 10.dp, vertical = 5.dp)
-                ) {
-                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Icon(
-                      if (streamStatus.isActive) Icons.Default.Pause else Icons.Default.PlayArrow,
-                      contentDescription = null,
-                      tint = if (streamStatus.isActive) Slate200 else AmberWarning,
-                      modifier = Modifier.size(12.dp)
-                    )
-                    Text(
-                      if (streamStatus.isActive) "Пауза" else "Пуск",
-                      color = if (streamStatus.isActive) Slate200 else AmberWarning,
-                      fontSize = 11.sp,
-                      fontWeight = FontWeight.Bold
-                    )
-                  }
-                }
-              }
-            }
+          }
+        }
 
-          Text(
-            text = "🎬 Активное окно на ПК: $currentPcSummary",
-            color = Color.White,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis
-          )
-          Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        if (!streamStatus.isActive) {
+          Box(
+            modifier = Modifier
+              .align(Alignment.Center)
+              .clip(RoundedCornerShape(10.dp))
+              .background(AmberWarning.copy(alpha = 0.9f))
+              .padding(horizontal = 12.dp, vertical = 8.dp)
           ) {
-            Button(
-              onClick = {
-                val res = ScreenShotManager.saveBitmapToGalleryWithUri(context, fullBmp, "PC")
-                Toast.makeText(
-                  context,
-                  if (res != null) "📸 Снимок монитора ПК сохранён в Галерею!" else "Ошибка сохранения снимка",
-                  Toast.LENGTH_LONG
-                ).show()
-              },
-              colors = ButtonDefaults.buttonColors(containerColor = CyanLight, contentColor = Color.Black),
-              shape = RoundedCornerShape(10.dp),
-              modifier = Modifier.weight(1f)
-            ) {
-              Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
-              Spacer(modifier = Modifier.width(6.dp))
-              Text("Снимок в галерею", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-            }
-            Button(
-              onClick = {
-                val acct = childAccountInput.trim().ifBlank { pcState.fullLock.childAccount }
-                PcBlockerClient.toggleFullPcLock(!pcState.fullLock.now, acct)
-              },
-              colors = ButtonDefaults.buttonColors(
-                containerColor = if (pcState.fullLock.now) EmeraldShield else RoseLock,
-                contentColor = Color.White
-              ),
-              shape = RoundedCornerShape(10.dp),
-              modifier = Modifier.weight(1f)
-            ) {
-              Icon(
-                if (pcState.fullLock.now) Icons.Default.LockOpen else Icons.Default.Lock,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp)
-              )
-              Spacer(modifier = Modifier.width(6.dp))
-              Text(
-                if (pcState.fullLock.now) "Разблок. ПК" else "Заблок. ПК",
-                fontWeight = FontWeight.Bold,
-                fontSize = 12.sp
-              )
-            }
+            Text(
+              "Поток на паузе",
+              color = Slate950,
+              fontSize = 12.sp,
+              fontWeight = FontWeight.Bold
+            )
           }
         }
       }
