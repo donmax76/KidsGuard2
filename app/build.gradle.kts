@@ -31,6 +31,11 @@ val verMinor = versionProps.getProperty("VERSION_MINOR", "3").toIntOrNull() ?: 3
 val currentPatch = maxOf(34, versionProps.getProperty("VERSION_PATCH", "34").toIntOrNull() ?: 34)
 val currentVerCode = maxOf(64, versionProps.getProperty("VERSION_CODE", "64").toIntOrNull() ?: 64)
 val currentVerName = "$verMajor.$verMinor.$currentPatch Pro"
+// Каждый запуск CI получает новый versionCode/versionName, иначе APK
+// устанавливается как та же версия и обновление не видит разницы.
+val ciBuildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
+val effectiveVersionCode = currentVerCode + ciBuildNumber
+val effectiveVersionName = if (ciBuildNumber > 0) "$currentVerName.${ciBuildNumber}" else currentVerName
 
 android {
   namespace = "com.example"
@@ -40,8 +45,8 @@ android {
     applicationId = "com.aistudio.kidsguard.pvrtqx"
     minSdk = 24
     targetSdk = 36
-    versionCode = currentVerCode
-    versionName = currentVerName
+    versionCode = effectiveVersionCode
+    versionName = effectiveVersionName
 
     buildConfigField("String", "LIVE_APK_URL", "\"https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk\"")
     buildConfigField("String", "PRE_APK_URL", "\"https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk\"")

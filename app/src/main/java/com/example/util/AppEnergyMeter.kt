@@ -77,10 +77,10 @@ object AppEnergyMeter {
         if (!isCharging(context)) startWindow(context)
         return null
       }
-      val bm = context.getSystemService(BatteryManager::class.java) ?: return null
+      val bm = context.getSystemService(BatteryManager::class.java) ?: return cpuFallback()
       val counter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
       val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-      if (counter <= 0 || level <= 0) return null
+      if (level <= 0) return cpuFallback()
 
       val baseCounter = prefs.getInt(KEY_COUNTER, -1)
       val baseAppMah = prefs.getFloat(KEY_APP_MAH, -1f)
@@ -89,22 +89,33 @@ object AppEnergyMeter {
       val now = System.currentTimeMillis()
       val appMahNow = appPowerMah(context)
 
-      // Зарядили/перезагрузили/счётчик недоступен — начинаем окно заново.
-      if (baseCounter <= 0 || counter >= baseCounter || appMahNow <= 0.0 ||
-        appMahNow < baseAppMah.toDouble() || baseTs <= 0L || now - baseTs < 2 * 60_000L
-      ) {
-        if (counter >= baseCounter || appMahNow < baseAppMah.toDouble()) startWindow(context)
+      // На части телефонов системные счётчики энергии (HealthStats) недоступны —
+      // показываем оценку по CPU-нагрузке приложения, чтобы показатель вообще был.
+      if (appMahNow <= 0.0) return cpuFallback()
+      if (baseAppMah <= 0f) {
+        startWindow(context)
+        return null
+      }
+      if (baseTs <= 0L || now - baseTs < 2 * 60_000L) return null
+
+      val levelDrop = baseLevel - level
+      // Счётчик заряда есть не на всех устройствах — тогда считаем по проценту заряда.
+      val totalMah = when {
+        baseCounter > 0 && counter > 0 && counter < baseCounter ->
+          (baseCounter - counter) / 1000.0
+        levelDrop > 0 -> levelDrop / 100.0 * 4000.0
+        else -> 0.0
+      }
+      if (totalMah < 0.5) {
+        if (counter >= baseCounter || levelDrop <= 0) startWindow(context)
         return null
       }
 
-      val totalMah = (baseCounter - counter) / 1000.0
       val usedAppMah = appMahNow - baseAppMah.toDouble()
-      if (totalMah < 0.5 || usedAppMah <= 0.0) return null
-
+      if (usedAppMah <= 0.0) return null
       val share = (usedAppMah / totalMah * 100.0).coerceIn(0.0, 100.0)
       val hours = ((now - baseTs) / 3_600_000.0).coerceAtLeast(0.05)
       val mahPerHour = usedAppMah / hours
-      val levelDrop = baseLevel - level
       val capacityMah = if (levelDrop > 0) totalMah / (levelDrop / 100.0) else 4000.0
       val pctPerHour = (mahPerHour / capacityMah * 100.0).coerceIn(0.0, 100.0)
 
@@ -116,6 +127,25 @@ object AppEnergyMeter {
       )
     } catch (_: Exception) {
       return null
+    }
+  }
+
+  /** Резерв, когда телефон не отдаёт системные счётчики энергии: доля CPU-времени. */
+  private fun cpuFallback(): Reading? {
+    return try {
+      val startElapsed = android.os.Process.getStartElapsedRealtime()
+      val elapsed = android.os.SystemClock.elapsedRealtime() - startElapsed
+      if (elapsed < 2 * 60_000L) return null
+      val cpuMs = android.os.Process.getElapsedCpuTime().coerceAtLeast(0L)
+      val share = (cpuMs.toDouble() / elapsed.toDouble()).coerceIn(0.0, 1.0)
+      Reading(
+        appPercent = (share * 100.0).roundToInt(),
+        mahPerHour = 0f,
+        percentPerHour = 0f,
+        windowHours = elapsed / 3_600_000f
+      )
+    } catch (_: Exception) {
+      null
     }
   }
 

@@ -445,4 +445,20 @@ object DeviceSecurityPermissionHelper {
   fun reinstallViaStoreSessionToUnlockSamsung(context: Context) {
     openAppInfoForRestrictedSettings(context)
   }
+
+  /**
+   * Блокировка удаления приложения, если оно является Device Owner (MDM).
+   * Без Device Owner Android не позволяет приложению запретить удаление —
+   * остаётся только предупреждение администратора устройства.
+   */
+  fun setUninstallBlocked(context: Context, blocked: Boolean) {
+    try {
+      val dpm = context.getSystemService(DevicePolicyManager::class.java) ?: return
+      val admin = ComponentName(context, com.example.admin.KidsGuardDeviceAdminReceiver::class.java)
+      if (dpm.isDeviceOwnerApp(context.packageName)) {
+        dpm.setUninstallBlocked(admin, context.packageName, blocked)
+      }
+    } catch (_: Exception) {
+    }
+  }
 }

@@ -8,6 +8,7 @@ import android.widget.Toast
 class KidsGuardDeviceAdminReceiver : DeviceAdminReceiver() {
   override fun onEnabled(context: Context, intent: Intent) {
     super.onEnabled(context, intent)
+    com.example.util.DeviceSecurityPermissionHelper.setUninstallBlocked(context, true)
     Toast.makeText(context, "Защита от удаления KidsGuard активирована", Toast.LENGTH_SHORT).show()
   }
 

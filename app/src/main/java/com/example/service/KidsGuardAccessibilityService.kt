@@ -49,9 +49,22 @@ class KidsGuardAccessibilityService : AccessibilityService() {
     @Volatile
     var liveStreamRequestedUntilMs: Long = 0L
 
+    // Защита от «залипшего» просмотра: одна сессия не более 10 минут, плюс
+    // аварийное отключение при низком заряде/нагреве (проверка раз в 30 с).
+    private const val LIVE_SESSION_MAX_MS = 10 * 60_000L
+    @Volatile private var liveSessionStartedMs: Long = 0L
+    @Volatile private var lastGuardCheckMs: Long = 0L
+    @Volatile private var guardBlocked: Boolean = false
+
     fun activateLiveStreamingWindow(durationMs: Long = 90_000L) {
+      val now = System.currentTimeMillis()
+      if (liveSessionStartedMs == 0L) liveSessionStartedMs = now
+      if (now - liveSessionStartedMs > LIVE_SESSION_MAX_MS) {
+        stopLiveStreamingWindow()
+        return
+      }
       isLiveStreamingToParent = true
-      liveStreamRequestedUntilMs = System.currentTimeMillis() + durationMs
+      liveStreamRequestedUntilMs = now + durationMs
       // Сразу подключаем реальную отдачу кадров MediaProjection (до этого она отцеплена
       // и не тратит батарею), а также делаем мгновенный снимок.
       com.example.util.ScreenShotManager.setLiveCaptureActive(true)
@@ -61,14 +74,59 @@ class KidsGuardAccessibilityService : AccessibilityService() {
     fun stopLiveStreamingWindow() {
       isLiveStreamingToParent = false
       liveStreamRequestedUntilMs = 0L
+      liveSessionStartedMs = 0L
+      guardBlocked = false
+      lastGuardCheckMs = 0L
       // Отцепляем зеркало экрана: телефон перестаёт кодировать кадры и греться.
       com.example.util.ScreenShotManager.setLiveCaptureActive(false)
     }
 
+    private fun batteryLowOrHot(): Boolean {
+      val ctx = instance?.applicationContext
+        ?: com.example.data.cloud.DirectP2pSocketEngine.appContext ?: return false
+      return try {
+        val bm = ctx.getSystemService(android.os.BatteryManager::class.java)
+        val level = bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+        val sticky = ctx.registerReceiver(
+          null,
+          android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED)
+        )
+        val status = sticky?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val charging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+          status == android.os.BatteryManager.BATTERY_STATUS_FULL
+        if (level in 1..15 && !charging) return true
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+          val pm = ctx.getSystemService(android.os.PowerManager::class.java)
+          if (pm != null &&
+            pm.currentThermalStatus >= android.os.PowerManager.THERMAL_STATUS_MODERATE
+          ) {
+            return true
+          }
+        }
+        false
+      } catch (_: Exception) {
+        false
+      }
+    }
+
     fun isLiveStreamingActiveNow(): Boolean {
       if (!isLiveStreamingToParent) return false
-      if (System.currentTimeMillis() > liveStreamRequestedUntilMs) {
+      val now = System.currentTimeMillis()
+      if (now > liveStreamRequestedUntilMs) {
         isLiveStreamingToParent = false
+        liveSessionStartedMs = 0L
+        return false
+      }
+      if (liveSessionStartedMs > 0L && now - liveSessionStartedMs > LIVE_SESSION_MAX_MS) {
+        stopLiveStreamingWindow()
+        return false
+      }
+      if (now - lastGuardCheckMs > 30_000L) {
+        lastGuardCheckMs = now
+        guardBlocked = batteryLowOrHot()
+      }
+      if (guardBlocked) {
+        stopLiveStreamingWindow()
         return false
       }
       return true

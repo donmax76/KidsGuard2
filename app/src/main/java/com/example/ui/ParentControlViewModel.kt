@@ -577,6 +577,7 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     val masterPin = familyConfig.value?.parentMasterPin ?: "1234"
     return if (pin == masterPin) {
       _isPinDialogVisible.value = false
+      com.example.util.DeviceSecurityPermissionHelper.setUninstallBlocked(getApplication(), false)
       setDeviceRole(AppRole.PARENT)
       showToast("Вход выполнен")
       true
