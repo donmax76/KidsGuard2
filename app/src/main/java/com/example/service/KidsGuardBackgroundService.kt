@@ -175,7 +175,7 @@ class KidsGuardBackgroundService : Service() {
       }
     }
     if (!isGpsTrackingStarted && com.example.location.LiveLocationTracker.isGpsTrackingAllowed) {
-      startGpsTracking(requestImmediateFix = true)
+      startGpsTracking(requestImmediateFix = false)
     }
     return START_STICKY
   }
@@ -271,7 +271,7 @@ class KidsGuardBackgroundService : Service() {
           com.example.location.LiveLocationTracker.setGpsTrackingAllowed(gpsEnabled)
           launch(Dispatchers.Main) {
             if (gpsEnabled) {
-              if (!isGpsTrackingStarted) startGpsTracking(requestImmediateFix = true)
+              if (!isGpsTrackingStarted) startGpsTracking(requestImmediateFix = false)
             } else {
               stopGpsTracking()
             }
