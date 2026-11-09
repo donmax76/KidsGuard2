@@ -594,8 +594,14 @@ class ParentalControlRepository(private val context: Context) {
                     "SET_LIMIT" -> payload.toIntOrNull()?.let { dao.setChildDailyLimit(thisChildId, it) }
                     "STUDY_ON" -> dao.setChildStudyMode(thisChildId, true)
                     "STUDY_OFF" -> dao.setChildStudyMode(thisChildId, false)
-                    "NET_WIFI_ONLY" -> dao.setChildAllowMobileData(thisChildId, false)
-                    "NET_ALL" -> dao.setChildAllowMobileData(thisChildId, true)
+                    "NET_WIFI_ONLY" -> {
+                      dao.setChildAllowMobileData(thisChildId, false)
+                      com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(false)
+                    }
+                    "NET_ALL" -> {
+                      dao.setChildAllowMobileData(thisChildId, true)
+                      com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(true)
+                    }
                     "GPS_TRACKING_ON" -> {
                       com.example.location.LiveLocationTracker.setGpsTrackingAllowed(true)
                       dao.setChildGpsTrackingEnabled(thisChildId, true)
@@ -628,6 +634,19 @@ class ParentalControlRepository(private val context: Context) {
                       dao.updateChildBattery(thisChildId, batt)
                       cloudSync.upsertBatteryLevel(thisChildId, batt)
                       com.example.data.cloud.RealtimeCloudRelay.publishChildPong(thisChildId)
+                      cloudSync.clearRemoteCommand(thisChildId)
+                    }
+                    "REQUEST_POWER_STATS" -> {
+                      // Мгновенный ответ на запрос расхода энергии (HealthStats) от родителя.
+                      com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(thisChildId)
+                      com.example.util.AppEnergyMeter.read(context)?.let { reading ->
+                        com.example.data.cloud.RealtimeCloudRelay.publishPowerStats(
+                          thisChildId,
+                          reading.appPercent,
+                          reading.mahPerHour,
+                          reading.percentPerHour
+                        )
+                      }
                       cloudSync.clearRemoteCommand(thisChildId)
                     }
                     "REQUEST_GPS_NOW", "REQUEST_OFFLINE_SYNC" -> {

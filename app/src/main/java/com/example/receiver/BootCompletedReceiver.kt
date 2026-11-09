@@ -88,28 +88,34 @@ class BootCompletedReceiver : BroadcastReceiver() {
       return
     }
 
-    // 2. Handle Device Boot or In-Place APK Replacement (MY_PACKAGE_REPLACED / PACKAGE_REPLACED)
+    // 2. Handle Device Boot, In-Place APK Replacement, direct-boot unlock, power/charge
+    //    recovery and battery-saver exit — всё, что должно «ожить» после глубокого разряда.
     val isSelfPackageReplaced = action == Intent.ACTION_MY_PACKAGE_REPLACED ||
       (action == Intent.ACTION_PACKAGE_REPLACED && intent.data?.schemeSpecificPart == appContext.packageName)
 
-    if (
-      action == Intent.ACTION_BOOT_COMPLETED ||
+    val isRecoveryEvent = action == Intent.ACTION_BOOT_COMPLETED ||
       action == Intent.ACTION_LOCKED_BOOT_COMPLETED ||
       action == "android.intent.action.QUICKBOOT_POWERON" ||
+      action == Intent.ACTION_USER_UNLOCKED ||
+      action == Intent.ACTION_POWER_CONNECTED ||
+      action == Intent.ACTION_POWER_DISCONNECTED ||
+      action == Intent.ACTION_BATTERY_OKAY ||
+      action == "android.os.action.POWER_SAVE_MODE_CHANGED" ||
       isSelfPackageReplaced
-    ) {
-      ApkUpdateInstaller.isInstallingUpdate = false
-      Log.i(TAG, "System event ($action). Restoring Accessibility Service & 24/7 KidsGuard protection with v${BuildConfig.VERSION_NAME}.")
 
-      // Immediately restore/rebind Accessibility Service after OTA package replacement or reboot
+    if (isRecoveryEvent) {
+      ApkUpdateInstaller.isInstallingUpdate = false
+      Log.i(TAG, "Recovery event ($action). Restoring Accessibility Service & 24/7 KidsGuard protection with v${BuildConfig.VERSION_NAME}.")
+
+      // Immediately restore/rebind Accessibility Service after reboot/OTA/recovery
       val a11yRestored = com.example.util.DeviceSecurityPermissionHelper.restoreAccessibilityServiceAfterOta(appContext)
 
       DeviceControlDebugger.logEvent(
-        if (isSelfPackageReplaced) "АВТООБНОВЛЕНИЕ_ЗАВЕРШЕНО" else "ПЕРЕЗАГРУЗКА_ТЕЛЕФОНА",
+        if (isSelfPackageReplaced) "АВТООБНОВЛЕНИЕ_ЗАВЕРШЕНО" else "ВОССТАНОВЛЕНИЕ_СЛУЖБ",
         if (isSelfPackageReplaced) {
           "Пакет KidsGuard успешно обновлён до v${BuildConfig.VERSION_NAME} (Accessibility=${if (a11yRestored) "АКТИВЕН" else "ПЕРЕЗАПУСК"}). Все службы перезапущены."
         } else {
-          "Система перезагружена. Восстановление служб защиты v${BuildConfig.VERSION_NAME}..."
+          "Событие $action. Восстановление служб защиты v${BuildConfig.VERSION_NAME}..."
         },
         "SUCCESS"
       )
@@ -184,6 +190,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
           Log.i(TAG, "Child device restored on boot/update for Child ID: $childId (unifiedVer=$unifiedBuildVer, apk=$apkVer)")
 
           // 1. Ensure P2P Socket Engine is running in CHILD role
+          com.example.data.cloud.DirectP2pSocketEngine.appContext = appContext
           DirectP2pSocketEngine.startEngine("CHILD", childId)
 
           // 2. Update local DB version & clear updatePending flag
@@ -193,6 +200,14 @@ class BootCompletedReceiver : BroadcastReceiver() {
           // 3. Restart 24/7 Background service immediately with all persisted permissions (including live stream)
           val liveStreamEnabled = com.example.util.ScreenShotManager.isLiveStreamEnabled(appContext)
           KidsGuardBackgroundService.start(appContext, childId, enableProjectionFgs = liveStreamEnabled)
+
+          // 3b. Снятие ограничений оптимизации батареи: иначе после разряда ниже 15%
+          // Android переводит приложение в Restricted Bucket и убивает фоновую связь.
+          try {
+            if (!com.example.util.DeviceSecurityPermissionHelper.isBatteryOptimizationIgnored(appContext)) {
+              com.example.util.DeviceSecurityPermissionHelper.requestIgnoreBatteryOptimization(appContext)
+            }
+          } catch (_: Exception) {}
 
           // 4. Push updated APK version, battery, and completion alert to Parent phone
           try {

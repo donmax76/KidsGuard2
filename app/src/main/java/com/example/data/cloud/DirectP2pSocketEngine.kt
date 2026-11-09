@@ -1,5 +1,9 @@
 package com.example.data.cloud
 
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.util.Log
 import com.example.BuildConfig
 import com.example.location.LiveLocationTracker
@@ -108,8 +112,30 @@ object DirectP2pSocketEngine {
 
   @Volatile
   private var globalTcpOut: BufferedOutputStream? = null
+
+  @Volatile
+  private var globalSocket: Socket? = null
   private val globalWriteLock = Any()
   private val retainedPacketsOutbox = ConcurrentHashMap<String, JSONObject>()
+
+  // --- Честный сетевой режим «Только Wi-Fi» vs «Wi-Fi + 4G» ---
+  // Раньше глобальный TCP-релей подключался к брокеру по сети по умолчанию и не знал
+  // про переключатель родителя: в «Только Wi-Fi» он всё равно лез в 4G, а при смене
+  // сети мог спать в backoff до 30 с. Теперь держим актуальное состояние сети и
+  // будим сокет по NetworkCallback мгновенно.
+  @Volatile
+  private var allowMobileData = true
+
+  @Volatile
+  private var hasWifi = false
+
+  @Volatile
+  private var hasCellular = false
+
+  @Volatile
+  private var hasAnyNetwork = false
+
+  private var networkMonitorCallback: ConnectivityManager.NetworkCallback? = null
 
   @Volatile
   private var isStarted = false
@@ -239,6 +265,91 @@ object DirectP2pSocketEngine {
       ?.hostAddress
   }
 
+  /** Wi-Fi сеть с интернетом (для привязки глобального TCP-сокета к Wi-Fi). */
+  private fun currentWifiNetwork(): Network? {
+    val ctx = appContext ?: return null
+    val cm = ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+      as? ConnectivityManager ?: return null
+    return cm.allNetworks.firstOrNull { n ->
+      val caps = cm.getNetworkCapabilities(n) ?: return@firstOrNull false
+      caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+  }
+
+  private fun refreshNetworkState() {
+    val ctx = appContext ?: return
+    val cm = ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+      as? ConnectivityManager ?: return
+    var wifi = false
+    var cell = false
+    for (n in cm.allNetworks) {
+      val caps = cm.getNetworkCapabilities(n) ?: continue
+      if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+      if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) wifi = true
+      if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) cell = true
+    }
+    hasWifi = wifi
+    hasCellular = cell
+    hasAnyNetwork = wifi || cell
+  }
+
+  /**
+   * True, если глобальному TCP-релею сейчас разрешено подключаться.
+   * Для ребёнка в режиме «Только Wi-Fi» возвращает True только при доступном Wi-Fi.
+   */
+  private fun childNetworkAllowed(): Boolean {
+    refreshNetworkState()
+    if (currentRole != "CHILD") return true
+    return if (allowMobileData) hasAnyNetwork else hasWifi
+  }
+
+  /** Будит блокирующее чтение глобального сокета — цикл тут же переподключится. */
+  private fun wakeGlobalTcp() {
+    try { globalSocket?.close() } catch (_: Exception) {}
+  }
+
+  /** Родитель переключил режим сети ребёнка: применяем мгновенно. */
+  fun setAllowMobileData(allow: Boolean) {
+    if (allowMobileData == allow) return
+    allowMobileData = allow
+    wakeGlobalTcp()
+    Log.d(TAG, "Network mode changed: allowMobileData=$allow; wake global TCP")
+  }
+
+  private fun startNetworkMonitor() {
+    val ctx = appContext ?: return
+    val cm = ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+      as? ConnectivityManager ?: return
+    if (networkMonitorCallback != null) return
+    val cb = object : ConnectivityManager.NetworkCallback() {
+      override fun onAvailable(network: Network) {
+        refreshNetworkState()
+        wakeGlobalTcp()
+      }
+
+      override fun onLost(network: Network) {
+        refreshNetworkState()
+        wakeGlobalTcp()
+      }
+
+      override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+        refreshNetworkState()
+        wakeGlobalTcp()
+      }
+    }
+    val req = NetworkRequest.Builder()
+      .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+      .build()
+    try {
+      cm.registerNetworkCallback(req, cb)
+      networkMonitorCallback = cb
+      refreshNetworkState()
+    } catch (_: Exception) {
+      refreshNetworkState()
+    }
+  }
+
   fun getLocalIpv4Address(): String {
     // Сначала именно Wi-Fi: иначе при включённом мобильном интернете можно
     // «найти» себя в сотовой сети и решить, что ребёнок в другой подсети.
@@ -271,10 +382,23 @@ object DirectP2pSocketEngine {
 
     if (!isStarted) {
       isStarted = true
+      startNetworkMonitor()
       startGlobalBinaryTcpSocketLoop()
       startUdpDiscoveryListener()
       startChildTcpServerIfNeeded()
       startChildUdpBeaconLoop()
+    }
+    // Подтягиваем сохранённый режим «Только Wi-Fi / Wi-Fi + 4G» из БД ребёнка.
+    val ctx = appContext
+    val cid = boundChildId.takeIf { it > 0L } ?: thisDeviceBoundChildId
+    if (ctx != null && currentRole == "CHILD" && cid > 0L) {
+      scope.launch {
+        try {
+          val child = com.example.data.local.KidsGuardDatabase.getDatabase(ctx)
+            .kidsGuardDao().getChildByIdOnce(cid)
+          child?.let { allowMobileData = it.allowMobileData }
+        } catch (_: Exception) {}
+      }
     }
   }
 
@@ -495,9 +619,11 @@ object DirectP2pSocketEngine {
         }
         udpSocket.broadcast = true
         while (isActive) {
-          val myIp = getLocalIpv4Address()
-          _status.value = _status.value.copy(localDeviceIp = myIp)
-          if (myIp != "0.0.0.0" && myIp != "127.0.0.1") {
+          // Маяк живёт только в Wi-Fi сети (LAN). По 4G его слать нельзя — и родитель
+          // его там не услышит, и трафик/батарея тратится зря.
+          val wifiIp = wifiIpv4()
+          _status.value = _status.value.copy(localDeviceIp = getLocalIpv4Address())
+          if (!wifiIp.isNullOrBlank() && wifiIp != "0.0.0.0" && wifiIp != "127.0.0.1") {
             if (currentRole == "CHILD" && !LiveLocationTracker.isEmulator()) {
               val cachedChild = RealtimeCloudRelay.getCachedChild(thisDeviceBoundChildId)
               val beacon = JSONObject().apply {
@@ -507,7 +633,7 @@ object DirectP2pSocketEngine {
                   put("pairingCode", cachedChild.pairingCode)
                   put("name", cachedChild.name)
                 }
-                put("lanIp", myIp)
+                put("lanIp", wifiIp)
                 put("port", TCP_PORT)
                 put("appVersion", BuildConfig.VERSION_NAME)
                 put("ts", System.currentTimeMillis())
@@ -518,7 +644,7 @@ object DirectP2pSocketEngine {
                 udpSocket.send(DatagramPacket(beacon, beacon.size, broadcastAddr, UDP_DISCOVERY_PORT))
               } catch (_: Exception) {}
 
-              val parts = myIp.split(".")
+              val parts = wifiIp.split(".")
               if (parts.size == 4) {
                 try {
                   val subnetBroadcast = InetAddress.getByName("${parts[0]}.${parts[1]}.${parts[2]}.255")
@@ -623,12 +749,26 @@ object DirectP2pSocketEngine {
       var hostIdx = preferredRelayHost
       var retryDelayMs = 2_000L
       while (isActive) {
+        // В режиме «Только Wi-Fi» без Wi-Fi не пытаемся лезть в 4G и не крутим
+        // бесконечный реконнект — просто ждём, пока NetworkCallback разбудит нас
+        // при появлении Wi-Fi (или родитель переключит режим).
+        if (!childNetworkAllowed()) {
+          retryDelayMs = 2_000L
+          delay(3_000L)
+          continue
+        }
         val (host, port) = TCP_RELAY_HOSTS[hostIdx % TCP_RELAY_HOSTS.size]
         hostIdx++
         var sock: Socket? = null
         var succeeded = false
         try {
           sock = Socket()
+          // Привязываемся к Wi-Fi, если он доступен: в «Только Wi-Fi» это гарантирует,
+          // что сокет не уйдёт в мобильную сеть; в «Wi-Fi + 4G» предпочитаем Wi-Fi.
+          currentWifiNetwork()?.let { wifi ->
+            try { wifi.bindSocket(sock) } catch (_: Exception) {}
+          }
+          globalSocket = sock
           sock.connect(InetSocketAddress(host, port), 5000)
           sock.keepAlive = true
           sock.tcpNoDelay = true
@@ -748,6 +888,7 @@ object DirectP2pSocketEngine {
           Log.d(TAG, "Binary TCP socket ($host:$port) reconnect: ${e.message}")
         } finally {
           globalTcpOut = null
+          globalSocket = null
           try { sock?.close() } catch (_: Exception) {}
           _status.value = _status.value.copy(
             isGlobalTcpSocketConnected = false,

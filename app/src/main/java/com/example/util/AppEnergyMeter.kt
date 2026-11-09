@@ -99,11 +99,20 @@ object AppEnergyMeter {
       if (baseTs <= 0L || now - baseTs < 2 * 60_000L) return null
 
       val levelDrop = baseLevel - level
-      // Счётчик заряда есть не на всех устройствах — тогда считаем по проценту заряда.
+      // Реальная ёмкость батареи: charge_counter (µА·ч) / уровень заряда. Раньше
+      // здесь был хардкод 4000 мА·ч — на аппаратах с батареей 5000/4500 мА·ч доля
+      // приложения занижалась (28,8% вместо 42% в системных настройках).
+      val derivedCapacityMah = if (counter > 0 && level in 1..100) {
+        (counter / 1000.0) / (level / 100.0)
+      } else {
+        4000.0
+      }
+      // Всего израсходовано устройством с начала окна: по счётчику заряда, а при
+      // его отсутствии — по проценту заряда и вычисленной ёмкости.
       val totalMah = when {
         baseCounter > 0 && counter > 0 && counter < baseCounter ->
           (baseCounter - counter) / 1000.0
-        levelDrop > 0 -> levelDrop / 100.0 * 4000.0
+        levelDrop > 0 -> levelDrop / 100.0 * derivedCapacityMah
         else -> 0.0
       }
       if (totalMah < 0.5) {
@@ -116,8 +125,7 @@ object AppEnergyMeter {
       val share = (usedAppMah / totalMah * 100.0).coerceIn(0.0, 100.0)
       val hours = ((now - baseTs) / 3_600_000.0).coerceAtLeast(0.05)
       val mahPerHour = usedAppMah / hours
-      val capacityMah = if (levelDrop > 0) totalMah / (levelDrop / 100.0) else 4000.0
-      val pctPerHour = (mahPerHour / capacityMah * 100.0).coerceIn(0.0, 100.0)
+      val pctPerHour = (mahPerHour / derivedCapacityMah * 100.0).coerceIn(0.0, 100.0)
 
       return Reading(
         appPercent = share.roundToInt(),

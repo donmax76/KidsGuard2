@@ -7,6 +7,89 @@
 
 ---
 
+## ЭТАП 2 (системные фиксы) — что изменено в этой сессии
+
+### 5.1. Чёрный экран при стриме ПК (Windows Sessions)
+Файл: `hosts_blocker.py` (и все его копии в `public/`, `app/src/main/assets/`).
+- `_process_session_id()` / `_active_console_session_id()` / `_is_active_console_session()`
+  теперь строго сравнивают SessionId процесса с активной консольной сессией и возвращают
+  `False` при любой ошибке (раньше — `True`, т.е. «разрешено»).
+- `_grab_screen_bgra()` в начале отказывается захватывать, если процесс не в активной
+  консольной сессии → SYSTEM-движок (сессия 0) больше не может вернуть чёрный буфер.
+- `_is_black_frame()` — эвристика «кадр почти чёрный»; применяется в
+  `capture_screen_png()` и `capture_screen_frame()`, чтобы заблокированный/чужой рабочий
+  стол не перезаписывал последний хороший кадр.
+- Убраны прямые fallback-захваты из движка в `panel_screen()`, `_stream_mjpeg()` и
+  `p2p_stream_worker()`: теперь они читают только `agent_screen_frame(max_age=5.0)`.
+
+### 5.2. Сеть ребёнка: «Только Wi-Fi» vs «Wi-Fi + 4G»
+Файл: `app/src/main/java/com/example/data/cloud/DirectP2pSocketEngine.kt`
+- `setAllowMobileData(allow)` — применяет режим мгновенно и будит сокет.
+- `startNetworkMonitor()` — `ConnectivityManager.NetworkCallback`; при `onAvailable/onLost/
+  onCapabilitiesChanged` обновляет `hasWifi/hasCellular/hasAnyNetwork` и вызывает
+  `wakeGlobalTcp()` (закрывает сокет → цикл сразу переподключается).
+- `childNetworkAllowed()` — в «Только Wi-Fi» без Wi-Fi глобальный TCP-релей **не** лезет в
+  4G и не крутит реконнект (ждёт NetworkCallback), в «Wi-Fi + 4G» использует любую сеть.
+- `currentWifiNetwork()` + `Network.bindSocket()` — глобальный MQTT-сокет привязывается к
+  Wi-Fi, если он доступен (и в «Wi-Fi + 4G» предпочитаем Wi-Fi).
+- `startChildUdpBeaconLoop()` теперь шлёт LAN-маяк только по Wi-Fi (`wifiIpv4()`), а не по
+  мобильной сети по умолчанию.
+Файлы-команды: `ParentalControlRepository.kt`, `KidsGuardBackgroundService.kt` —
+  `NET_WIFI_ONLY`/`NET_ALL` теперь ещё вызывают `DirectP2pSocketEngine.setAllowMobileData(...)`.
+
+### 5.3. Батарея: мгновенный сбор + формула
+- `KidsGuardBackgroundService.kt` / `ParentalControlRepository.kt`: команда
+  `REQUEST_POWER_STATS` — ребёнок сразу читает `AppEnergyMeter.read()` и шлёт
+  `RealtimeCloudRelay.publishPowerStats(...)`.
+- `ParentControlViewModel.kt`: родитель шлёт `REQUEST_POWER_STATS` вместе с heartbeat
+  (раз в 40 с) — расход энергии приходит в течение секунд, а не 10–30 минут.
+- `AppEnergyMeter.kt`: ёмкость батареи теперь вычисляется из `CHARGE_COUNTER (µА·ч) / заряд %`,
+  а не хардкодом `4000 мА·ч`; доля = `app_mAh / total_mAh`. Это объясняет и частично чинит
+  расхождение 28,8% vs 42% (см. пояснение ниже).
+
+### 5.4. Глубокий экономный режим при выключенном экране
+- `KidsGuardBackgroundService.kt`, цикл батареи/телеметрии:
+  - `AppEnergyMeter.read()` (тяжёлые HealthStats) теперь **только при включённом экране**;
+  - обновление батареи при выключенном экране раз в 10 минут (вместо 3);
+  - задержка цикла при выключенном экране — 5 минут.
+- Режим «Только Wi-Fi» без Wi-Fi больше не долбит MQTT-брокер по 4G (см. 5.2) — это был
+  главный источник реконнект-шторма в покое.
+
+### 5.5. Выживание после глубокого разряда/перезагрузки
+- `AndroidManifest.xml`: в `BootCompletedReceiver` добавлены `ACTION_USER_UNLOCKED`,
+  `ACTION_POWER_CONNECTED`, `ACTION_POWER_DISCONNECTED`, `ACTION_BATTERY_OKAY`,
+  `ACTION_POWER_SAVE_MODE_CHANGED`.
+- `BootCompletedReceiver.kt`: расширен `isRecoveryEvent` на все эти интенты; при зарядке/
+  выходе из энергосбережения/разблокировке снова поднимаются AccessibilityService,
+  `DirectP2pSocketEngine` и `KidsGuardBackgroundService`.
+- Запрос `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` теперь вызывается при восстановлении
+  (`BootCompletedReceiver.restoreServicesAndNotifyParentAfterUpdate`) и при старте
+  фонового сервиса (`KidsGuardBackgroundService.startProtectionLoops`), если ограничение
+  ещё не снято.
+- `KidsGuardAccessibilityService.observeSecurityAndCloud()`: добавлен Watchdog (45 с) —
+  если `KidsGuardBackgroundService.isRunning == false`, он перезапускает фоновый сервис.
+- `KidsGuardBackgroundService`: статический флаг `isRunning` (в `onCreate`/`onDestroy`).
+
+Не сделано (осознанно, чтобы не ломать сборку без SDK):
+- `WorkManager`/`AlarmManager` не добавлялись (в проекте нет зависимости WorkManager).
+  Роль периодического сторожа выполняет AccessibilityService-watchdog. Если потребуется
+  страховка и после отключения Accessibility — добавить WorkManager periodic 15 мин.
+
+---
+
+## Пояснение: почему 28,8% ≠ 42% (батарея)
+
+- Наше приложение считает долю **с момента последнего отключения зарядки**:
+  `app_mAh (UidHealthStats) / total_mAh (дельта CHARGE_COUNTER)`.
+- Android в «Настройки → Батарея» показывает долю **с последней полной зарядки** и по
+  собственным счётчикам `BatteryStats` (включая экран, wakeups, радио). Окно и методика
+  отличаются, поэтому цифры не обязаны совпадать в точности.
+- Дополнительные источники расхождения: `UidHealthStats` может недосчитывать часть
+  компонентов, а раньше был хардкод `4000 мА·ч` для батарей другой ёмкости. Хардкод убран
+  (ёмкость теперь вычисляется из счётчика), поэтому расхождение стало меньше.
+
+---
+
 ## 1. Что уже готово (пункты 1–3)
 
 ### 1.1. Поворот экрана не ставит поток на паузу

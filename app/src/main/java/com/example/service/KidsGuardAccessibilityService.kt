@@ -460,6 +460,25 @@ class KidsGuardAccessibilityService : AccessibilityService() {
     val database = KidsGuardDatabase.getDatabase(applicationContext)
     val dao = database.kidsGuardDao()
 
+    // 0. Watchdog выживания: AccessibilityService система почти не убивает, поэтому
+    // используем его как сторожа — если фоновый сервис связи упал (разряд, Doze,
+    // force-stop части процесса), поднимаем его обратно при следующей проверке.
+    serviceScope.launch(Dispatchers.IO) {
+      while (isActive) {
+        delay(45_000L)
+        if (!isChildDeviceRole || com.example.location.LiveLocationTracker.isEmulator()) continue
+        try {
+          if (!com.example.service.KidsGuardBackgroundService.isRunning) {
+            val cid = activeChildId.takeIf { it > 0 }
+              ?: dao.getFamilyConfigOnce()?.thisDeviceChildId?.takeIf { it > 0 }
+              ?: 1L
+            com.example.service.KidsGuardBackgroundService.start(applicationContext, cid)
+            Log.w(TAG, "Watchdog: KidsGuardBackgroundService был убит — перезапущен")
+          }
+        } catch (_: Exception) {}
+      }
+    }
+
     // 1. Observe Active Child and Phone Lock status reactively (zero polling loops!)
     serviceScope.launch(Dispatchers.IO) {
       dao.getFamilyConfig().collectLatest { config ->

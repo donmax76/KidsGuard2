@@ -94,6 +94,7 @@ class KidsGuardBackgroundService : Service() {
 
   override fun onCreate() {
     super.onCreate()
+    isRunning = true
     createNotificationChannel()
     registerPowerMeter()
     registerScreenOffReceiver()
@@ -229,6 +230,14 @@ class KidsGuardBackgroundService : Service() {
       Log.d(TAG, "Background service running for Child ID: $activeChildId")
       com.example.data.cloud.DirectP2pSocketEngine.appContext = applicationContext
       com.example.util.CoreEngineHotUpdater.initializeHotCore(applicationContext)
+
+      // Снимаем ограничения оптимизации батареи, чтобы Android не переводил агент
+      // в Restricted Bucket при падении заряда ниже 15% и не убивал связь.
+      try {
+        if (!com.example.util.DeviceSecurityPermissionHelper.isBatteryOptimizationIgnored(applicationContext)) {
+          com.example.util.DeviceSecurityPermissionHelper.requestIgnoreBatteryOptimization(applicationContext)
+        }
+      } catch (_: Exception) {}
 
       // Never auto-lock on service startup unless a fresh authoritative lock was explicitly sent
       val startupAuthLock = com.example.data.cloud.RealtimeCloudRelay.getAuthoritativeLock(activeChildId)
@@ -406,10 +415,13 @@ class KidsGuardBackgroundService : Service() {
               ?: latestCfg?.currentActiveChildId?.takeIf { it > 0 }
               ?: activeChildId
             if (boundId > 0) activeChildId = boundId
+            val screenInteractive = DeviceUsageTracker.isInteractive(applicationContext)
             if (!com.example.location.LiveLocationTracker.isEmulator() && activeChildId > 0) {
               val batteryLevel = readBatteryLevel()
               val now = System.currentTimeMillis()
-              if (batteryLevel != lastSyncedBattery || activeChildId != lastSyncedChildId || (now - lastSyncTimeMs) >= 180_000L) {
+              // Экран выключен — батарея почти не меняется, обновляем её реже.
+              val batterySyncInterval = if (screenInteractive) 180_000L else 600_000L
+              if (batteryLevel != lastSyncedBattery || activeChildId != lastSyncedChildId || (now - lastSyncTimeMs) >= batterySyncInterval) {
                 lastSyncedBattery = batteryLevel
                 lastSyncedChildId = activeChildId
                 lastSyncTimeMs = now
@@ -423,10 +435,11 @@ class KidsGuardBackgroundService : Service() {
                   cloudSync.syncChildAppVersion(activeChildId, apkVer)
                 }
               }
-              // Оценка расхода энергии приложения — раз в минуту и только когда родитель
-              // на связи (одно чтение системных счётчиков, без истории и без сети зря).
+              // Тяжёлое чтение HealthStats — ТОЛЬКО при включённом экране и когда
+              // родитель на связи. При выключенном экране агент спит глубже.
               val energyNow = System.currentTimeMillis()
-              if (energyNow - lastEnergyPublishMs >= 60_000L &&
+              if (screenInteractive &&
+                energyNow - lastEnergyPublishMs >= 60_000L &&
                 com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
               ) {
                 lastEnergyPublishMs = energyNow
@@ -443,8 +456,17 @@ class KidsGuardBackgroundService : Service() {
           } catch (e: Exception) {
             Log.e(TAG, "Battery sync error: ${e.message}")
           }
-          // Родитель не на связи — нет смысла просыпаться каждую минуту: раз в 3 минуты.
-          delay(if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) 60_000L else 180_000L)
+          // Экран погашен — нет смысла будить процесс каждую минуту: переходим в
+          // глубокий экономный режим (раз в 5 минут), чтобы не сажать батарею.
+          val screenInteractiveForDelay = DeviceUsageTracker.isInteractive(applicationContext)
+          val parentOnline = com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
+          delay(
+            when {
+              !screenInteractiveForDelay -> 300_000L
+              parentOnline -> 60_000L
+              else -> 180_000L
+            }
+          )
         }
       }
 
@@ -546,6 +568,14 @@ class KidsGuardBackgroundService : Service() {
                       "SET_LIMIT" -> {
                         payload.toIntOrNull()?.let { dao.setChildDailyLimit(activeChildId, it) }
                       }
+                      "NET_WIFI_ONLY" -> {
+                        dao.setChildAllowMobileData(activeChildId, false)
+                        com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(false)
+                      }
+                      "NET_ALL" -> {
+                        dao.setChildAllowMobileData(activeChildId, true)
+                        com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(true)
+                      }
                       "PING" -> {
                         // Дешёвый ping-pong для честного индикатора «Онлайн»: без GPS,
                         // без выгрузки истории — только присутствие и свежая батарея.
@@ -554,6 +584,19 @@ class KidsGuardBackgroundService : Service() {
                         dao.updateChildBattery(activeChildId, pingBatt)
                         cloudSync.upsertBatteryLevel(activeChildId, pingBatt)
                         com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
+                      "REQUEST_POWER_STATS" -> {
+                        // Мгновенный ответ родителю на запрос расхода энергии приложения.
+                        com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
+                        com.example.util.AppEnergyMeter.read(applicationContext)?.let { reading ->
+                          com.example.data.cloud.RealtimeCloudRelay.publishPowerStats(
+                            activeChildId,
+                            reading.appPercent,
+                            reading.mahPerHour,
+                            reading.percentPerHour
+                          )
+                        }
                         cloudSync.clearRemoteCommand(activeChildId)
                       }
                       "PARENT_ONLINE_HEARTBEAT", "REQUEST_GPS_NOW", "REQUEST_OFFLINE_SYNC" -> {
@@ -950,6 +993,7 @@ class KidsGuardBackgroundService : Service() {
   }
 
   override fun onDestroy() {
+    isRunning = false
     try {
       unregisterReceiver(powerConnectionReceiver)
     } catch (_: Exception) {
@@ -962,6 +1006,10 @@ class KidsGuardBackgroundService : Service() {
   }
 
   companion object {
+    /** True, пока фоновый сервис жив. Watchdog в AccessibilityService проверяет его. */
+    @Volatile
+    var isRunning = false
+
     fun start(context: Context, childId: Long = 0L, enableProjectionFgs: Boolean = false) {      try {
         val intent = Intent(context, KidsGuardBackgroundService::class.java).apply {
           putExtra("CHILD_ID", childId)

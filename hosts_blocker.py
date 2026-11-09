@@ -2038,9 +2038,38 @@ def top_activity(d, n=8, min_seconds=15):
     return procs, titles
 
 
+def _is_black_frame(raw, w, h):
+    """Дешёвая эвристика: кадр полностью/почти чёрный (заблокированный экран,
+    сессия 0, RDP-дисконнект). Возвращает True, если картинку нельзя показывать."""
+    if not raw:
+        return True
+    # Сэмплируем до ~4096 пикселей, чтобы не тратить CPU на 4K-буфер.
+    step = max(1, (w * h) // 4096)
+    lit = 0
+    total = 0
+    n = len(raw)
+    for i in range(0, n - 3, step * 4):
+        b = raw[i]
+        g = raw[i + 1]
+        r = raw[i + 2]
+        total += 1
+        if r > 16 or g > 16 or b > 16:
+            lit += 1
+        if lit > max(2, total * 0.02):  # >2% светлых пикселей — кадр не чёрный
+            return False
+    return lit <= max(2, total * 0.02)
+
+
 def _grab_screen_bgra(dst_w, dst_h):
-    """Снимок экрана монитора через GDI (ctypes) в raw-буфер BGRA dst_w*dst_h*4."""
+    """Снимок экрана монитора через GDI (ctypes) в raw-буфер BGRA dst_w*dst_h*4.
+
+    Захватываем ТОЛЬКО из активной консольной сессии: иначе (движок SYSTEM в
+    сессии 0, RDP-агент, заблокированный рабочий стол) GDI вернёт чёрный буфер,
+    который раньше «мигал» в стриме между нормальными кадрами.
+    """
     if not IS_WIN:
+        return None
+    if not _is_active_console_session():
         return None
     try:
         from ctypes import wintypes
@@ -2124,7 +2153,7 @@ def _encode_png_bgra(raw, dst_w, dst_h, level=6):
 def capture_screen_png(dst_w=640, dst_h=360, level=6):
     """Снимок экрана монитора в PNG без внешних библиотек (ctypes GDI + zlib)."""
     raw = _grab_screen_bgra(dst_w, dst_h)
-    if not raw:
+    if not raw or _is_black_frame(raw, dst_w, dst_h):
         return None
     return _encode_png_bgra(raw, dst_w, dst_h, level)
 
@@ -2136,7 +2165,7 @@ def capture_screen_frame(dst_w=800, dst_h=450, quality=55, prefer_jpeg=True):
     честный PNG-резерв, чтобы программа работала на «чистом» Python.
     """
     raw = _grab_screen_bgra(dst_w, dst_h)
-    if not raw:
+    if not raw or _is_black_frame(raw, dst_w, dst_h):
         return None
     if prefer_jpeg and _PILImage is not None:
         try:
@@ -2267,16 +2296,39 @@ def agent_screen_frame(max_age=2.0):
     return None
 
 
-def _is_active_console_session():
-    """Только консольный сеанс снимает screen.png. Агент неактивного/RDP-сеанса
-    иначе перезаписывал кадр чёрным экраном — из-за этого поток был чёрным."""
+def _process_session_id():
+    """SessionId текущего процесса (0 = SYSTEM, N = пользовательская сессия)."""
     try:
         sid = ctypes.c_ulong()
-        ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
-        active = int(ctypes.windll.kernel32.WTSGetActiveConsoleSessionId())
-        return int(sid.value) == active
+        ok = ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
+        if not ok:
+            return None
+        return int(sid.value)
     except Exception:
-        return True
+        return None
+
+
+def _active_console_session_id():
+    """Id активной консольной сессии (физический экран, к которому сейчас
+    подключён пользователь). -1 = определить не удалось."""
+    try:
+        return int(ctypes.windll.kernel32.WTSGetActiveConsoleSessionId())
+    except Exception:
+        return -1
+
+
+def _is_active_console_session():
+    """Только консольный сеанс имеет право снимать рабочий стол. Агент
+    неактивного/RDP-сеанса (или движок SYSTEM в сессии 0) отсюда получит False
+    и не будет читать буфер чужой/чёрной сессии."""
+    if not IS_WIN:
+        return False
+    sid = _process_session_id()
+    active = _active_console_session_id()
+    if sid is None or active < 0:
+        # Не смогли определить сессию — безопаснее НЕ снимать, чем снять чёрный кадр.
+        return False
+    return sid == active
 
 
 # ====================== HD-СКРИНШОТ И HD-ЗАПИСЬ ЭКРАНА ======================
@@ -3087,9 +3139,9 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             deadline = time.time() + 180.0
             while time.time() < deadline:
                 params = stream_params()
-                frame = agent_screen_frame() or capture_screen_frame(
-                    params["w"], params["h"], quality=params["quality"]
-                )
+                # Кадр берём ТОЛЬКО от агента активной консольной сессии. Прямой
+                # GDI-захват из SYSTEM-движка вернул бы чёрный экран (сессия 0).
+                frame = agent_screen_frame(max_age=5.0)
                 if not frame:
                     time.sleep(0.25)
                     continue
@@ -3159,21 +3211,9 @@ def panel_screen(force=False, w=640, h=360, quality=60):
                     break
                 time.sleep(0.08)
         got_fresh = os.path.exists(scr_path) and os.path.getmtime(scr_path) >= started
-        stale = (not os.path.exists(scr_path)) or (time.time() - os.path.getmtime(scr_path) > 8)
-        # Прямой захват из этого процесса нужен, только если агента нет (иначе из сессии
-        # SYSTEM получился бы чёрный кадр и затёр настоящий рабочий стол).
-        if force and not got_fresh and not agent_online:
-            frame = capture_screen_frame(w, h, quality=quality)
-            if frame:
-                with open(scr_path + ".tmp", "wb") as f:
-                    f.write(frame[0])
-                os.replace(scr_path + ".tmp", scr_path)
-        elif not force and stale and not agent_online:
-            frame = capture_screen_frame(w, h, quality=quality)
-            if frame:
-                with open(scr_path + ".tmp", "wb") as f:
-                    f.write(frame[0])
-                os.replace(scr_path + ".tmp", scr_path)
+        # Прямой захват из SYSTEM-движка НЕ делаем вообще: сессия 0 не имеет
+        # интерактивного рабочего стола, и раньше такой fallback давал чёрный кадр.
+        # Кадр поставляет только агент активной консольной сессии (agent_main).
         if os.path.exists(scr_path):
             with open(scr_path, "rb") as f:
                 blob = f.read()
@@ -3800,9 +3840,9 @@ def p2p_stream_worker(st, host, port):
                     time.sleep(min(0.15, next_frame - now))
                     continue
                 params = stream_params()
-                frame = agent_screen_frame() or capture_screen_frame(
-                    params["w"], params["h"], quality=params["quality"]
-                )
+                # Кадр берём ТОЛЬКО от агента активной консольной сессии — иначе
+                # SYSTEM-движок (сессия 0) периодически подсовывал чёрный кадр.
+                frame = agent_screen_frame(max_age=5.0)
                 if not frame:
                     next_frame = time.time() + 0.2
                     continue

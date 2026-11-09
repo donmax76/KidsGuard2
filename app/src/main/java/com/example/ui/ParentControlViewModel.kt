@@ -455,6 +455,9 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
             repository.sendRemoteCloudCommand(targetChildId, "PING", "1")
             if (heartbeatTick % 4 == 0) {
               repository.sendRemoteCloudCommand(targetChildId, "PARENT_ONLINE_HEARTBEAT", "1")
+              // Явный запрос расхода энергии: ребёнок сразу шлёт свежие HealthStats,
+              // вместо ожидания фонового цикла 1–30 минут.
+              repository.sendRemoteCloudCommand(targetChildId, "REQUEST_POWER_STATS", "1")
               // Высокоточный GPS ребёнку нужен только когда открыта карта, а не всегда,
               // пока приложение родителя просто запущено.
               if (_activeParentTab.value == ParentTab.LOCATION_MAP) {
