@@ -19,6 +19,8 @@ local.properties
 
 __pycache__/
 *.pyc
+.tmp/
+.pylibs/
 dist/
 build/
 *.spec
