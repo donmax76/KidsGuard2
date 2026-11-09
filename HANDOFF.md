@@ -9,8 +9,8 @@
 
 ## Пост-релизные фиксы (после сборки #30)
 
-Коммит с фиксами: `584697d` (локально; после push запустится новый CI-run).
-Второй локальный коммит `9b3f94f` — обновление этого HANDOFF.
+Финальный коммит с фиксами: `27670694557ac0d634070f4d923ab110404fe9d0` (запушен).
+CI run **#32** — ✅ success (оба job’а), artifacts пересобраны.
 
 Пользователь сообщил:
 1. Новые кнопки «HD-кадр на ПК» и «REC HD на ПК» не работают; старая локальная
@@ -64,7 +64,10 @@
 **Статус: сборка успешна.**
 - Коммит: `01771eee3a129e4a1efc5e645cda8c362e1c6819` (`main`, запушен на GitHub).
 - GitHub Actions run **#30**: ✅ `success` (09.11.2026, 15:28–15:30 UTC).
-- Run page: https://github.com/donmax76/KidsGuard2/actions/runs/42645020531
+- GitHub Actions run **#32** (финальный, `2767069`): ✅ `success` (09.11.2026, 16:56–16:57 UTC),
+  APK и ПК-агент пересобраны. Run page:
+  https://github.com/donmax76/KidsGuard2/actions/runs/42659668084
+- Run page #30: https://github.com/donmax76/KidsGuard2/actions/runs/42645020531
 - Job `build` — APK собран; artifact **`KidsGuard-debug-apk`** (20.8 МБ ZIP).
 - Job `Build Windows PC agent (.exe)` — ПК-агент собран; artifact
   **`KidsGuard-PC-Agent`** (18.7 МБ ZIP: `hosts_blocker.exe` + `hosts_blocker.py`).
@@ -88,7 +91,7 @@
   ПК-агент — job `build-pc-agent` (artifact `KidsGuard-PC-Agent`).
 
 Скачивание готовых файлов:
-1. Открыть https://github.com/donmax76/KidsGuard2/actions/runs/42645020531
+1. Открыть https://github.com/donmax76/KidsGuard2/actions/runs/42659668084
 2. Внизу страницы — раздел **Artifacts**.
 3. `KidsGuard-debug-apk` → ZIP → внутри `app-debug.apk` (устанавливать на телефон).
 4. `KidsGuard-PC-Agent` → ZIP → внутри `hosts_blocker.exe` (ПК-агент) и
