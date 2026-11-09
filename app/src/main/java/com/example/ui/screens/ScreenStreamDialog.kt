@@ -309,7 +309,7 @@ fun ScreenStreamDialog(
     if (isRecordingVideo) {
       recordingSeconds = 0
       recordedVideoUri = null
-      ScreenVideoRecorder.startRecording()
+      ScreenVideoRecorder.startRecording(fps = 1)
       while (isRecordingVideo) {
         val frameBmp = remoteBitmap ?: renderWatchedContentFrameBitmap(
           childName = childName,

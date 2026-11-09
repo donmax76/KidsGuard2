@@ -111,6 +111,8 @@ data class PcConnectionState(
   val isLanHttpAuthenticated: Boolean = false,
   val transportLabel: String = "Ожидание связи с ПК (P2P / Wi-Fi)...",
   val pcName: String = "Windows ПК ребёнка",
+  /** Версия ПК-агента (hosts_blocker.py): 5.5+ умеет HD-кадр и REC HD. */
+  val pcScriptVersion: String = "",
   val lanIp: String = "",
   val port: Int = 8765,
   val pairingCode: String = "101-701",
@@ -353,6 +355,8 @@ object PcBlockerClient {
   private fun learnPcIdentity(code: String, pcId: String) {
     var changed = false
     if (code.isNotBlank() && !codeExplicitlySet && normalizePcCode(code) != normalizePcCode(configuredCode)) {
+      // Автоопределение другого ПК по коду — начинаем с чистого состояния.
+      clearPcScopedState("Найден ПК с кодом ${code.trim()}")
       configuredCode = code.trim()
       changed = true
     }
@@ -376,6 +380,73 @@ object PcBlockerClient {
 
   private fun markPcContact() {
     lastPcContactMs = System.currentTimeMillis()
+  }
+
+  // Пока идёт переключение на другой ПК, не даём старому/новому пакету писать
+  // историю в Room: иначе в SQL снова смешаются пользователи двух компьютеров.
+  @Volatile
+  private var pcActivityResetAtMs: Long = 0L
+
+  /**
+   * Полный сброс всего, что относится к конкретному ПК: пользователи Windows,
+   * история, правила, кадр, запись, скриншот. Вызывается при смене pairing code/pc_id,
+   * чтобы данные старого компьютера не попадали в UI нового.
+   */
+  private fun clearPcScopedState(reason: String, deleteRoomHistory: Boolean = true) {
+    val cur = _state.value
+    _state.value = cur.copy(
+      isOnline = false,
+      isLanHttpAuthenticated = false,
+      transportLabel = "🔄 Переключение на другой ПК…",
+      pcScriptVersion = "",
+      pcName = "Windows ПК ребёнка",
+      lanIp = "",
+      port = 8765,
+      computerTodaySec = 0,
+      computerTotalSec = 0,
+      fullLock = PcFullLockState(),
+      entries = emptyList(),
+      activeWindows = emptyList(),
+      windowsUsers = emptyList(),
+      activityDate = "",
+      activityByUser = emptyList(),
+      activityByDate = emptyMap(),
+      hourlyUsageMinutes = List(24) { 0 },
+      offlineHistory = emptyList(),
+      screenBase64 = "",
+      screenTimestampMs = 0L,
+      screenReceivedAtMs = 0L,
+      lastSyncMs = 0L,
+      pcRecordingActive = false,
+      pcRecordingPath = "",
+      pcRecordingSeconds = 0,
+      pcRecordingFrames = 0,
+      lastScreenshotPath = "",
+      lastScreenshotAtMs = 0L,
+      statusMessage = reason
+    )
+    sessionCookie = null
+    csrfToken = ""
+    lastPcContactMs = 0L
+    syncedPcActivityHashes.clear()
+    lastPcActivitySyncMs = 0L
+    pcActivityResetAtMs = System.currentTimeMillis() + 3_000L
+    if (!deleteRoomHistory) return
+    scope.launch {
+      try {
+        val ctx = DirectP2pSocketEngine.appContext ?: return@launch
+        val dao = KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+        val cfg = dao.getFamilyConfigOnce()
+        val childId = cfg?.currentActiveChildId?.takeIf { it > 0L }
+          ?: cfg?.thisDeviceChildId?.takeIf { it > 0L }
+          ?: dao.getAllChildrenOnce().firstOrNull()?.id
+          ?: 0L
+        if (childId > 0L) {
+          dao.deletePcActivityLogsForChild(childId)
+        }
+      } catch (_: Exception) {
+      }
+    }
   }
 
   init {
@@ -402,6 +473,12 @@ object PcBlockerClient {
   fun setPairingCode(code: String) {
     loadPersistedPcIdentity()
     val clean = code.trim().ifBlank { "101-701" }
+    val codeChanged = normalizePcCode(clean) != normalizePcCode(configuredCode)
+    // Смена кода = другой компьютер. Чистим всех пользователей/историю/правила
+    // старого ПК, иначе они остаются в списке и SQL-истории нового.
+    if (codeChanged || configuredPcId.isNotBlank() || _state.value.windowsUsers.isNotEmpty()) {
+      clearPcScopedState("Переключение на ПК с кодом $clean")
+    }
     configuredCode = clean
     // Пользователь явно указал код — заново опознаём ПК по этому коду.
     configuredPcId = ""
@@ -434,6 +511,7 @@ object PcBlockerClient {
 
   fun resetPcIdentity() {
     loadPersistedPcIdentity()
+    clearPcScopedState("Привязка к ПК сброшена — ищу компьютер заново по коду")
     configuredPcId = ""
     codeExplicitlySet = false
     persistPcIdentity()
@@ -445,12 +523,30 @@ object PcBlockerClient {
   }
 
   fun onUdpBeaconReceived(pcName: String, ip: String, port: Int, pairingCode: String, pcId: String = "") {
-    markPcContact()
     loadPersistedPcIdentity()
+    val beaconCode = pairingCode.trim()
+    val beaconId = pcId.trim()
+    // Чужой ПК (другой код или другой pc_id) не должен перебивать выбранный.
+    // Раньше любой маяк в LAN мог «переключить» приложение на соседний компьютер.
+    if (codeExplicitlySet && beaconCode.isNotBlank() &&
+      normalizePcCode(beaconCode) != normalizePcCode(configuredCode)
+    ) {
+      return
+    }
+    if (configuredPcId.isNotBlank() && beaconId.isNotBlank() && beaconId != configuredPcId) {
+      return
+    }
+    val switching = (beaconCode.isNotBlank() &&
+      normalizePcCode(beaconCode) != normalizePcCode(configuredCode)) ||
+      (beaconId.isNotBlank() && configuredPcId.isNotBlank() && beaconId != configuredPcId)
+    if (switching) {
+      clearPcScopedState("Переключение на ПК ${pcName.ifBlank { "Windows" }}")
+    }
+    markPcContact()
     // Маяк приходит по локальной сети от реального ПК — он главнее случайно
     // «пойманного» чужого состояния из интернета. Переключаемся на этот ПК.
-    if (pairingCode.isNotBlank()) configuredCode = pairingCode.trim()
-    if (pcId.isNotBlank()) configuredPcId = pcId.trim()
+    if (beaconCode.isNotBlank()) configuredCode = beaconCode
+    if (beaconId.isNotBlank()) configuredPcId = beaconId
     codeExplicitlySet = true
     persistPcIdentity()
     val cur = _state.value
@@ -1614,6 +1710,7 @@ object PcBlockerClient {
       isOnline = true,
       transportLabel = transport,
       pcName = msg.optString("pc_name", current.pcName).ifBlank { current.pcName },
+      pcScriptVersion = msg.optString("script_version", current.pcScriptVersion).ifBlank { current.pcScriptVersion },
       lanIp = if (ipFromMsg.isNotBlank() && ipFromMsg != "127.0.0.1") ipFromMsg else current.lanIp,
       port = msg.optInt("port", current.port),
       pairingCode = current.pairingCode,
@@ -1688,6 +1785,9 @@ object PcBlockerClient {
    */
   private fun syncPcActivityByDateToRoom(byDate: Map<String, List<PcActivityUser>>) {
     if (byDate.isEmpty()) return
+    // Идёт смена ПК: старые/новые строки ещё могут быть в полёте — не пишем,
+    // пока не закончится очистка истории предыдущего компьютера.
+    if (System.currentTimeMillis() < pcActivityResetAtMs) return
     val appCtx = DirectP2pSocketEngine.appContext ?: return
     val changed = LinkedHashMap<String, Pair<List<PcActivityUser>, Int>>()
     for ((dateIso, users) in byDate) {

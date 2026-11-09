@@ -7,6 +7,50 @@
 
 ---
 
+## Пост-релизные фиксы (после сборки #30)
+
+Коммит с фиксами: `584697d` (локально; после push запустится новый CI-run).
+Второй локальный коммит `9b3f94f` — обновление этого HANDOFF.
+
+Пользователь сообщил:
+1. Новые кнопки «HD-кадр на ПК» и «REC HD на ПК» не работают; старая локальная
+   запись идёт в ужасном качестве.
+2. При переключении на другой ПК по pairing code в списке пользователей/истории
+   остаются пользователи предыдущего компьютера.
+
+Исправлено:
+- **`PcBlockerClient.kt`**:
+  - `clearPcScopedState(reason, deleteRoomHistory)` — полный сброс состояния ПК
+    (windowsUsers, activityByUser/ByDate, activeWindows, entries, fullLock, кадр,
+    запись, скриншот, LAN-сессия) + удаление PC-истории из Room;
+  - вызывается в `setPairingCode`, `onUdpBeaconReceived` (при смене code/pc_id),
+    `learnPcIdentity`, `resetPcIdentity`;
+  - `onUdpBeaconReceived` игнорирует чужой маяк (другой code/pc_id) — раньше любой
+    ПК в LAN мог «переключить» приложение;
+  - `pcActivityResetAtMs` — 3-секундный запрет записи истории в Room во время
+    переключения, чтобы старые/новые пользователи не смешались;
+  - `PcConnectionState.pcScriptVersion` — парсинг `script_version` из `PC_STATE`.
+- **`KidsGuardDao.kt`**: `deletePcActivityLogsForChild(childId)` — удаляет только
+  `deviceType='PC'` логи при смене компьютера.
+- **`PcControlScreen.kt`**:
+  - сброс `selectedHistoryUser` при смене `pairingCode/pcName`;
+  - предупреждение, если ПК-агент старее 5.5 (HD-кадр/REC HD не поддерживаются),
+    с версией агента;
+  - локальная MP4-запись теперь стартует из `LaunchedEffect` (без двойного
+    `startRecording`).
+- **`ScreenVideoRecorder.kt`**: локальная запись вместо 480×800/1,2 Мбит/с теперь
+  до 1280×720 (720×1280 для портрета), `RGB_565`, 2 кадра/с, битрейт
+  `width*height*6` (2–12 Мбит/с), до 60 кадров. Это заметно повышает качество
+  старой кнопки «Запись MP4».
+- **`ScreenStreamDialog.kt`**: `startRecording(fps = 1)` под реальный 1 кадр/с.
+
+Важно: новые HD-команды работают только с **новым** `hosts_blocker.exe` версии
+**5.5+**. Старый exe их не знает — в UI теперь будет предупреждение с версией
+агента. После установки нового exe нужно перезапустить задачи
+`HostsBlockerEngine`/`HostsBlockerWatchdog` и агент пользовательской сессии.
+
+---
+
 ## ЭТАП 3 (интеграция, pre-build, CI/CD) — ЗАВЕРШЁН
 
 **Статус: сборка успешна.**

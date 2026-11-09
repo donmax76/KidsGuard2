@@ -465,6 +465,10 @@ interface KidsGuardDao {
   @Query("DELETE FROM offline_activity_logs WHERE childId = :childId")
   suspend fun deleteOfflineActivityLogsForChild(childId: Long)
 
+  /** Удаляет историю только ПК (при смене компьютера по pairing code). */
+  @Query("DELETE FROM offline_activity_logs WHERE childId = :childId AND deviceType = 'PC'")
+  suspend fun deletePcActivityLogsForChild(childId: Long)
+
   // Offline Location Points (Store-and-Forward GPS)
   @Query("SELECT * FROM offline_location_points WHERE childId = :childId ORDER BY timestamp DESC LIMIT 250")
   fun getOfflineLocationPointsForChild(childId: Long): Flow<List<OfflineLocationPointEntity>>

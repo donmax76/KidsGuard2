@@ -36,22 +36,49 @@ object ScreenVideoRecorder {
   private val recordedFrames = mutableListOf<Bitmap>()
   private val frameLock = Any()
 
-  fun startRecording() {
+  // Качество локальной записи: до 1280×720 (или 720×1280 для портрета),
+  // RGB_565 чтобы 60–90 кадров не съели всю память. Раньше было 480×800 ARGB.
+  @Volatile
+  private var recordingFps: Int = 2
+  private var targetWidth: Int = 0
+  private var targetHeight: Int = 0
+  private val maxFrames = 60
+
+  fun startRecording(fps: Int = 2) {
     synchronized(frameLock) {
       recordedFrames.clear()
+      recordingFps = fps.coerceIn(1, 10)
+      targetWidth = 0
+      targetHeight = 0
       isRecording = true
     }
-    Log.d(TAG, "Video recording started")
+    Log.d(TAG, "Video recording started (fps=$recordingFps, HD)")
   }
 
   fun addFrame(bitmap: Bitmap) {
     if (!isRecording) return
     synchronized(frameLock) {
-      if (recordedFrames.size < 180) { // Up to 3 minutes at 1fps or 90s at 2fps
-        val scaled = scaleEven(bitmap, 480, 800)
-        recordedFrames.add(scaled)
+      if (recordedFrames.size >= maxFrames) return
+      if (targetWidth <= 0 || targetHeight <= 0) {
+        val (tw, th) = targetSizeFor(bitmap)
+        targetWidth = tw
+        targetHeight = th
       }
+      recordedFrames.add(scaleEven(bitmap, targetWidth, targetHeight))
     }
+  }
+
+  private fun targetSizeFor(src: Bitmap): Pair<Int, Int> {
+    val maxW = if (src.width >= src.height) 1280 else 720
+    val maxH = if (src.width >= src.height) 720 else 1280
+    val scale = minOf(
+      1f,
+      maxW.toFloat() / src.width.coerceAtLeast(1),
+      maxH.toFloat() / src.height.coerceAtLeast(1)
+    )
+    val w = ((src.width * scale).toInt().coerceAtLeast(2) / 2) * 2
+    val h = ((src.height * scale).toInt().coerceAtLeast(2) / 2) * 2
+    return Pair(w, h)
   }
 
   fun isCurrentlyRecording(): Boolean = isRecording
@@ -103,7 +130,8 @@ object ScreenVideoRecorder {
   }
 
   private fun scaleEven(src: Bitmap, targetWidth: Int, targetHeight: Int): Bitmap {
-    val out = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+    // RGB_565: вдвое меньше памяти, чем ARGB_8888 — важно для 720p-серии кадров.
+    val out = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.RGB_565)
     val canvas = Canvas(out)
     canvas.drawColor(Color.parseColor("#020617"))
     val scale = minOf(
@@ -120,10 +148,12 @@ object ScreenVideoRecorder {
   }
 
   private fun encodeBitmapsToMp4(frames: List<Bitmap>, outputFile: File): Boolean {
-    val width = 480
-    val height = 800
+    val width = (frames.first().width / 2 * 2).coerceAtLeast(2)
+    val height = (frames.first().height / 2 * 2).coerceAtLeast(2)
     val mime = MediaFormat.MIMETYPE_VIDEO_AVC
-    val frameRate = 2 // 2 frames per second
+    val frameRate = recordingFps.coerceIn(1, 10)
+    // 6 бит/пиксель в секунду — заметно выше прежних 1,2 Мбит/с, без «мыла».
+    val bitRate = (width * height * 6).coerceIn(2_000_000, 12_000_000)
     var codec: MediaCodec? = null
     var muxer: MediaMuxer? = null
     var muxerStarted = false
@@ -131,7 +161,7 @@ object ScreenVideoRecorder {
     return try {
       val format = MediaFormat.createVideoFormat(mime, width, height).apply {
         setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-        setInteger(MediaFormat.KEY_BIT_RATE, 1_200_000)
+        setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
         setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
         setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
       }

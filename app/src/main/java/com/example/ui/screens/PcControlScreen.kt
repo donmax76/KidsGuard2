@@ -227,6 +227,11 @@ fun PcControlScreen(
     mutableStateOf(pcState.pairingCode.ifBlank { "101-701" })
   }
 
+  // При смене ПК не тащим выбранную учётку/историю со старого компьютера.
+  LaunchedEffect(pcState.pairingCode, pcState.pcName) {
+    selectedHistoryUser = ""
+  }
+
   var childAccountInput by remember(pcState.fullLock.childAccount) {
     mutableStateOf(pcState.fullLock.childAccount)
   }
@@ -356,7 +361,9 @@ fun PcControlScreen(
 
   LaunchedEffect(isRecordingPcVideo) {
     if (isRecordingPcVideo) {
+      ScreenVideoRecorder.startRecording(fps = 2)
       pcRecordingSeconds = 0
+      var frameTick = 0
       while (isRecordingPcVideo) {
         val timeNow = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         val frameBmp = liveFrame?.bitmap ?: pcScreenBitmap ?: renderWatchedContentFrameBitmap(
@@ -365,8 +372,9 @@ fun PcControlScreen(
           timeStr = timeNow
         )
         ScreenVideoRecorder.addFrame(frameBmp)
-        delay(1000)
-        pcRecordingSeconds++
+        delay(500)
+        frameTick++
+        if (frameTick % 2 == 0) pcRecordingSeconds++
       }
     }
   }
@@ -1171,6 +1179,22 @@ fun PcControlScreen(
               )
             }
           }
+          val pcAgentSupportsHd = remember(pcState.pcScriptVersion) {
+            val parts = pcState.pcScriptVersion.split(".").mapNotNull { it.trim().toIntOrNull() }
+            val major = parts.getOrNull(0) ?: 0
+            val minor = parts.getOrNull(1) ?: 0
+            major > 5 || (major == 5 && minor >= 5)
+          }
+          if (!pcAgentSupportsHd) {
+            Text(
+              text = "⚠️ ПК-агент${pcState.pcScriptVersion.takeIf { it.isNotBlank() }?.let { " v$it" } ?: ""} " +
+                "не поддерживает HD-кадр/REC HD. Обновите hosts_blocker.exe на ПК до 5.5+ " +
+                "(artifact KidsGuard-PC-Agent).",
+              color = AmberWarning,
+              fontSize = 10.sp,
+              maxLines = 3
+            )
+          }
           val hdMediaInfo = when {
             pcState.pcRecordingActive -> "🔴 ПК пишет экран: ${pcState.pcRecordingPath.ifBlank { "…" }} (${pcState.pcRecordingFrames} кадров)"
             pcState.pcRecordingPath.isNotBlank() -> "🎥 Последняя запись ПК: ${pcState.pcRecordingPath}"
@@ -1291,16 +1315,8 @@ fun PcControlScreen(
               onClick = {
                 if (!isRecordingPcVideo) {
                   recordedPcVideoUri = null
-                  val timeNow = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-                  val firstBmp = pcScreenBitmap ?: renderWatchedContentFrameBitmap(
-                    childName = "Компьютер (${pcState.pairingCode})",
-                    rawAppSummary = currentPcSummary,
-                    timeStr = timeNow
-                  )
-                  ScreenVideoRecorder.startRecording()
-                  ScreenVideoRecorder.addFrame(firstBmp)
                   isRecordingPcVideo = true
-                  Toast.makeText(context, "🔴 Запись видео MP4 началась...", Toast.LENGTH_SHORT).show()
+                  Toast.makeText(context, "🔴 Запись видео MP4 началась (HD)...", Toast.LENGTH_SHORT).show()
                 } else {
                   isRecordingPcVideo = false
                   coroutineScope.launch {
