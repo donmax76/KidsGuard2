@@ -389,14 +389,25 @@ object DirectP2pSocketEngine {
       startChildUdpBeaconLoop()
     }
     // Подтягиваем сохранённый режим «Только Wi-Fi / Wi-Fi + 4G» из БД ребёнка.
+    // boundChildId может быть 0 при старте из репозитория — тогда берём id из
+    // family_config/child_profiles, иначе режим «Только Wi-Fi» терялся после ребута.
     val ctx = appContext
-    val cid = boundChildId.takeIf { it > 0L } ?: thisDeviceBoundChildId
-    if (ctx != null && currentRole == "CHILD" && cid > 0L) {
+    if (ctx != null && currentRole == "CHILD") {
       scope.launch {
         try {
-          val child = com.example.data.local.KidsGuardDatabase.getDatabase(ctx)
-            .kidsGuardDao().getChildByIdOnce(cid)
-          child?.let { allowMobileData = it.allowMobileData }
+          val dao = com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+          val cfg = dao.getFamilyConfigOnce()
+          val cid = boundChildId.takeIf { it > 0L }
+            ?: thisDeviceBoundChildId.takeIf { it > 0L }
+            ?: cfg?.thisDeviceChildId?.takeIf { it > 0L }
+            ?: cfg?.currentActiveChildId?.takeIf { it > 0L }
+            ?: dao.getAllChildrenOnce().firstOrNull()?.id
+            ?: 0L
+          if (cid > 0L) {
+            thisDeviceBoundChildId = cid
+            val child = dao.getChildByIdOnce(cid)
+            child?.let { allowMobileData = it.allowMobileData }
+          }
         } catch (_: Exception) {}
       }
     }

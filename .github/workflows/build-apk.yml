@@ -72,3 +72,32 @@ jobs:
         with:
           files: app/build/outputs/apk/debug/*.apk
           generate_release_notes: true
+
+  build-pc-agent:
+    name: Build Windows PC agent (.exe)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller and Pillow
+        run: |
+          python -m pip install --upgrade pip
+          pip install pillow pyinstaller
+
+      - name: Build single-file PC agent
+        run: pyinstaller --noconsole --onefile --name hosts_blocker hosts_blocker.py
+
+      - name: Upload PC agent artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KidsGuard-PC-Agent
+          path: |
+            dist/hosts_blocker.exe
+            hosts_blocker.py
+          if-no-files-found: error

@@ -7,6 +7,38 @@
 
 ---
 
+## ЭТАП 3 (интеграция, pre-build, CI/CD) — статус
+
+**Статус: pre-build проверка выполнена, CI НЕ запущен — push в GitHub заблокирован
+отсутствием credentials в текущем окружении.**
+
+Что проверено/исправлено на Этапе 3:
+- `AndroidManifest.xml`: исправлено имя action энергосбережения на правильное
+  `android.os.action.POWER_SAVE_MODE_CHANGED` (было `android.intent.action...` — receiver
+  его не получал).
+- `DirectP2pSocketEngine.startEngine()`: сохранённый режим «Только Wi-Fi / Wi-Fi + 4G»
+  теперь подтягивается из БД и при `boundChildId = 0` (через `family_config`/
+  `currentActiveChildId`/первого ребёнка), иначе после ребута режим терялся.
+- `.github/workflows/build-apk.yml`: добавлен job `build-pc-agent` (windows-latest,
+  Python 3.12, `pip install pillow pyinstaller`, `pyinstaller --noconsole --onefile
+  --name hosts_blocker hosts_blocker.py`, artifact `KidsGuard-PC-Agent`).
+- Проверки: `python -m py_compile hosts_blocker.py` — OK; XML манифеста парсится; YAML
+  workflow проверен вручную; Kotlin-файлы проверены на баланс скобок (локального Android
+  SDK/Gradle в окружении нет, поэтому `assembleDebug` локально не запускался).
+- `.gitignore`/сборка: APK собирается job `build` (artifact `KidsGuard-debug-apk`),
+  ПК-агент — job `build-pc-agent` (artifact `KidsGuard-PC-Agent`).
+
+Чтобы завершить Этап 3 на машине с доступом к GitHub:
+```powershell
+cd KidsGuard2
+git push origin main
+```
+После push GitHub Actions запустит `Build KidsGuard APK`; зелёный лог и артефакты —
+вкладка Actions → Run → Artifacts. Если сборка упадёт, лог ошибки будет в Summary
+(шаг «Show build errors in summary»), а также в `build-output.log` артефакта.
+
+---
+
 ## ЭТАП 2 (системные фиксы) — что изменено в этой сессии
 
 ### 5.1. Чёрный экран при стриме ПК (Windows Sessions)
