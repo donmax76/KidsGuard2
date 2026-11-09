@@ -1,0 +1,474 @@
+# KidsGuard2 — HANDOFF (состояние после сессии 2026-11-09)
+
+Репозиторий: https://github.com/donmax76/KidsGuard2.git  
+Ветка: `main`  
+Базовая точка до этой сессии: `3c987167d0eebd518d057146ca6e57659f69c918`  
+Работа велась по пунктам 1–3, по пункту 4 — только разведка (код узлов не переписывался).
+
+---
+
+## 1. Что уже готово (пункты 1–3)
+
+### 1.1. Поворот экрана не ставит поток на паузу
+
+- `app/src/main/AndroidManifest.xml`, activity `.MainActivity`:
+  добавлено
+  `android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"`.
+- Причина прежнего поведения: Activity пересоздавалась при повороте, `PcControlScreen` получал
+  `ON_PAUSE/ON_STOP`, а `DisposableEffect(lifecycleOwner)` вызывал
+  `PcBlockerClient.stopScreenStream()` → оверлей «Поток на паузе».
+- Теперь Activity не пересоздаётся, Compose-состояние (`pcStreamQuality`, `showFullPcScreenDialog`,
+  зум) сохраняется. Поток по-прежнему осознанно останавливается, когда приложение реально уходит
+  в фон (свернули, а не повернули).
+- Проверить: открыть живой экран ПК → повернуть телефон → статус должен остаться `LIVE`,
+  кадр не должен пропадать/мигать «Пауза».
+
+### 1.2. Pinch-to-Zoom, панорамирование и качество
+
+Файл: `app/src/main/java/com/example/ui/screens/PcControlScreen.kt`
+
+- Полноэкранный плеер (блок `if (showFullPcScreenDialog)`):
+  - `detectTransformGestures` — зум `1f..5f` и панорамирование двумя пальцами;
+  - панорама ограничивается размерами вьюпорта (`onSizeChanged` + `IntSize`);
+  - двойной тап — переключение `100% ↔ 250%`; при зуме `≤1.02` панорама сбрасывается;
+  - `graphicsLayer { scaleX/scaleY/translationX/translationY }`.
+- Качество: `PcStreamQuality` в
+  `app/src/main/java/com/example/data/pc/PcBlockerClient.kt`:
+  `ECONOMY 480×270`, `BALANCED 640×360`, `HD 1280×720`, `FULL_HD 1920×1080`.
+  Выбор сохраняется в `SharedPreferences` (`saveStreamQuality`/`savedStreamQuality`) и в
+  `rememberSaveable`, поэтому не сбрасывается при повороте/перезапуске.
+- ПК-агент `hosts_blocker.py`: `stream_touch()`/`stream_params()` теперь принимают до
+  `1920×1080` (раньше был жёсткий потолок `1600×900`, из-за чего Full HD молча резался).
+- Проверить: щипок увеличивает именно картинку, а не весь экран; после поворота качество
+  остаётся выбранным; на Full HD в статусе ПК видно `1920×1080`.
+
+### 1.3. Полупрозрачное меню с автоскрытием
+
+Тот же `PcControlScreen.kt`:
+
+- верхняя/нижняя панели — `Color.Black.copy(alpha = 0.45f)`;
+- `LaunchedEffect(showFullPcScreenDialog, pcHudVisible, pcHudInteraction, pcZoom)`:
+  через `3_000 ms` бездействия `pcHudVisible = false`;
+- одиночный тап по экрану (`detectTapGestures.onTap`) показывает/скрывает меню;
+- двойной тап (`onDoubleTap`) — зум, при этом меню принудительно показывается;
+- зум/панорама двумя пальцами не считаются одиночным тапом, поэтому не конфликтуют с меню;
+- любое взаимодействие (касание, зум, смена качества, кнопки) инкрементит `pcHudInteraction`
+  и перезапускает таймер автоскрытия.
+
+### 1.4. HD-скриншот и HD-запись экрана ПК
+
+Android UI (`PcControlScreen.kt`):
+
+- кнопка `HD-кадр на ПК` (`testTag("pc_screenshot_hd_button")`) →
+  `PcBlockerClient.requestPcScreenshotHd()`;
+- кнопка `REC HD на ПК` (`testTag("pc_record_hd_button")`) →
+  `PcBlockerClient.startPcRecording()` / `stopPcRecording()`;
+- дублирующие кнопки в полноэкранном HUD;
+- в карточке показывается путь к последнему HD-кадру и статус записи
+  (`pcState.lastScreenshotPath`, `pcState.pcRecordingActive/Path/Seconds/Frames`).
+
+Android-клиент (`PcBlockerClient.kt`):
+
+- `requestPcScreenshotHd()` → P2P-команда и LAN-POST `/api/screenshot_hd`;
+- `startPcRecording(fps, quality)` → `/api/record_start`;
+- `stopPcRecording()` → `/api/record_stop`;
+- все три команды добавлены в «read-only» список (`sendP2pCommand`), чтобы работали без
+  ввода пароля панели, как и обычный просмотр.
+
+ПК-агент (`hosts_blocker.py`):
+
+- `request_hd_screenshot()` пишет `screenshot_hd.flag`; агент пользовательского сеанса
+  (`agent_main`) снимает экран в **исходном разрешении монитора** (`_native_screen_size()`),
+  сохраняет JPEG quality 92 (или PNG без Pillow) в
+  `C:\ProgramData\HostsBlockerPub\screenshots\shot_ГГГГММДД_ЧЧММСС.jpg`;
+- `request_record("start")` пишет `record.json`; агент пишет **AVI/MJPEG** в исходном
+  разрешении, JPEG quality 85, по умолчанию 10 кадров/с, в
+  `C:\ProgramData\HostsBlockerPub\records\screen_ГГГГММДД_ЧЧММСС.avi`;
+- статусы пишутся в `screenshot_status.json` и `record_status.json`, движок отдаёт их в
+  `panel_state()` как `last_screenshot` и `recording`;
+- запись и скриншот делает именно агент сеанса, а не SYSTEM-движок: GDI-захват из сессии 0
+  даёт чёрный экран (см. пункт 4.1);
+- `agent_main` пересчитывает `_is_active_console_session()` на каждом тике, поэтому после
+  переключения пользователя старый агент больше не снимает чёрный экран и останавливает запись.
+
+Ограничения текущей реализации:
+
+- AVI/MJPEG не проигрывается стандартной галереей Android; файл лежит на ПК и открывается
+  VLC/Windows Media Player. Для MP4 на телефоне остаётся прежняя кнопка локальной записи
+  (`ScreenVideoRecorder`, 1 кадр/с) — она не заменена, чтобы не ломать текущий сценарий.
+- Запись требует Pillow на ПК (`pip install pillow`); без Pillow агент вернёт понятную ошибку
+  в `record_status.json`.
+- Если агент убить во время записи, AVI может остаться с незакрытым заголовком (файл
+  частично читается, но лучше добавить `finally`/watchdog в следующей итерации).
+
+### 2.1. Мультиаккаунтность Windows
+
+- `PcBlockerClient.kt`:
+  - `PcConnectionState.windowsUsers: List<String>` — все локальные учётки;
+  - парсинг `windows_users` из `PC_STATE`, с fallback на активные окна/историю/`full_lock`;
+  - `PcActivityItem.startedAtMs` — время первого запуска программы/окна;
+  - `selectFullPcLockAccount(account)` — переключение учётки в блоке полной блокировки.
+- `PcControlScreen.kt`, карточка «Полная блокировка ПК»:
+  - горизонтальный ряд чипов «👤 Учётные записи Windows…»;
+  - тап по чипу меняет `childAccountInput` и отправляет аккаунт на ПК
+    (`/api/fulllock_schedule`), поэтому блокировка/расписание применяются к выбранному
+    пользователю, а не только к `raufh`.
+- `hosts_blocker.py`:
+  - `list_windows_users()` парсит `net user`;
+  - `panel_state()` отдаёт `windows_users`;
+  - `_full_lock_usage()` + `activity_seconds_for_user()` +
+    `activity_total_seconds_for_user()` — лимиты полной блокировки считаются по активности
+    выбранной учётки, а не по общему времени всех сеансов;
+  - `apply_full_lock()` по-прежнему делает `net user /active:no` + `WTSLogoffSession`
+    именно для выбранного имени.
+- История активности разделена по пользователям:
+  - `KidsGuardDao.getAggregatedProcsByDateRange` и `getAggregatedWindowTitlesByDateRange`
+    теперь группируют по `LOWER(TRIM(packageName/windowTitle)), appName`, где `appName` —
+    имя Windows-пользователя; раньше два пользователя с одним `chrome.exe` складывались
+    в одну строку;
+  - `PcActivityItem.userName` доносит учётку до UI;
+  - в карточке истории есть чипы «Все / <учётка>», а при «Все» каждая строка подписана
+    именем пользователя;
+  - `selectedHistoryUser` хранится в `rememberSaveable`.
+- Что осталось на будущее: лимиты обычных правил (`entries[].limit`) в ПК-агенте всё ещё
+  общие для всех пользователей (`usage.json`, `__computer__`). Для полного разделения нужно
+  перевести `usage.json` на структуру `user -> entry -> seconds` и обновить UI правил.
+
+### 2.2. Точное время запуска программы в истории ПК
+
+- `hosts_blocker.py`, `agent_main()`:
+  - `proc_started`, `title_started` — словари `имя -> epoch ms` первого появления за день;
+  - `setdefault` на каждом тике, сохранение в `activity_<user>.json`
+    (`proc_started`, `title_started`);
+  - `save_activity_history_day()` сохраняет эти словари в 30-дневный архив;
+  - `panel_state()` отдаёт `started` в каждом элементе `procs`/`titles`.
+- `PcBlockerClient.parseUsersActivityJson()` читает `started` в `PcActivityItem.startedAtMs`.
+- `PcControlScreen.kt`, история:
+  - под временем работы выводится `• запуск ЧЧ:ММ:СС` для программ и
+    `• открыто ЧЧ:ММ:СС` для окон/вкладок;
+  - при SQLite-агрегате, где старого поля нет, подставляется значение из последнего
+    `PC_STATE` по имени; если и его нет — строка не показывается.
+
+### 3. Честный «Онлайн / Оффлайн»
+
+ПК:
+
+- `PcBlockerClient.kt`: `lastPcContactMs`, `markPcContact()`, watchdog в `init` —
+  если 15 с не было ни `PC_STATE`, ни кадра, ни UDP-маяка, `isOnline` становится `false`,
+  `transportLabel` = `🔴 ПК оффлайн • нет пакетов N с`;
+- `markPcContact()` вызывается в `onUdpBeaconReceived`, `ingestP2pStateJson`,
+  `ingestP2pScreenJson`, `ingestP2pStreamFrame*`, `parseStateJson`;
+- ПК-агент публикует `PC_STATE` каждые ~4 с, этого достаточно для таймаута 15 с.
+
+Телефон ребёнка:
+
+- `RealtimeCloudRelay.kt`:
+  - `childLastSeenMs`, `_childOnlineFlow`, `isChildOnline()`, `recomputeChildPresence()`
+    (пересчёт раз в 3 с, таймаут 30 с);
+  - `markChildSeen()` на `CHILD_STATE`/`CHILD_PATCH` от ребёнка;
+  - новый лёгкий тип `CHILD_PONG` и `publishChildPong()`;
+- `KidsGuardBackgroundService.kt` и `ParentalControlRepository.kt`: команда `PING` —
+  отмечает присутствие родителя, обновляет батарею и отвечает `CHILD_PONG`
+  (без GPS и без выгрузки истории). Дублирование нужно, если фоновый сервис ещё не поднялся,
+  а приложение ребёнка уже открыто;
+- `ParentControlViewModel.kt`: родитель шлёт `PING` каждые 10 с, полный
+  `PARENT_ONLINE_HEARTBEAT` — раз в 40 с (раньше всё было раз в 35 с);
+- `CommonComponents.kt` (`HeroBannerCard`): новый параметр `isOnline`;
+  текст `🟢 Онлайн` / `🔴 Оффлайн` вместо прежнего «Онлайн» по `batteryLevel > 0`;
+- `ParentDashboardScreen.kt` собирает `RealtimeCloudRelay.childOnlineFlow` и передаёт
+  `isOnline` в `HeroBannerCard`.
+
+Примечание: если телефон ребёнка полностью выключен/в авиарежиме, PING не доставляется,
+`childLastSeenMs` перестаёт обновляться и через 30 с UI покажет «Оффлайн». Это ожидаемо.
+
+---
+
+## 2. Проверка и сборка
+
+- Python-часть: `python -m py_compile hosts_blocker.py` — OK (Python 3, bundled runtime).
+- AVI-писатель проверен отдельным тестом: файл начинается с `RIFF....AVI `, содержит
+  корректные `00dc`-чанки, открывается как MJPEG AVI.
+- Kotlin/Android в этой сессии **не собирался**: в рабочем окружении нет Android SDK и
+  Gradle wrapper, а GitHub Actions по условию задачи не запускался. Перед релизом
+  обязательно выполнить `./gradlew :app:assembleDebug` (или CI) и проверить:
+  - поворот на полноэкранном потоке;
+  - щипок/панораму/двойной тап;
+  - автоскрытие HUD через 3 с и возврат по тапу;
+  - переключение учёток в «Полной блокировке ПК»;
+  - HD-кадр и REC HD (на ПК должен быть Pillow);
+  - «Оффлайн» на ПК через ~15 с после выключения агента и на телефоне через ~30 с.
+
+Копии `hosts_blocker.py` синхронизированы:
+`hosts_blocker.py`, `public/hosts_blocker.py`, `public/downloads/hosts_blocker.py`,
+`public/assets/aistudio/hosts_blocker.py`, `public/assets/aistudio/hosts_blocker_c2776433.py`,
+`app/src/main/assets/hosts_blocker.py` (одинаковый SHA-256).
+
+---
+
+## 3. Карта для следующего этапа (пункт 4) — код этих узлов НЕ переписывался
+
+Ниже — точные файлы, методы и гипотезы. Это исходная точка для модели Pro.
+
+### 4.1. Чёрный экран при захвате экрана ПК (неактивные сессии Windows)
+
+Файл: `hosts_blocker.py`
+
+- `_grab_screen_bgra(dst_w, dst_h)` — GDI: `GetDC(None)`, `CreateDIBSection`,
+  `StretchBlt`; источник — **только primary-монитор** `GetSystemMetrics(0/1)`.
+- `capture_screen_png()` / `capture_screen_frame()` — PNG/JPEG из BGRA.
+- `agent_screen_frame(max_age=2.0)` — движок читает `screen.png`, который пишет агент
+  пользовательского сеанса; если кадр старше 2 с — `None`.
+- `_is_active_console_session()` — сравнивает `ProcessIdToSessionId` с
+  `WTSGetActiveConsoleSessionId`.
+- `agent_main()` — `is_console` (теперь пересчитывается каждый тик), запись `screen.png`,
+  `stream.json`, `screenshot_hd.flag`, `record.json`.
+- `panel_screen(force, w, h, quality)` — отдаёт кадр панели/телефону, ждёт свежий
+  `screen.png` от агента.
+- `p2p_stream_worker()` / `_stream_mjpeg()` — отдают кадры в P2P/MJPEG.
+- `engine_tick()` — SYSTEM-движок; прямой GDI-захват в сессии 0 даёт чёрный экран.
+
+Почему чередуется чёрный кадр:
+
+1. SYSTEM-движок и агент работают в разных сессиях; движок не должен снимать экран сам.
+2. Агент неактивного/RDP-сеанса тоже может писать `screen.png`; защита —
+   `_is_active_console_session()`, но она вычисляется по PID процесса и не учитывает
+   переключение пользователя без перезапуска (сейчас пересчитывается в цикле).
+3. `GetSystemMetrics(0/1)` не работает для multi-monitor и для заблокированного экрана.
+4. Нет проверки «кадр полностью чёрный»: если агент записал чёрный кадр, движок отдаёт его
+   как валидный.
+5. `agent_screen_frame(max_age=2.0)` жёстко 2 с; при slow GDI/нагрузке кадр может не успеть.
+
+Направления исправления (для Pro):
+
+- захват через **Windows Graphics Capture / Desktop Duplication API** в сессии пользователя;
+- в `agent_*.json` добавить `session_id` и `is_console`, движку выбирать только
+  `console == true` и `fresh_agents()`;
+- детект чёрного кадра (средняя яркость/гистограмма) и fallback на последний непустой;
+- для multi-monitor — `EnumDisplayMonitors` и захват нужного монитора;
+- хранить в `screen.png` не только кадр, но и метаданные (session, monitor, timestamp).
+
+### 4.2. Сетевой слой детского Android-агента (Wi-Fi vs Wi-Fi + 4G, реконнект)
+
+Файл: `app/src/main/java/com/example/data/cloud/DirectP2pSocketEngine.kt`
+
+- `isParentActivelyConnected()` — присутствие родителя, таймаут 95 с.
+- `markParentPresenceActive()` — обновление присутствия.
+- `wifiNetwork()` — находит сеть с `TRANSPORT_WIFI`; `wifiIpv4()` — IPv4 Wi-Fi.
+- `startEngine(role, boundChildId)` — запуск движка для роли.
+- `startChildTcpServerIfNeeded()` — LAN TCP-сервер.
+- `startChildUdpBeaconLoop()` — UDP-маяк (сейчас 60 с при соединении / 30 с без).
+- `startGlobalBinaryTcpSocketLoop()` — глобальный TCP-релей, backoff `2 с → 30 с`.
+- `publishTcpSocketPacket()` / `handleIncomingJsonPacket()` — публикация/приём.
+- `NetworkConnectivityObserver.kt` — `NetworkCallback` (`registerNetworkCallback`),
+  `activeNetwork`, `hasTransport(TRANSPORT_CELLULAR)`; отдельного триггера реконнекта
+  движка по смене сети нет.
+
+Wi-Fi vs 4G:
+
+- `NET_WIFI_ONLY` / `NET_ALL` в `ParentalControlRepository.kt` (строки ~597–598) только
+  пишут `child_profiles.allowMobileData` (`KidsGuardDao.kt` ~145) и публикуют поле.
+- В `DirectP2pSocketEngine` **нет** `bindProcessToNetwork`/`Network.bindSocket` для
+  мобильного трафика и **нет** запрета сокетов при `allowMobileData = false`.
+  То есть переключатель «Только Wi-Fi» сейчас не ограничивает 4G на уровне сокетов.
+- LAN-сокеты (`wifiNetwork()`, `wifiIpv4()`) привязаны к Wi-Fi, но глобальный TCP-релей
+  идёт через сеть по умолчанию (может уйти в 4G).
+- `PcBlockerClient` (`wifiNetwork()` ~286, `wifiIpv4()` ~301, `lanHttpClient()` ~312)
+  использует Wi-Fi `socketFactory` для LAN-панели ПК — это единственное место явной привязки.
+
+Направления:
+
+- в `NetworkConnectivityObserver` при смене `activeNetwork` перезапускать
+  `startGlobalBinaryTcpSocketLoop()` (сейчас backoff живёт сам);
+- при `allowMobileData = false` вызывать `ConnectivityManager.bindProcessToNetwork(wifi)`
+  или `Network.bindSocket()` для P2P-сокетов; при `true` — снять bind;
+- в `startEngine`/`startGlobalBinaryTcpSocketLoop` логировать фактический транспорт.
+
+### 4.3. Проценты потребления батареи (28,8% против 42% в настройках) и долгая загрузка
+
+Файлы/методы:
+
+- `app/src/main/java/com/example/util/DeviceBatteryUtil.kt`
+  - `getAccurateBatteryPercentage(context)` — sticky `ACTION_BATTERY_CHANGED`,
+    `EXTRA_LEVEL/EXTRA_SCALE`; fallback `BATTERY_PROPERTY_CAPACITY`.
+- `app/src/main/java/com/example/location/LiveLocationTracker.kt`
+  - `readRealDeviceBattery()` (~450).
+- `app/src/main/java/com/example/service/KidsGuardBackgroundService.kt`
+  - `readBatteryLevel()` (~887), цикл батареи/телеметрии (~396–449):
+    публикация раз в 60 с при родителе online, иначе раз в 180 с.
+- `app/src/main/java/com/example/util/AppEnergyMeter.kt`
+  - `read(context)` (~73) — считает долю приложения:
+    `usedAppMah / totalMah * 100`, где `totalMah` — дельта
+    `BATTERY_PROPERTY_CHARGE_COUNTER`, `appMahNow` — сумма
+    `UidHealthStats.STATS_POWER_*` через `appPowerMah()` (~176);
+  - `cpuFallback()` (~134) — грубая оценка по CPU-времени;
+  - `BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER`/`CAPACITY` (строки ~81–82).
+- `app/src/main/java/com/example/data/cloud/ChildPowerStats.kt`
+  - `ingest(msg)` — принимает `appEnergyPercent`, `appMahPerHour`, `percentPerHour`.
+
+Почему 28,8% ≠ 42%:
+
+- 28,8% — это **доля приложения в израсходованных мА·ч за окно наблюдения** по
+  `UidHealthStats` (сумма CPU/wakelock/radio/GPS/sensors для UID).
+- 42% в настройках Android — это **остаток заряда** (или доля экрана/системы в другом
+  окне), другая база и другое окно; эти числа не обязаны совпадать.
+- `UidHealthStats` на многих OEM неполный/недоступен; `appPowerMah()` тогда возвращает 0 и
+  включается `cpuFallback()`.
+- `totalMah` может быть 0/отрицательным на некоторых прошивках; используются эвристики
+  `capacityMah = totalMah / (levelDrop / 100)`.
+- Долгая загрузка 30 минут: `syncRealUsageStats()` (`DeviceUsageTracker.kt` ~350) делает
+  `queryUsageStats` + запись Room; `AppEnergyMeter.read()` дорогой (HealthStats);
+  `ChildPowerStats` публикуется раз в 60 с; всё это усугубляется частыми реконнектами.
+
+Направления:
+
+- показывать два разных показателя явно: «Заряд телефона: 42%» и
+  «Расход KidsGuard за сутки: 28,8%» (с подписью методики);
+- кэшировать `HealthStats` (не чаще раза в 5–10 мин), не читать на UI-потоке;
+- считать `totalMah` по ёмкости батареи (`BATTERY_PROPERTY_CHARGE_COUNTER` + `Capacity`),
+  а не только по дельте;
+- на телефоне ребёнка не публиковать энергию чаще 1 раза в 5–10 минут.
+
+### 4.4. Фоновый сервис и WakeLock (разряд 100% → 13% за 50 ч при выключенном экране)
+
+Файл: `app/src/main/java/com/example/service/KidsGuardBackgroundService.kt`
+
+- `onCreate()` (~95) — `startProtectionLoops()`.
+- `onStartCommand()` (~153) — `START_STICKY`, `promoteToForeground`.
+- `onTaskRemoved()` (~183) — перезапуск без projection.
+- `startProtectionLoops()` (~192) — корутины:
+  - active app sync,
+  - screen usage loop 45 с / 120 с,
+  - battery/telemetry 60 с / 180 с,
+  - remote command listener,
+  - chat listener.
+- `buildForegroundNotification()` (~919), `start()` (~965), `stop()` (~998),
+  `onDestroy()` (~952).
+- `promoteToForeground()` (~110–150) — FGS type `specialUse|mediaProjection|location`.
+
+Файл: `app/src/main/java/com/example/service/KidsGuardAccessibilityService.kt`
+
+- `onCreate()` (~177), `onServiceConnected()` (~212),
+  `startMinuteUsageTicking()` (~336), `observeSecurityAndCloud()` (~458),
+  `onAccessibilityEvent()` (~731), `onDestroy()` (~1028);
+- `batteryLowOrHot()` (~84) — thermal/battery guard.
+
+Файл: `app/src/main/java/com/example/location/LiveLocationTracker.kt`
+
+- `startRealLocationUpdates()` (~479), `stopLocationUpdates()` (~418),
+  `CurrentLocationRequest` с `PRIORITY_HIGH_ACCURACY` (~531), fused request (~566),
+  `LocationManager` fallback (~592).
+
+Важно:
+
+- В проекте **нет** `PowerManager.WakeLock`, `WAKE_LOCK` permission, `AlarmManager`,
+  `WorkManager` (проверено grep по `app/src/main/java`). То есть «WakeLock» как таковой
+  не держится; разряд идёт от постоянных пробуждений корутин, GPS, сети и FGS.
+- `DeviceSecurityPermissionHelper.isBatteryOptimizationIgnored()` (~325) и
+  `requestIgnoreBatteryOptimization()` (~338) есть, но статус не проверяется при
+  старте сервиса и не показывается как блокирующее требование.
+- `onTaskRemoved` перезапускает сервис — на OEM это может приводить к циклу
+  «убит → запущен → снова убит».
+
+Направления:
+
+- измерить Battery Historian: `wakeups`, `mobile radio`, `gps`, `foreground service`;
+- заменить частые `while(true) + delay` на `WorkManager`/`AlarmManager` с
+  `setExactAndAllowWhileIdle` для редких задач;
+- GPS — только по `MAP_VIEWING` (уже частично), не поднимать при `PARENT_ONLINE_HEARTBEAT`;
+- проверить, не остаётся ли `mediaProjection` FGS после сворачивания;
+- при `onTaskRemoved` не перезапускать сервис без проверки `isBatteryOptimizationIgnored`.
+
+### 4.5. Manifest / BootReceiver / AccessibilityService / WorkManager (блокировка после <13% и полной зарядки)
+
+Файлы:
+
+- `app/src/main/AndroidManifest.xml`
+  - permissions: `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`,
+    `FOREGROUND_SERVICE_MEDIA_PROJECTION`, `FOREGROUND_SERVICE_LOCATION`,
+    `RECEIVE_BOOT_COMPLETED`, `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`,
+    `SYSTEM_ALERT_WINDOW`, `WRITE_SECURE_SETTINGS`, `PACKAGE_USAGE_STATS`;
+  - `KidsGuardBackgroundService`: `android:directBootAware="true"`,
+    `android:stopWithTask="false"`, `foregroundServiceType="specialUse|mediaProjection|location"`;
+  - `KidsGuardAccessibilityService`: `directBootAware="true"`,
+    `BIND_ACCESSIBILITY_SERVICE`, `accessibility_service_config`;
+  - `BootCompletedReceiver`: `directBootAware="true"`, фильтры `BOOT_COMPLETED`,
+    `LOCKED_BOOT_COMPLETED`, `QUICKBOOT_POWERON`, `MY_PACKAGE_REPLACED`,
+    `PACKAGE_REPLACED`, `ACTION_OTA_INSTALL_STATUS`.
+- `app/src/main/java/com/example/receiver/BootCompletedReceiver.kt`
+  - `onReceive()` (~28) — OTA + boot;
+  - `restoreServicesAndNotifyParentAfterUpdate()` (~158) — читает Room
+    `getFamilyConfigOnce()`, стартует `DirectP2pSocketEngine.startEngine("CHILD", childId)`,
+    `KidsGuardBackgroundService.start(...)` (~195), `LockOverlayService.start` (~238),
+    second-pass Accessibility (~242–247).
+- `app/src/main/java/com/example/service/KidsGuardAccessibilityService.kt`
+  - `onServiceConnected()` (~212), `onAccessibilityEvent()` (~731),
+    `showLockOverlay()` (~936), `bringAppToFront()` (~1021).
+- `app/src/main/java/com/example/util/DeviceSecurityPermissionHelper.kt`
+  - `restoreAccessibilityServiceAfterOta()` (используется в BootReceiver).
+- `WorkManager` в проекте отсутствует: нет зависимости в `app/build.gradle.kts`, нет
+  `WorkManager` provider/receiver в манифесте.
+
+Почему после <13% и зарядки приложение «молчит»:
+
+1. При разряде Android включает Battery Saver/Doze; FGS и сеть ограничиваются,
+   `START_STICKY` не гарантирует перезапуск.
+2. При падении до 0 система может **force-stop** приложение; после зарядки и загрузки
+   `BOOT_COMPLETED` для force-stopped пакета не доставляется, пока пользователь сам не
+   откроет приложение.
+3. `LOCKED_BOOT_COMPLETED` приходит до разблокировки, но `restoreServicesAndNotifyParentAfterUpdate`
+   читает **credential-encrypted Room** (`KidsGuardDatabase.getDatabase`), которая в этот
+   момент недоступна → исключение → `catch` молча выходит, сервис не стартует.
+4. `android:directBootAware="true"` у receiver/service есть, но БД и настройки не переведены
+   на device-protected storage; нет `DeviceProtectedStorageContext`.
+5. Нет `WorkManager`/`AlarmManager` fallback и нет повторной попытки после
+   `USER_UNLOCKED`/`ACTION_USER_UNLOCKED`.
+6. OEM-«автозапуск»/оптимизация батареи может блокировать FGS; приложение не проверяет
+   `isBatteryOptimizationIgnored` и не требует whitelist.
+7. AccessibilityService после force-stop/OEM-clean может быть отключён; restore через
+   `WRITE_SECURE_SETTINGS` не всегда помогает.
+
+Направления:
+
+- добавить `BroadcastReceiver` на `Intent.ACTION_USER_UNLOCKED` и повторять инициализацию
+  после разблокировки;
+- хранить минимальный «boot-конфиг» (role, childId, allowMobileData) в
+  `DeviceProtectedStorage`/`SharedPreferences` и стартовать сервис без Room;
+- добавить `WorkManager` periodic (15 мин) как watchdog, который проверяет
+  `KidsGuardBackgroundService` и `AccessibilityService`;
+- добавить `WAKE_LOCK` только если реально нужен (скорее нет), а лучше —
+  `setExactAndAllowWhileIdle` для редких задач;
+- в `BootCompletedReceiver` не глотать исключения: логировать и retry;
+- показывать родителю статус «оптимизация батареи не отключена» и вести в настройки.
+
+---
+
+## 4. Что изменено в этой сессии (файлы)
+
+- `AndroidManifest.xml` — `configChanges` у `MainActivity`.
+- `PcControlScreen.kt` — зум/панорама, HUD-автоскрытие, Full HD, кнопки HD-кадра/записи,
+  чипы пользователей Windows, время запуска в истории.
+- `PcBlockerClient.kt` — `windowsUsers`, `startedAtMs`, watchdog онлайна,
+  `requestPcScreenshotHd`, `startPcRecording`, `stopPcRecording`,
+  `selectFullPcLockAccount`, поля записи/скриншота, `FULL_HD`.
+- `RealtimeCloudRelay.kt` — `childOnlineFlow`, `isChildOnline`, `markChildSeen`,
+  `publishChildPong`, обработка `CHILD_PONG`.
+- `KidsGuardBackgroundService.kt` — команда `PING` и ответ `CHILD_PONG`.
+- `ParentControlViewModel.kt` — `PING` каждые 10 с, heartbeat раз в 40 с.
+- `CommonComponents.kt` — `HeroBannerCard(isOnline=...)`, честный текст.
+- `ParentDashboardScreen.kt` — подписка на `childOnlineFlow`.
+- `hosts_blocker.py` и его копии — `list_windows_users`, `proc_started/title_started`,
+  per-user full-lock usage, HD-скриншот, AVI/MJPEG-запись, `record_status`/
+  `screenshot_status`, `windows_users`/`recording`/`last_screenshot` в `panel_state`,
+  команды `/api/screenshot_hd`, `/api/record_start`, `/api/record_stop` (P2P + LAN),
+  Full HD clamp 1920×1080, версия 5.5.
+
+---
+
+## 5. Следующие шаги (рекомендация)
+
+1. Собрать APK в CI и прогнать ручной чек-лист из раздела 2.
+2. Починить 4.1 (чёрный экран) — это блокер для HD-записи и потока.
+3. Починить 4.2 (реальный Wi-Fi-only + реконнект по смене сети).
+4. Починить 4.5 (boot после разряда) — вынести boot-конфиг из credential-encrypted Room
+   и добавить `USER_UNLOCKED` + WorkManager watchdog.
+5. После этого — 4.3/4.4 (метрики батареи и фоновые циклы).

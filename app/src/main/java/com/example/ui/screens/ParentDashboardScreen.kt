@@ -149,6 +149,10 @@ fun ParentDashboardScreen(
   // Расход энергии самого приложения ребёнка (оценка, приходит по P2P раз в 5 минут).
   val childPowerStats by com.example.data.cloud.ChildPowerStats.byChild.collectAsState()
   val childEnergyPercent = currentChild?.id?.let { childPowerStats[it]?.appPercent } ?: -1
+  val childOnlineMap by com.example.data.cloud.RealtimeCloudRelay.childOnlineFlow.collectAsState()
+  val childIsOnline = currentChild?.id?.let { childId ->
+    childOnlineMap[childId] ?: com.example.data.cloud.RealtimeCloudRelay.isChildOnline(childId)
+  } ?: false
 
   LazyColumn(
     modifier = modifier
@@ -163,7 +167,8 @@ fun ParentDashboardScreen(
         childName = if (hasChildren) "$childName (${currentChild?.age ?: 10} лет)" else "Семейный контроль активен",
         isLocked = isLocked,
         batteryPercent = currentChild?.batteryLevel ?: -1,
-        appEnergyPercent = childEnergyPercent
+        appEnergyPercent = childEnergyPercent,
+        isOnline = childIsOnline
       )
     }
 

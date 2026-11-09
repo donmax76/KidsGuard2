@@ -620,6 +620,16 @@ class ParentalControlRepository(private val context: Context) {
                       // Родитель закрыл просмотр — сразу отцепляем зеркало экрана (экономия батареи).
                       com.example.service.KidsGuardAccessibilityService.stopLiveStreamingWindow()
                     }
+                    "PING" -> {
+                      // Ответ на PING родителя для честного индикатора «Онлайн»
+                      // (даже если фоновый сервис ещё не поднялся).
+                      com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(thisChildId)
+                      val batt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(context)
+                      dao.updateChildBattery(thisChildId, batt)
+                      cloudSync.upsertBatteryLevel(thisChildId, batt)
+                      com.example.data.cloud.RealtimeCloudRelay.publishChildPong(thisChildId)
+                      cloudSync.clearRemoteCommand(thisChildId)
+                    }
                     "REQUEST_GPS_NOW", "REQUEST_OFFLINE_SYNC" -> {
                       if (!com.example.location.LiveLocationTracker.isEmulator() && com.example.location.LiveLocationTracker.isGpsTrackingAllowed) {
                         val batt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(context)

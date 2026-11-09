@@ -11,6 +11,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,12 +21,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -76,14 +80,19 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -127,6 +136,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private fun formatPcTimestamp(ms: Long): String =
+  if (ms <= 0L) "" else SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(ms))
 
 private fun formatDurationRu(totalSeconds: Long): String {
   val sec = totalSeconds.coerceAtLeast(0L)
@@ -203,6 +215,8 @@ fun PcControlScreen(
   var showFullPcScreenDialog by rememberSaveable { mutableStateOf(false) }
   var showCustomDateRangeDialog by remember { mutableStateOf(false) }
   var expandedEntryName by remember { mutableStateOf<String?>(null) }
+  // История ПК не должна смешивать пользователей Windows: "" = все, иначе выбранная учётка.
+  var selectedHistoryUser by rememberSaveable { mutableStateOf("") }
 
   var ipInput by remember(pcState.lanIp) { mutableStateOf(pcState.lanIp) }
   var portInput by remember(pcState.port) { mutableStateOf(pcState.port.toString()) }
@@ -230,6 +244,13 @@ fun PcControlScreen(
   var pcRecordingSeconds by remember { mutableIntStateOf(0) }
   var recordedPcVideoUri by remember { mutableStateOf<Uri?>(null) }
   var autoRefreshScreen by rememberSaveable { mutableStateOf(true) }
+  // Полноэкранный плеер: щипок = зум, панорамирование двумя пальцами, HUD
+  // скрывается через 3 с бездействия и возвращается одиночным тапом.
+  var pcZoom by rememberSaveable { mutableStateOf(1f) }
+  var pcPanX by rememberSaveable { mutableStateOf(0f) }
+  var pcPanY by rememberSaveable { mutableStateOf(0f) }
+  var pcHudVisible by remember { mutableStateOf(true) }
+  var pcHudInteraction by remember { mutableIntStateOf(0) }
   // Качество сохраняем между поворотами и перезапусками: иначе после поворота
   // HD сбрасывался на «Баланс» 640×360.
   var pcStreamQuality by rememberSaveable(
@@ -240,6 +261,14 @@ fun PcControlScreen(
   ) { mutableStateOf(PcBlockerClient.savedStreamQuality()) }
   LaunchedEffect(pcStreamQuality) {
     PcBlockerClient.saveStreamQuality(pcStreamQuality)
+  }
+
+  // Автоскрытие полупрозрачного меню: 3 секунды без касаний/зума и оверлеи уходят.
+  LaunchedEffect(showFullPcScreenDialog, pcHudVisible, pcHudInteraction, pcZoom) {
+    if (showFullPcScreenDialog && pcHudVisible) {
+      delay(3_000L)
+      pcHudVisible = false
+    }
   }
 
   val liveFrame by PcBlockerClient.liveFrame.collectAsState()
@@ -751,6 +780,70 @@ fun PcControlScreen(
             }
           }
 
+          // Все учётные записи Windows: переключение одним тапом, чтобы блокировать
+          // не только raufh, но и любого другого пользователя этого ПК.
+          val allWindowsUsers = remember(
+            pcState.windowsUsers,
+            fl.childAccount,
+            pcState.activeWindows,
+            pcState.activityByUser
+          ) {
+            (
+              pcState.windowsUsers +
+                pcState.activeWindows.map { it.user } +
+                pcState.activityByUser.map { it.user } +
+                listOf(fl.childAccount)
+              )
+              .map { it.trim() }
+              .filter {
+                it.isNotBlank() &&
+                  !it.equals("SYSTEM", ignoreCase = true) &&
+                  !it.equals("User", ignoreCase = true)
+              }
+              .distinctBy { it.lowercase() }
+          }
+          if (allWindowsUsers.isNotEmpty()) {
+            Column(modifier = Modifier.fillMaxWidth()) {
+              Text(
+                text = "👤 Учётные записи Windows на этом ПК — выберите, кого блокировать:",
+                color = Slate400,
+                fontSize = 10.sp,
+                maxLines = 2
+              )
+              Row(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+              ) {
+                allWindowsUsers.forEach { winUser ->
+                  val selected = childAccountInput.trim().equals(winUser, ignoreCase = true) ||
+                    (childAccountInput.isBlank() && fl.childAccount.equals(winUser, ignoreCase = true))
+                  Box(
+                    modifier = Modifier
+                      .clip(RoundedCornerShape(50))
+                      .background(if (selected) CyanLight.copy(alpha = 0.22f) else Slate950)
+                      .border(1.dp, if (selected) CyanLight else Slate800, RoundedCornerShape(50))
+                      .clickable {
+                        childAccountInput = winUser
+                        PcBlockerClient.selectFullPcLockAccount(winUser)
+                      }
+                      .padding(horizontal = 10.dp, vertical = 6.dp)
+                      .testTag("pc_full_lock_user_$winUser")
+                  ) {
+                    Text(
+                      text = winUser,
+                      color = if (selected) CyanLight else Slate200,
+                      fontSize = 11.sp,
+                      fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                      maxLines = 1
+                    )
+                  }
+                }
+              }
+            }
+          }
+
           Spacer(modifier = Modifier.height(10.dp))
 
           Button(
@@ -1033,6 +1126,67 @@ fun PcControlScreen(
             }
           }
 
+          // HD-скриншот и HD-запись выполняет сам ПК-агент: файл сохраняется на диск
+          // компьютера в исходном разрешении (без сжатия в превью 800×450).
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            OutlinedButton(
+              onClick = { PcBlockerClient.requestPcScreenshotHd() },
+              shape = RoundedCornerShape(10.dp),
+              modifier = Modifier
+                .weight(1f)
+                .height(40.dp)
+                .testTag("pc_screenshot_hd_button")
+            ) {
+              Icon(Icons.Default.CameraAlt, contentDescription = null, tint = CyanLight, modifier = Modifier.size(15.dp))
+              Spacer(modifier = Modifier.width(4.dp))
+              Text("HD-кадр на ПК", color = CyanLight, fontSize = 11.sp, maxLines = 1)
+            }
+            OutlinedButton(
+              onClick = {
+                if (pcState.pcRecordingActive) PcBlockerClient.stopPcRecording()
+                else PcBlockerClient.startPcRecording()
+              },
+              shape = RoundedCornerShape(10.dp),
+              modifier = Modifier
+                .weight(1f)
+                .height(40.dp)
+                .testTag("pc_record_hd_button")
+            ) {
+              Icon(
+                imageVector = if (pcState.pcRecordingActive) Icons.Default.Stop else Icons.Default.FiberManualRecord,
+                contentDescription = null,
+                tint = if (pcState.pcRecordingActive) RoseLock else CyanLight,
+                modifier = Modifier.size(15.dp)
+              )
+              Spacer(modifier = Modifier.width(4.dp))
+              Text(
+                text = if (pcState.pcRecordingActive) "Стоп ${pcState.pcRecordingSeconds}с" else "REC HD на ПК",
+                color = if (pcState.pcRecordingActive) RoseLock else CyanLight,
+                fontSize = 11.sp,
+                maxLines = 1
+              )
+            }
+          }
+          val hdMediaInfo = when {
+            pcState.pcRecordingActive -> "🔴 ПК пишет экран: ${pcState.pcRecordingPath.ifBlank { "…" }} (${pcState.pcRecordingFrames} кадров)"
+            pcState.pcRecordingPath.isNotBlank() -> "🎥 Последняя запись ПК: ${pcState.pcRecordingPath}"
+            pcState.lastScreenshotPath.isNotBlank() -> "📸 Последний HD-кадр: ${pcState.lastScreenshotPath}"
+            else -> null
+          }
+          if (hdMediaInfo != null) {
+            Text(
+              text = hdMediaInfo,
+              color = if (pcState.pcRecordingActive) RoseLock else Slate400,
+              fontSize = 10.sp,
+              maxLines = 2,
+              overflow = TextOverflow.Ellipsis
+            )
+          }
+
           if (pcState.activeWindows.isEmpty()) {
             Text(
               text = "Когда ребёнок откроет видео, браузер или игру на ПК, здесь сразу появится название и кнопка быстрого просмотра.",
@@ -1284,19 +1438,43 @@ fun PcControlScreen(
           .flatten()
       }
 
-      val displayProcs: List<PcActivityItem> = remember(filteredSqlProcs, fallbackDatedUsers) {
+      // Время запуска приходит с ПК ("started"), а SQLite-агрегат его не хранит —
+      // подстраховываемся значением из последнего пакета PC_STATE.
+      val fallbackProcStart = remember(fallbackDatedUsers) {
+        fallbackDatedUsers
+          .flatMap { it.procs }
+          .filter { it.startedAtMs > 0L }
+          .groupBy { it.label.lowercase().trim() }
+          .mapValues { (_, items) -> items.minOf { it.startedAtMs } }
+      }
+      val fallbackTitleStart = remember(fallbackDatedUsers) {
+        fallbackDatedUsers
+          .flatMap { it.titles }
+          .filter { it.startedAtMs > 0L }
+          .groupBy { it.label.lowercase().trim() }
+          .mapValues { (_, items) -> items.minOf { it.startedAtMs } }
+      }
+
+      val displayProcs: List<PcActivityItem> = remember(filteredSqlProcs, fallbackDatedUsers, fallbackProcStart) {
         if (filteredSqlProcs.isNotEmpty()) {
           filteredSqlProcs.map {
-            PcActivityItem(label = it.packageName, seconds = it.totalDurationSeconds.toInt())
+            PcActivityItem(
+              label = it.packageName,
+              seconds = it.totalDurationSeconds.toInt(),
+              startedAtMs = fallbackProcStart[it.packageName.lowercase().trim()] ?: 0L,
+              userName = it.appName
+            )
           }
         } else {
           fallbackDatedUsers
-            .flatMap { it.procs }
-            .groupBy { it.label.lowercase().trim() }
+            .flatMap { u -> u.procs.map { p -> p.copy(userName = u.user) } }
+            .groupBy { it.userName.lowercase().trim() + "|" + it.label.lowercase().trim() }
             .map { (_, items) ->
               PcActivityItem(
                 label = items.first().label,
-                seconds = items.sumOf { it.seconds }
+                seconds = items.sumOf { it.seconds },
+                startedAtMs = items.mapNotNull { i -> i.startedAtMs.takeIf { it > 0L } }.minOrNull() ?: 0L,
+                userName = items.first().userName
               )
             }
             .filter { it.seconds > 0 }
@@ -1304,44 +1482,84 @@ fun PcControlScreen(
         }
       }
 
-      val displayTitles: List<PcActivityItem> = remember(filteredSqlTitles, fallbackDatedUsers) {
+      val displayTitles: List<PcActivityItem> = remember(filteredSqlTitles, fallbackDatedUsers, fallbackTitleStart) {
         if (filteredSqlTitles.isNotEmpty()) {
           filteredSqlTitles.map {
-            PcActivityItem(label = it.windowTitle, seconds = it.totalDurationSeconds.toInt())
+            PcActivityItem(
+              label = it.windowTitle,
+              seconds = it.totalDurationSeconds.toInt(),
+              startedAtMs = fallbackTitleStart[it.windowTitle.lowercase().trim()] ?: 0L,
+              userName = it.appName
+            )
           }
         } else {
           fallbackDatedUsers
-            .flatMap { it.titles }
-            .groupBy { it.label.lowercase().trim() }
+            .flatMap { u -> u.titles.map { t -> t.copy(userName = u.user) } }
+            .groupBy { it.userName.lowercase().trim() + "|" + it.label.lowercase().trim() }
             .map { (_, items) ->
               PcActivityItem(
                 label = items.first().label,
-                seconds = items.sumOf { it.seconds }
+                seconds = items.sumOf { it.seconds },
+                startedAtMs = items.mapNotNull { i -> i.startedAtMs.takeIf { it > 0L } }.minOrNull() ?: 0L,
+                userName = items.first().userName
               )
             }
             .filter { it.seconds > 0 }
             .sortedByDescending { it.seconds }
         }
+      }
+
+      val historyUsers = remember(
+        filteredSqlProcs,
+        filteredSqlTitles,
+        fallbackDatedUsers,
+        pcState.windowsUsers
+      ) {
+        (
+          filteredSqlProcs.map { it.appName } +
+            filteredSqlTitles.map { it.appName } +
+            fallbackDatedUsers.map { it.user } +
+            pcState.windowsUsers
+          )
+          .map { it.trim() }
+          .filter { it.isNotBlank() && !it.equals("Windows", ignoreCase = true) }
+          .distinctBy { it.lowercase() }
+      }
+
+      val detectedWinUserForHistory = remember(historyUsers, pcState.fullLock.childAccount) {
+        historyUsers.firstOrNull()
+          ?: pcState.fullLock.childAccount.takeIf { it.isNotBlank() }
+          ?: "Windows"
+      }
+
+      val visibleProcs = remember(displayProcs, selectedHistoryUser) {
+        if (selectedHistoryUser.isBlank()) displayProcs
+        else displayProcs.filter { it.userName.equals(selectedHistoryUser, ignoreCase = true) }
+      }
+      val visibleTitles = remember(displayTitles, selectedHistoryUser) {
+        if (selectedHistoryUser.isBlank()) displayTitles
+        else displayTitles.filter { it.userName.equals(selectedHistoryUser, ignoreCase = true) }
       }
 
       val totalActiveSecondsForSelectedRange: Long = remember(
         filteredSqlTotalSeconds,
         displayProcs,
-        displayTitles
+        displayTitles,
+        visibleProcs,
+        visibleTitles,
+        selectedHistoryUser
       ) {
         when {
+          selectedHistoryUser.isNotBlank() && visibleProcs.isNotEmpty() ->
+            visibleProcs.sumOf { it.seconds.toLong() }
+          selectedHistoryUser.isNotBlank() && visibleTitles.isNotEmpty() ->
+            visibleTitles.sumOf { it.seconds.toLong() }
+          selectedHistoryUser.isNotBlank() -> 0L
           filteredSqlTotalSeconds > 0L -> filteredSqlTotalSeconds
           displayProcs.isNotEmpty() -> displayProcs.sumOf { it.seconds.toLong() }
           displayTitles.isNotEmpty() -> displayTitles.sumOf { it.seconds.toLong() }
           else -> 0L
         }
-      }
-
-      val detectedWinUserForHistory = remember(filteredSqlProcs, fallbackDatedUsers, pcState.fullLock.childAccount) {
-        filteredSqlProcs.firstOrNull()?.appName?.takeIf { it.isNotBlank() }
-          ?: fallbackDatedUsers.firstOrNull()?.user?.takeIf { it.isNotBlank() }
-          ?: pcState.fullLock.childAccount.takeIf { it.isNotBlank() }
-          ?: "Windows"
       }
 
       val periodShortSuffix = when (dateFilterState.preset) {
@@ -1519,7 +1737,53 @@ fun PcControlScreen(
             }
           }
 
-          if (displayProcs.isEmpty() && displayTitles.isEmpty()) {
+          if (historyUsers.isNotEmpty()) {
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+              horizontalArrangement = Arrangement.spacedBy(6.dp),
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Text("👤 Учётка:", color = Slate400, fontSize = 10.sp)
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(50))
+                  .background(if (selectedHistoryUser.isBlank()) CyanLight.copy(alpha = 0.22f) else Slate950)
+                  .border(1.dp, if (selectedHistoryUser.isBlank()) CyanLight else Slate800, RoundedCornerShape(50))
+                  .clickable { selectedHistoryUser = "" }
+                  .padding(horizontal = 9.dp, vertical = 4.dp)
+              ) {
+                Text(
+                  text = "Все",
+                  color = if (selectedHistoryUser.isBlank()) CyanLight else Slate200,
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold
+                )
+              }
+              historyUsers.forEach { winUser ->
+                val selected = selectedHistoryUser.equals(winUser, ignoreCase = true)
+                Box(
+                  modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(if (selected) CyanLight.copy(alpha = 0.22f) else Slate950)
+                    .border(1.dp, if (selected) CyanLight else Slate800, RoundedCornerShape(50))
+                    .clickable { selectedHistoryUser = winUser }
+                    .padding(horizontal = 9.dp, vertical = 4.dp)
+                ) {
+                  Text(
+                    text = winUser,
+                    color = if (selected) CyanLight else Slate200,
+                    fontSize = 10.sp,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    maxLines = 1
+                  )
+                }
+              }
+            }
+          }
+
+          if (visibleProcs.isEmpty() && visibleTitles.isEmpty()) {
             Box(
               modifier = Modifier
                 .fillMaxWidth()
@@ -1539,7 +1803,11 @@ fun PcControlScreen(
             }
           } else {
             Text(
-              text = "👤 Пользователь Windows: $detectedWinUserForHistory",
+              text = if (selectedHistoryUser.isBlank()) {
+                "👤 Учётные записи: ${historyUsers.joinToString(", ").ifBlank { detectedWinUserForHistory }}"
+              } else {
+                "👤 Пользователь Windows: $selectedHistoryUser"
+              },
               color = CyanLight,
               fontWeight = FontWeight.Bold,
               fontSize = 13.sp,
@@ -1547,7 +1815,7 @@ fun PcControlScreen(
               overflow = TextOverflow.Ellipsis
             )
 
-            if (displayProcs.isNotEmpty()) {
+            if (visibleProcs.isNotEmpty()) {
               Text(
                 text = "Программы (.exe) $periodShortSuffix:",
                 color = Slate400,
@@ -1556,7 +1824,7 @@ fun PcControlScreen(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
               )
-              displayProcs.forEach { procItem ->
+              visibleProcs.forEach { procItem ->
                 Row(
                   modifier = Modifier
                     .fillMaxWidth()
@@ -1569,7 +1837,11 @@ fun PcControlScreen(
                 ) {
                   Column(modifier = Modifier.weight(1f)) {
                     Text(
-                      text = procItem.label,
+                      text = if (selectedHistoryUser.isBlank() && procItem.userName.isNotBlank()) {
+                        "${procItem.userName}: ${procItem.label}"
+                      } else {
+                        procItem.label
+                      },
                       color = Color.White,
                       fontSize = 13.sp,
                       fontWeight = FontWeight.SemiBold,
@@ -1577,8 +1849,13 @@ fun PcControlScreen(
                       overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                      text = "${formatDurationRu(procItem.seconds.toLong())} $periodShortSuffix",
-                      color = Slate400,
+                      text = buildString {
+                        append("${formatDurationRu(procItem.seconds.toLong())} $periodShortSuffix")
+                        if (procItem.startedAtMs > 0L) {
+                          append(" • запуск ${formatPcTimestamp(procItem.startedAtMs)}")
+                        }
+                      },
+                      color = if (procItem.startedAtMs > 0L) CyanLight.copy(alpha = 0.85f) else Slate400,
                       fontSize = 11.sp,
                       maxLines = 1,
                       overflow = TextOverflow.Ellipsis
@@ -1603,7 +1880,7 @@ fun PcControlScreen(
               }
             }
 
-            if (displayTitles.isNotEmpty()) {
+            if (visibleTitles.isNotEmpty()) {
               Text(
                 text = "Что смотрел в браузере и окнах $periodShortSuffix:",
                 color = Slate400,
@@ -1612,7 +1889,7 @@ fun PcControlScreen(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
               )
-              displayTitles.forEach { titleItem ->
+              visibleTitles.forEach { titleItem ->
                 Row(
                   modifier = Modifier
                     .fillMaxWidth()
@@ -1625,7 +1902,11 @@ fun PcControlScreen(
                 ) {
                   Column(modifier = Modifier.weight(1f)) {
                     Text(
-                      text = cleanPcWindowTitle(titleItem.label),
+                      text = if (selectedHistoryUser.isBlank() && titleItem.userName.isNotBlank()) {
+                        "${titleItem.userName}: ${cleanPcWindowTitle(titleItem.label)}"
+                      } else {
+                        cleanPcWindowTitle(titleItem.label)
+                      },
                       color = Color.White,
                       fontSize = 12.sp,
                       fontWeight = FontWeight.SemiBold,
@@ -1633,8 +1914,13 @@ fun PcControlScreen(
                       overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                      text = "${formatDurationRu(titleItem.seconds.toLong())} $periodShortSuffix",
-                      color = Slate400,
+                      text = buildString {
+                        append("${formatDurationRu(titleItem.seconds.toLong())} $periodShortSuffix")
+                        if (titleItem.startedAtMs > 0L) {
+                          append(" • открыто ${formatPcTimestamp(titleItem.startedAtMs)}")
+                        }
+                      },
+                      color = if (titleItem.startedAtMs > 0L) CyanLight.copy(alpha = 0.85f) else Slate400,
                       fontSize = 11.sp,
                       maxLines = 1,
                       overflow = TextOverflow.Ellipsis
@@ -1701,80 +1987,202 @@ fun PcControlScreen(
       }
 
       // Полноэкранный режим: кадр ПК занимает весь экран, элементы управления —
-      // полупрозрачные оверлеи сверху/снизу, а не отдельные панели, отнимающие место.
+      // полупрозрачные оверлеи. Щипок = зум 1…5x, два пальца = панорама,
+      // одиночный тап = показать/скрыть меню, бездействие 3 с = автоскрытие.
+      var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+      val closeFullscreen = {
+        showFullPcScreenDialog = false
+        pcZoom = 1f
+        pcPanX = 0f
+        pcPanY = 0f
+        pcHudVisible = true
+      }
       Box(
         modifier = Modifier
           .fillMaxSize()
           .background(Color.Black)
+          .onSizeChanged { viewportSize = it }
+          .pointerInput(Unit) {
+            detectTransformGestures { _, pan, zoom, _ ->
+              val newScale = (pcZoom * zoom).coerceIn(1f, 5f)
+              val maxX = (viewportSize.width * (newScale - 1f)) / 2f
+              val maxY = (viewportSize.height * (newScale - 1f)) / 2f
+              pcZoom = newScale
+              if (newScale <= 1.02f) {
+                pcPanX = 0f
+                pcPanY = 0f
+              } else {
+                pcPanX = (pcPanX + pan.x).coerceIn(-maxX, maxX)
+                pcPanY = (pcPanY + pan.y).coerceIn(-maxY, maxY)
+              }
+              pcHudInteraction++
+            }
+          }
+          .pointerInput(Unit) {
+            detectTapGestures(
+              onTap = {
+                pcHudVisible = !pcHudVisible
+                pcHudInteraction++
+              },
+              onDoubleTap = {
+                if (pcZoom > 1.05f) {
+                  pcZoom = 1f
+                  pcPanX = 0f
+                  pcPanY = 0f
+                } else {
+                  pcZoom = 2.5f
+                }
+                pcHudVisible = true
+                pcHudInteraction++
+              }
+            )
+          }
       ) {
         Image(
           bitmap = fullBmp.asImageBitmap(),
           contentDescription = "Полный экран ПК",
           contentScale = ContentScale.Fit,
-          modifier = Modifier.fillMaxSize()
+          modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer {
+              scaleX = pcZoom
+              scaleY = pcZoom
+              translationX = pcPanX
+              translationY = pcPanY
+            }
         )
 
-        Row(
-          modifier = Modifier
-            .align(Alignment.TopCenter)
-            .fillMaxWidth()
-            .background(Color.Black.copy(alpha = 0.55f))
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-          verticalAlignment = Alignment.CenterVertically
-        ) {
-          Column(modifier = Modifier.weight(1f)) {
-            Text(
-              text = "🖥 ${pcState.pcName}",
-              color = Color.White,
-              fontSize = 14.sp,
-              fontWeight = FontWeight.ExtraBold,
-              maxLines = 1,
-              overflow = TextOverflow.Ellipsis
-            )
-            Text(
-              text = if (liveFrame != null) {
-                "🟢 ${streamStatus.fps} к/с • ${pcStreamQuality.label} • кадр $frameTimeStr"
-              } else {
-                "⏳ Подключение к потоку… ($frameTimeStr)"
-              },
-              color = if (liveFrame != null) EmeraldShieldLight else CyanLight,
-              fontSize = 10.sp,
-              maxLines = 1,
-              overflow = TextOverflow.Ellipsis
-            )
-          }
-          androidx.compose.material3.TextButton(onClick = { showFullPcScreenDialog = false }) {
-            Text("✕", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-          }
-        }
-
-        Row(
-          modifier = Modifier
-            .align(Alignment.BottomCenter)
-            .fillMaxWidth()
-            .background(Color.Black.copy(alpha = 0.55f))
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-          horizontalArrangement = Arrangement.SpaceBetween,
-          verticalAlignment = Alignment.CenterVertically
-        ) {
-          Text(
-            text = "Качество: ${pcStreamQuality.label} (${pcStreamQuality.width}×${pcStreamQuality.height})",
-            color = Slate200,
-            fontSize = 10.sp,
-            maxLines = 1
-          )
+        if (pcHudVisible) {
           Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier
+              .align(Alignment.TopCenter)
+              .fillMaxWidth()
+              .background(Color.Black.copy(alpha = 0.45f))
+              .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically
           ) {
-            androidx.compose.material3.TextButton(onClick = { PcBlockerClient.requestPcScreenshot() }) {
-              Text("Кадр", color = CyanLight, fontSize = 11.sp)
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = "🖥 ${pcState.pcName}",
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.ExtraBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+              )
+              Text(
+                text = if (liveFrame != null) {
+                  "🟢 ${streamStatus.fps} к/с • ${pcStreamQuality.label} • кадр $frameTimeStr • ${(pcZoom * 100).toInt()}%"
+                } else {
+                  "⏳ Подключение к потоку… ($frameTimeStr)"
+                },
+                color = if (liveFrame != null) EmeraldShieldLight else CyanLight,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+              )
+            }
+            TextButton(onClick = closeFullscreen) {
+              Text("✕", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            }
+          }
+
+          Column(
+            modifier = Modifier
+              .align(Alignment.BottomCenter)
+              .fillMaxWidth()
+              .background(Color.Black.copy(alpha = 0.45f))
+              .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+          ) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.spacedBy(6.dp),
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Text("Качество:", color = Slate200, fontSize = 10.sp)
+              PcStreamQuality.values().forEach { option ->
+                val selected = pcStreamQuality == option
+                Box(
+                  modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (selected) CyanLight.copy(alpha = 0.25f) else Color.Black.copy(alpha = 0.35f))
+                    .border(1.dp, if (selected) CyanLight else Slate800, RoundedCornerShape(8.dp))
+                    .clickable {
+                      pcStreamQuality = option
+                      pcHudInteraction++
+                    }
+                    .padding(horizontal = 6.dp, vertical = 3.dp)
+                ) {
+                  Text(
+                    text = option.label,
+                    color = if (selected) CyanLight else Slate200,
+                    fontSize = 9.sp,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    maxLines = 1
+                  )
+                }
+              }
+            }
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+              ) {
+                TextButton(onClick = {
+                  PcBlockerClient.requestPcScreenshotHd()
+                  pcHudInteraction++
+                }) {
+                  Text("📸 HD-кадр", color = CyanLight, fontSize = 11.sp)
+                }
+                TextButton(onClick = {
+                  if (pcState.pcRecordingActive) {
+                    PcBlockerClient.stopPcRecording()
+                  } else {
+                    PcBlockerClient.startPcRecording()
+                  }
+                  pcHudInteraction++
+                }) {
+                  Icon(
+                    imageVector = if (pcState.pcRecordingActive) Icons.Default.Stop else Icons.Default.FiberManualRecord,
+                    contentDescription = null,
+                    tint = if (pcState.pcRecordingActive) RoseLock else Color.White,
+                    modifier = Modifier.size(13.dp)
+                  )
+                  Spacer(modifier = Modifier.width(3.dp))
+                  Text(
+                    text = if (pcState.pcRecordingActive) "Стоп ${pcState.pcRecordingSeconds}с" else "REC HD",
+                    color = if (pcState.pcRecordingActive) RoseLock else Color.White,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                  )
+                }
+              }
+              Text(
+                text = when {
+                  pcState.pcRecordingActive -> "● REC"
+                  streamStatus.isActive -> "● LIVE"
+                  else -> "⏸ ПАУЗА"
+                },
+                color = when {
+                  pcState.pcRecordingActive -> RoseLock
+                  streamStatus.isActive -> EmeraldShieldLight
+                  else -> AmberWarning
+                },
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold
+              )
             }
             Text(
-              text = if (streamStatus.isActive) "● LIVE" else "⏸ ПАУЗА",
-              color = if (streamStatus.isActive) EmeraldShieldLight else AmberWarning,
-              fontSize = 11.sp,
-              fontWeight = FontWeight.Bold
+              text = "Щипок — зум • 2 пальца — панорама • 2x тап — 250% • 1 тап — меню",
+              color = Slate400,
+              fontSize = 9.sp,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis
             )
           }
         }

@@ -362,7 +362,7 @@ interface KidsGuardDao {
   @Query("""
     SELECT
       packageName AS packageName,
-      MAX(appName) AS appName,
+      appName AS appName,
       '' AS windowTitle,
       deviceType AS deviceType,
       COALESCE(SUM(durationSeconds), 0) AS totalDurationSeconds,
@@ -373,7 +373,7 @@ interface KidsGuardDao {
       AND windowTitle = ''
       AND packageName != '__computer__'
       AND timestamp BETWEEN :startTimestamp AND :endTimestamp
-    GROUP BY LOWER(TRIM(packageName))
+    GROUP BY LOWER(TRIM(packageName)), appName
     HAVING totalDurationSeconds > 0
     ORDER BY totalDurationSeconds DESC
   """)
@@ -390,7 +390,7 @@ interface KidsGuardDao {
   @Query("""
     SELECT
       MAX(packageName) AS packageName,
-      MAX(appName) AS appName,
+      appName AS appName,
       windowTitle AS windowTitle,
       deviceType AS deviceType,
       COALESCE(SUM(durationSeconds), 0) AS totalDurationSeconds,
@@ -400,7 +400,7 @@ interface KidsGuardDao {
       AND deviceType = :deviceType
       AND windowTitle != ''
       AND timestamp BETWEEN :startTimestamp AND :endTimestamp
-    GROUP BY LOWER(TRIM(windowTitle))
+    GROUP BY LOWER(TRIM(windowTitle)), appName
     HAVING totalDurationSeconds > 0
     ORDER BY totalDurationSeconds DESC
   """)

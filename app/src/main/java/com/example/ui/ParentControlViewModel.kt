@@ -442,22 +442,28 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     }
 
     // Lightweight heartbeat:
-    // - In PARENT mode: sends PARENT_ONLINE_HEARTBEAT every 35s so Child knows Parent is actively viewing and flushes SQLite cache.
+    // - In PARENT mode: PING каждые 10 с + полный PARENT_ONLINE_HEARTBEAT раз в 40 с.
+    //   PING даёт короткий таймаут «Оффлайн» (30 с), не дёргая GPS и выгрузку истории.
     // - In CHILD mode: checks 00:00 midnight reset and updates battery/location ONLY when Parent is actively connected.
     viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+      var heartbeatTick = 0
       while (true) {
         com.example.util.DeviceUsageTracker.ensureDailyMidnightReset(getApplication())
         if (_deviceRole.value == AppRole.PARENT) {
           val targetChildId = activeChild.value?.id ?: allChildren.value.firstOrNull()?.id ?: 0L
           if (targetChildId > 0L) {
-            repository.sendRemoteCloudCommand(targetChildId, "PARENT_ONLINE_HEARTBEAT", "1")
-            // Высокоточный GPS ребёнку нужен только когда открыта карта, а не всегда,
-            // пока приложение родителя просто запущено.
-            if (_activeParentTab.value == ParentTab.LOCATION_MAP) {
-              repository.sendRemoteCloudCommand(targetChildId, "MAP_VIEWING", "1")
+            repository.sendRemoteCloudCommand(targetChildId, "PING", "1")
+            if (heartbeatTick % 4 == 0) {
+              repository.sendRemoteCloudCommand(targetChildId, "PARENT_ONLINE_HEARTBEAT", "1")
+              // Высокоточный GPS ребёнку нужен только когда открыта карта, а не всегда,
+              // пока приложение родителя просто запущено.
+              if (_activeParentTab.value == ParentTab.LOCATION_MAP) {
+                repository.sendRemoteCloudCommand(targetChildId, "MAP_VIEWING", "1")
+              }
             }
           }
-          kotlinx.coroutines.delay(35_000L)
+          heartbeatTick++
+          kotlinx.coroutines.delay(10_000L)
           continue
         }
         if (_deviceRole.value == AppRole.CHILD && !com.example.location.LiveLocationTracker.isEmulator()) {

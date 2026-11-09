@@ -546,6 +546,16 @@ class KidsGuardBackgroundService : Service() {
                       "SET_LIMIT" -> {
                         payload.toIntOrNull()?.let { dao.setChildDailyLimit(activeChildId, it) }
                       }
+                      "PING" -> {
+                        // Дешёвый ping-pong для честного индикатора «Онлайн»: без GPS,
+                        // без выгрузки истории — только присутствие и свежая батарея.
+                        com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
+                        val pingBatt = readBatteryLevel()
+                        dao.updateChildBattery(activeChildId, pingBatt)
+                        cloudSync.upsertBatteryLevel(activeChildId, pingBatt)
+                        com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
                       "PARENT_ONLINE_HEARTBEAT", "REQUEST_GPS_NOW", "REQUEST_OFFLINE_SYNC" -> {
                         com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
                         val freshBatt = readBatteryLevel()

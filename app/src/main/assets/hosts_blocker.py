@@ -58,8 +58,8 @@ except ImportError:
 IS_WIN = os.name == "nt"
 
 # Версия скрипта: по ней приложение/панель понимают, что на ПК действительно новый файл.
-SCRIPT_VERSION = "5.4"
-SCRIPT_BUILD = "2026-11-04"
+SCRIPT_VERSION = "5.5"
+SCRIPT_BUILD = "2026-11-09"
 if IS_WIN:
     import winreg
 
@@ -1634,6 +1634,19 @@ def default_full_lock():
     return {"now": False, "daily": 0, "total": 0, "from": "", "to": ""}
 
 
+def _full_lock_usage(cfg, u):
+    """Время для лимитов блокировки: по выбранной учётке Windows, иначе общее."""
+    acct = str(cfg.get("child_account") or "").strip()
+    if acct and acct.lower() != "user":
+        today_sec = activity_seconds_for_user(acct)
+        if today_sec <= 0:
+            # Пользователь ещё не наработал активность сегодня — не подменяем
+            # чужим общим временем, иначе блокировка сработает не для него.
+            today_sec = 0
+        return today_sec, activity_total_seconds_for_user(acct)
+    return int(u["today"].get("__computer__", 0)), int(u["total"].get("__computer__", 0))
+
+
 def full_blocked(cfg, u):
     fl = cfg.get("full_lock") or {}
     if fl.get("now"):
@@ -1644,9 +1657,10 @@ def full_blocked(cfg, u):
         return False
     if frm and to and not in_window({"from": frm, "to": to}):
         return True
-    if daily and u["today"].get("__computer__", 0) >= daily * 60:
+    today_sec, total_sec = _full_lock_usage(cfg, u)
+    if daily and today_sec >= daily * 60:
         return True
-    if total and u["total"].get("__computer__", 0) >= total * 60:
+    if total and total_sec >= total * 60:
         return True
     return False
 
@@ -1658,11 +1672,12 @@ def full_lock_text(cfg, u):
     if full_blocked(cfg, u):
         return "заблокирован по расписанию"
     daily, total = fl.get("daily") or 0, fl.get("total") or 0
+    today_sec, total_sec = _full_lock_usage(cfg, u)
     parts = []
     if daily:
-        parts.append(f"сегодня осталось {max(0, daily * 60 - int(u['today'].get('__computer__', 0))) // 60} мин")
+        parts.append(f"сегодня осталось {max(0, daily * 60 - today_sec) // 60} мин")
     if total:
-        parts.append(f"всего осталось {max(0, total * 60 - int(u['total'].get('__computer__', 0))) // 60} мин")
+        parts.append(f"всего осталось {max(0, total * 60 - total_sec) // 60} мин")
     if fl.get("from") and fl.get("to"):
         parts.append(f"доступ {fl['from']}–{fl['to']}")
     return " · ".join(parts) or "без ограничений"
@@ -1682,6 +1697,54 @@ def list_local_accounts():
         return ""
     r = run_hidden(["net", "user"])
     return _console_decode(r.stdout)
+
+
+_WIN_USERS_CACHE = {"ts": 0.0, "users": []}
+
+
+def list_windows_users():
+    """Список локальных учётных записей Windows для переключения в блокировке ПК.
+
+    `net user` печатает шапку, пунктирную линию, затем имена по 2 в строке.
+    Служебные DefaultAccount/WDAGUtilityAccount не показываем — они не «дети».
+    Кэш 60 с: panel_state вызывается каждые 4 с, а запуск `net user` — дорогой.
+    """
+    if not IS_WIN:
+        return []
+    now = time.time()
+    if now - float(_WIN_USERS_CACHE.get("ts") or 0.0) < 60.0:
+        return list(_WIN_USERS_CACHE.get("users") or [])
+    try:
+        raw = list_local_accounts()
+        lines = raw.splitlines()
+        start = 0
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if len(s) >= 10 and set(s) <= {"-"}:
+                start = i + 1
+                break
+        users = []
+        skip = {"defaultaccount", "wdagutilityaccount", "system"}
+        for line in lines[start:]:
+            s = line.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if low.startswith("the command completed") or "команда выполнена" in low:
+                break
+            for token in s.split():
+                t = token.strip()
+                if not t or t.lower() in skip:
+                    continue
+                if not re.match(r"^[A-Za-zА-Яа-яЁё0-9_.\-]+$", t):
+                    continue
+                if t.lower() not in {u.lower() for u in users}:
+                    users.append(t)
+        _WIN_USERS_CACHE["ts"] = now
+        _WIN_USERS_CACHE["users"] = list(users)
+        return users
+    except Exception:
+        return list(_WIN_USERS_CACHE.get("users") or [])
 
 
 def set_account_active(username, active):
@@ -1858,7 +1921,7 @@ def load_activity_history():
     return {}
 
 
-def save_activity_history_day(day_iso, user, proc_sec, title_sec):
+def save_activity_history_day(day_iso, user, proc_sec, title_sec, proc_started=None, title_started=None):
     try:
         os.makedirs(PUB_DIR, exist_ok=True)
         hist = load_activity_history()
@@ -1867,6 +1930,8 @@ def save_activity_history_day(day_iso, user, proc_sec, title_sec):
             "date": day_iso,
             "proc": dict(proc_sec),
             "titles": dict(title_sec),
+            "proc_started": dict(proc_started or {}),
+            "title_started": dict(title_started or {}),
             "ts": int(time.time() * 1000)
         }
         # Храним последние 30 дней
@@ -1905,6 +1970,63 @@ def load_activity(target_date=None):
         pass
     return res
 
+
+
+_ACT_USER_CACHE = {}
+
+
+def activity_seconds_for_user(user, day_iso=None):
+    """Секунды активности КОНКРЕТНОГО Windows-пользователя за день.
+
+    Нужно для «Полной блокировки ПК»: лимиты/расписание должны считаться по
+    выбранной учётке, а не по общему времени всех сеансов компьютера.
+    """
+    acct = str(user or "").strip()
+    if not acct:
+        return 0
+    day = day_iso or datetime.date.today().isoformat()
+    key = (acct.lower(), day)
+    now = time.time()
+    cached = _ACT_USER_CACHE.get(key)
+    if cached and now - cached[0] < 5.0:
+        return cached[1]
+    seconds = 0
+    try:
+        act = load_activity(day)
+        d = act.get(acct)
+        if d is None:
+            d = next((v for k, v in act.items() if str(k).lower() == acct.lower()), {})
+        seconds = int(sum(((d or {}).get("proc") or {}).values()))
+    except Exception:
+        seconds = 0
+    _ACT_USER_CACHE[key] = (now, seconds)
+    return seconds
+
+
+def activity_total_seconds_for_user(user):
+    """Секунды активности пользователя за все дни 30-дневного архива."""
+    acct = str(user or "").strip()
+    if not acct:
+        return 0
+    key = (acct.lower(), "__total__")
+    now = time.time()
+    cached = _ACT_USER_CACHE.get(key)
+    if cached and now - cached[0] < 30.0:
+        return cached[1]
+    total = 0
+    try:
+        for d in (load_activity_history() or {}).values():
+            if not isinstance(d, dict):
+                continue
+            ud = d.get(acct)
+            if not isinstance(ud, dict):
+                ud = next((v for k, v in d.items() if str(k).lower() == acct.lower()), None)
+            if isinstance(ud, dict):
+                total += int(sum((ud.get("proc") or {}).values()))
+    except Exception:
+        total = 0
+    _ACT_USER_CACHE[key] = (now, total)
+    return total
 
 
 def top_activity(d, n=8, min_seconds=15):
@@ -2051,9 +2173,9 @@ def stream_touch(duration=25.0, fps=None, w=None, h=None, quality=None, channel=
             if fps is not None:
                 STREAM_ST["fps"] = max(1.0, min(12.0, float(fps)))
             if w is not None:
-                STREAM_ST["w"] = max(320, min(1600, int(w)))
+                STREAM_ST["w"] = max(320, min(1920, int(w)))
             if h is not None:
-                STREAM_ST["h"] = max(180, min(900, int(h)))
+                STREAM_ST["h"] = max(180, min(1080, int(h)))
             if quality is not None:
                 STREAM_ST["quality"] = max(25, min(90, int(quality)))
             if binary is not None:
@@ -2097,8 +2219,8 @@ def stream_params():
     with STREAM_LOCK:
         p = dict(STREAM_ST)
     fps = max(1.0, min(12.0, float(p.get("fps") or 4.0)))
-    w = max(320, min(1600, int(p.get("w") or 640))) // 2 * 2
-    h = max(180, min(900, int(p.get("h") or 360))) // 2 * 2
+    w = max(320, min(1920, int(p.get("w") or 640))) // 2 * 2
+    h = max(180, min(1080, int(p.get("h") or 360))) // 2 * 2
     q = max(25, min(90, int(p.get("quality") or 50)))
     return {"fps": fps, "w": w, "h": h, "quality": q, "binary": bool(p.get("binary"))}
 
@@ -2157,6 +2279,169 @@ def _is_active_console_session():
         return True
 
 
+# ====================== HD-СКРИНШОТ И HD-ЗАПИСЬ ЭКРАНА ======================
+# Скриншот и запись делает АГЕНТ пользовательского сеанса (он видит реальный рабочий
+# стол), а не SYSTEM-движок: GDI-захват из сессии 0 даёт чёрный экран. Обмен — через
+# маленькие JSON-файлы в PUB_DIR. Запись — AVI/MJPEG в исходном разрешении монитора,
+# JPEG quality 80–90, без пересжатия в 800×450 как у превью.
+RECORD_FLAG = os.path.join(PUB_DIR, "record.json")
+RECORD_STATUS = os.path.join(PUB_DIR, "record_status.json")
+SCREENSHOT_FLAG = os.path.join(PUB_DIR, "screenshot_hd.flag")
+SCREENSHOT_STATUS = os.path.join(PUB_DIR, "screenshot_status.json")
+RECORD_DIR = os.path.join(PUB_DIR, "records")
+SHOT_DIR = os.path.join(PUB_DIR, "screenshots")
+
+
+def _write_json_atomic(path, obj):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+        return True
+    except Exception:
+        return False
+
+
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _native_screen_size():
+    try:
+        w = int(ctypes.windll.user32.GetSystemMetrics(0)) or 1920
+        h = int(ctypes.windll.user32.GetSystemMetrics(1)) or 1080
+        return w, h
+    except Exception:
+        return 1920, 1080
+
+
+def _avi_open(path, width, height, fps):
+    """Открывает AVI (MJPEG, без индекса) и возвращает (file, positions)."""
+    f = open(path, "wb")
+    f.write(b"RIFF")
+    riff_pos = f.tell()
+    f.write(struct.pack("<I", 0))
+    f.write(b"AVI ")
+    f.write(b"LIST")
+    hdrl_pos = f.tell()
+    f.write(struct.pack("<I", 0))
+    f.write(b"hdrl")
+    f.write(b"avih")
+    f.write(struct.pack("<I", 56))
+    avih_pos = f.tell()
+    f.write(struct.pack(
+        "<IIIIIIIIII4I",
+        int(1_000_000 / max(1, fps)), 0, 0, 0, 0, 0, 1,
+        max(1, width * height * 3), width, height, 0, 0, 0, 0
+    ))
+    f.write(b"LIST")
+    strl_pos = f.tell()
+    f.write(struct.pack("<I", 0))
+    f.write(b"strl")
+    f.write(b"strh")
+    f.write(struct.pack("<I", 56))
+    strh_pos = f.tell()
+    f.write(struct.pack(
+        "<4s4sIHHIIIIIIIIhhhh",
+        b"vids", b"MJPG", 0, 0, 0, 0, 1, max(1, fps), 0, 0,
+        max(1, width * height * 3), 0xFFFFFFFF, 0, 0, 0, width, height
+    ))
+    f.write(b"strf")
+    f.write(struct.pack("<I", 40))
+    f.write(struct.pack(
+        "<IiiHH4sIiiII",
+        40, width, height, 1, 24, b"MJPG",
+        width * height * 3, 0, 0, 0, 0
+    ))
+    f.write(b"LIST")
+    movi_pos = f.tell()
+    f.write(struct.pack("<I", 0))
+    f.write(b"movi")
+    return f, {"riff": riff_pos, "hdrl": hdrl_pos, "avih": avih_pos,
+               "strl": strl_pos, "strh": strh_pos, "movi": movi_pos}
+
+
+def _avi_append(f, jpeg):
+    f.write(b"00dc")
+    f.write(struct.pack("<I", len(jpeg)))
+    f.write(jpeg)
+    if len(jpeg) % 2:
+        f.write(b"\x00")
+
+
+def _avi_close(f, pos, frames, fps, max_frame):
+    end = f.tell()
+    f.seek(pos["riff"])
+    f.write(struct.pack("<I", end - 8))
+    f.seek(pos["hdrl"])
+    f.write(struct.pack("<I", pos["movi"] - (pos["hdrl"] + 4)))
+    f.seek(pos["strl"])
+    f.write(struct.pack("<I", pos["movi"] - (pos["strl"] + 4)))
+    f.seek(pos["movi"])
+    f.write(struct.pack("<I", end - (pos["movi"] + 4)))
+    f.seek(pos["avih"] + 4)
+    f.write(struct.pack("<I", max(1, max_frame * max(1, fps))))
+    f.seek(pos["avih"] + 16)
+    f.write(struct.pack("<I", frames))
+    f.seek(pos["strh"] + 32)
+    f.write(struct.pack("<I", frames))
+    f.close()
+
+
+def request_hd_screenshot():
+    """Просит агент пользовательского сеанса сохранить PNG в исходном разрешении."""
+    try:
+        with open(SCREENSHOT_FLAG, "w", encoding="utf-8") as f:
+            f.write(str(int(time.time() * 1000)))
+        return True
+    except Exception:
+        return False
+
+
+def request_record(action, fps=10, quality=85):
+    """start/stop HD-записи силами агента сеанса."""
+    try:
+        _write_json_atomic(RECORD_FLAG, {
+            "action": str(action),
+            "fps": max(2, min(15, int(fps or 10))),
+            "quality": max(60, min(95, int(quality or 85))),
+            "ts": int(time.time() * 1000)
+        })
+        return True
+    except Exception:
+        return False
+
+
+def record_status():
+    st = _read_json(RECORD_STATUS)
+    active = bool(st.get("active", False))
+    return {
+        "active": active,
+        "path": str(st.get("path", "")),
+        "seconds": int(st.get("seconds", 0) or 0),
+        "frames": int(st.get("frames", 0) or 0),
+        "w": int(st.get("w", 0) or 0),
+        "h": int(st.get("h", 0) or 0),
+        "error": str(st.get("error", ""))
+    }
+
+
+def screenshot_status():
+    st = _read_json(SCREENSHOT_STATUS)
+    return {
+        "path": str(st.get("path", "")),
+        "ts": int(st.get("ts", 0) or 0),
+        "w": int(st.get("w", 0) or 0),
+        "h": int(st.get("h", 0) or 0)
+    }
+
+
 def agent_main():
     if not single_instance("Local\\HostsBlockerAgent"):
         return
@@ -2169,6 +2454,8 @@ def agent_main():
     stream_flag = os.path.join(PUB_DIR, "stream.json")
     today = datetime.date.today().isoformat()
     proc_sec, title_sec = {}, {}
+    # Точное время ПЕРВОГО запуска каждой программы/окна за день (epoch ms).
+    proc_started, title_started = {}, {}
     try:
         if os.path.exists(act_path):
             with open(act_path, "r", encoding="utf-8") as f:
@@ -2176,18 +2463,51 @@ def agent_main():
             if saved_act.get("date") == today:
                 proc_sec = dict(saved_act.get("proc") or {})
                 title_sec = dict(saved_act.get("titles") or {})
+                proc_started = dict(saved_act.get("proc_started") or {})
+                title_started = dict(saved_act.get("title_started") or {})
             elif saved_act.get("date"):
                 save_activity_history_day(
                     str(saved_act.get("date")),
                     user,
                     saved_act.get("proc") or {},
-                    saved_act.get("titles") or {}
+                    saved_act.get("titles") or {},
+                    saved_act.get("proc_started") or {},
+                    saved_act.get("title_started") or {}
                 )
     except Exception:
         proc_sec, title_sec = {}, {}
+        proc_started, title_started = {}, {}
     last_close, last_act_save, last_scr, last_agent_write = 0.0, 0.0, 0.0, 0.0
     last_hist_save = 0.0
+    # HD-запись экрана: ведёт её именно агент сеанса (движок SYSTEM видит чёрный экран).
+    rec = {"active": False, "f": None, "pos": None, "path": "", "frames": 0,
+           "started": 0.0, "next": 0.0, "fps": 10.0, "quality": 85,
+           "w": 0, "h": 0, "max": 0}
+    last_rec_poll = 0.0
+
+    def _stop_recording(error=""):
+        if not rec.get("active") and rec.get("f") is None:
+            return
+        try:
+            if rec.get("f") is not None:
+                _avi_close(rec["f"], rec["pos"], int(rec.get("frames") or 0),
+                           float(rec.get("fps") or 10.0), int(rec.get("max") or 0))
+        except Exception:
+            log_error("record stop: " + traceback.format_exc())
+        secs = int(max(0.0, time.time() - float(rec.get("started") or time.time())))
+        _write_json_atomic(RECORD_STATUS, {
+            "active": False, "path": rec.get("path", ""),
+            "frames": int(rec.get("frames") or 0), "seconds": secs,
+            "w": int(rec.get("w") or 0), "h": int(rec.get("h") or 0),
+            "error": error, "ts": int(time.time() * 1000)
+        })
+        rec.update({"active": False, "f": None, "pos": None, "frames": 0,
+                    "next": 0.0, "started": 0.0, "max": 0})
+
     while True:
+        # Пересчитываем на каждом тике: после переключения пользователя старый агент
+        # больше не консольный и не должен снимать/писать чёрный экран.
+        is_console = _is_active_console_session()
         title, proc = foreground_info()
         stream_cfg = None
         try:
@@ -2198,13 +2518,17 @@ def agent_main():
             stream_cfg = None
         day = datetime.date.today().isoformat()
         if day != today:  # новый день — архивируем вчерашний день и считаем активность заново
-            save_activity_history_day(today, user, proc_sec, title_sec)
+            save_activity_history_day(today, user, proc_sec, title_sec, proc_started, title_started)
             today, proc_sec, title_sec = day, {}, {}
+            proc_started, title_started = {}, {}
+        now_mono_ms = int(time.time() * 1000)
         if proc:
             proc_sec[proc] = proc_sec.get(proc, 0) + 1
+            proc_started.setdefault(proc, now_mono_ms)
         key = title.strip()[:70]
         if key:
             title_sec[key] = title_sec.get(key, 0) + 1
+            title_started.setdefault(key, now_mono_ms)
         # Файл активного окна обновляем раз в 3 секунды — этого достаточно, а диск не дёргаем ежесекундно.
         if time.time() - last_agent_write >= 3:
             last_agent_write = time.time()
@@ -2268,6 +2592,104 @@ def agent_main():
                     os.replace(scr_path + ".tmp", scr_path)
                 except Exception:
                     pass
+        # --- HD-скриншот: сохраняем кадр в ИСХОДНОМ разрешении монитора ---
+        if is_console and os.path.exists(SCREENSHOT_FLAG):
+            try:
+                os.remove(SCREENSHOT_FLAG)
+            except Exception:
+                pass
+            try:
+                sw, sh = _native_screen_size()
+                frame = capture_screen_frame(sw, sh, quality=92)
+                if frame:
+                    blob, ctype = frame
+                    ext = "jpg" if ctype == "image/jpeg" else "png"
+                    os.makedirs(SHOT_DIR, exist_ok=True)
+                    name = "shot_%s.%s" % (datetime.datetime.now().strftime("%Y%m%d_%H%M%S"), ext)
+                    shot_path = os.path.join(SHOT_DIR, name)
+                    with open(shot_path + ".tmp", "wb") as f:
+                        f.write(blob)
+                    os.replace(shot_path + ".tmp", shot_path)
+                    _write_json_atomic(SCREENSHOT_STATUS, {
+                        "path": shot_path, "ts": int(time.time() * 1000),
+                        "w": sw, "h": sh, "fmt": ctype, "bytes": len(blob)
+                    })
+                else:
+                    _write_json_atomic(SCREENSHOT_STATUS, {
+                        "path": "", "ts": int(time.time() * 1000),
+                        "error": "GDI не смог снять экран (сеанс неактивен?)"
+                    })
+            except Exception:
+                log_error("screenshot_hd: " + traceback.format_exc())
+
+        # --- HD-запись экрана (AVI/MJPEG, исходное разрешение) ---
+        now_rec = time.time()
+        if is_console and now_rec - last_rec_poll >= 0.5:
+            last_rec_poll = now_rec
+            cmd = _read_json(RECORD_FLAG)
+            action = str(cmd.get("action", "")).strip().lower() if cmd else ""
+            if action:
+                try:
+                    os.remove(RECORD_FLAG)
+                except Exception:
+                    pass
+                if action == "start" and not rec["active"]:
+                    if _PILImage is None:
+                        _write_json_atomic(RECORD_STATUS, {
+                            "active": False, "path": "", "frames": 0, "seconds": 0,
+                            "error": "Для HD-записи нужен Pillow (pip install pillow)"
+                        })
+                    else:
+                        try:
+                            os.makedirs(RECORD_DIR, exist_ok=True)
+                            rw, rh = _native_screen_size()
+                            rfps = float(cmd.get("fps") or 10)
+                            rq = int(cmd.get("quality") or 85)
+                            rpath = os.path.join(
+                                RECORD_DIR,
+                                "screen_%s.avi" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                            )
+                            rf, rpos = _avi_open(rpath, rw, rh, rfps)
+                            rec.update({
+                                "active": True, "f": rf, "pos": rpos, "path": rpath,
+                                "frames": 0, "started": time.time(), "next": 0.0,
+                                "fps": rfps, "quality": rq, "w": rw, "h": rh, "max": 0
+                            })
+                            _write_json_atomic(RECORD_STATUS, {
+                                "active": True, "path": rpath, "frames": 0, "seconds": 0,
+                                "w": rw, "h": rh, "ts": int(time.time() * 1000)
+                            })
+                        except Exception:
+                            _stop_recording("Не удалось начать запись: %s" % traceback.format_exc()[:200])
+                elif action == "stop":
+                    _stop_recording()
+
+        if rec["active"]:
+            if not is_console:
+                _stop_recording("Активный сеанс Windows переключился — запись остановлена")
+            elif now_rec >= float(rec.get("next") or 0.0):
+                try:
+                    frame = capture_screen_frame(
+                        int(rec["w"]), int(rec["h"]), quality=int(rec["quality"])
+                    )
+                    if frame and frame[1] == "image/jpeg":
+                        _avi_append(rec["f"], frame[0])
+                        rec["frames"] = int(rec.get("frames") or 0) + 1
+                        rec["max"] = max(int(rec.get("max") or 0), len(frame[0]))
+                        rec["next"] = now_rec + 1.0 / max(1.0, float(rec.get("fps") or 10))
+                        if rec["frames"] % 10 == 0:
+                            _write_json_atomic(RECORD_STATUS, {
+                                "active": True, "path": rec.get("path", ""),
+                                "frames": rec["frames"],
+                                "seconds": int(max(0.0, now_rec - float(rec.get("started") or now_rec))),
+                                "w": int(rec.get("w") or 0), "h": int(rec.get("h") or 0),
+                                "ts": int(time.time() * 1000)
+                            })
+                    else:
+                        _stop_recording("Кадр не закодирован в JPEG (нужен Pillow)")
+                except Exception:
+                    _stop_recording(traceback.format_exc()[:200])
+
         if time.time() - last_act_save > 5:  # отчёт об активности — раз в 5 секунд
             last_act_save = time.time()
             if len(title_sec) > 50:  # не даём файлу расти бесконечно
@@ -2275,21 +2697,26 @@ def agent_main():
                     title_sec.pop(k, None)
             try:
                 with open(act_path + ".tmp", "w", encoding="utf-8") as f:
-                    json.dump({"date": today, "proc": proc_sec, "titles": title_sec}, f,
+                    json.dump({"date": today, "proc": proc_sec, "titles": title_sec,
+                               "proc_started": proc_started, "title_started": title_started}, f,
                               ensure_ascii=False)
                 os.replace(act_path + ".tmp", act_path)
                 # 30-дневный архив пишем раз в минуту, а не каждые 5 секунд (бережём диск ПК).
                 if time.time() - last_hist_save > 60:
                     last_hist_save = time.time()
-                    save_activity_history_day(today, user, proc_sec, title_sec)
+                    save_activity_history_day(today, user, proc_sec, title_sec, proc_started, title_started)
             except Exception:
                 pass
-        if stream_cfg and is_console:
+        if rec["active"]:
+            time.sleep(max(0.05, 1.0 / max(1.0, float(rec.get("fps") or 10))))
+        elif stream_cfg and is_console:
             try:
                 fps = max(1.0, min(12.0, float(stream_cfg.get("fps") or 4.0)))
             except (TypeError, ValueError):
                 fps = 4.0
             time.sleep(max(0.12, 1.0 / fps))
+        elif is_console and (os.path.exists(SCREENSHOT_FLAG) or os.path.exists(RECORD_FLAG)):
+            time.sleep(0.15)
         else:
             time.sleep(1)
 
@@ -2634,7 +3061,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             stream_stop()
             return self._send(200, {"ok": True})
         if self.path in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
-                         "/api/fulllock_schedule", "/api/add", "/api/delete"):
+                         "/api/fulllock_schedule", "/api/add", "/api/delete",
+                         "/api/screenshot_hd", "/api/record_start", "/api/record_stop"):
             return self._send(200, panel_mutate(self.path, data))
         self._send(404, {"ok": False})
 
@@ -2776,10 +3204,14 @@ def panel_state(csrf, full=True):
     act_out = {}
     for user, d in act_raw.items():
         procs, titles = top_activity(d, n=12, min_seconds=5)
+        p_started = d.get("proc_started") or {}
+        t_started = d.get("title_started") or {}
         act_out[user] = {
             "date": today_iso,
-            "procs": [{"name": p, "seconds": int(s)} for p, s in procs],
-            "titles": [{"title": t, "seconds": int(s)} for t, s in titles]
+            "procs": [{"name": p, "seconds": int(s),
+                       "started": int(p_started.get(p) or 0)} for p, s in procs],
+            "titles": [{"title": t, "seconds": int(s),
+                        "started": int(t_started.get(t) or 0)} for t, s in titles]
         }
     act_by_date = {}
     if full:
@@ -2792,10 +3224,14 @@ def panel_state(csrf, full=True):
                 if not isinstance(d, dict):
                     continue
                 procs, titles = top_activity(d, n=12, min_seconds=5)
+                p_started = d.get("proc_started") or {}
+                t_started = d.get("title_started") or {}
                 day_users_out[user] = {
                     "date": day_key,
-                    "procs": [{"name": p, "seconds": int(s)} for p, s in procs],
-                    "titles": [{"title": t, "seconds": int(s)} for t, s in titles]
+                    "procs": [{"name": p, "seconds": int(s),
+                               "started": int(p_started.get(p) or 0)} for p, s in procs],
+                    "titles": [{"title": t, "seconds": int(s),
+                                "started": int(t_started.get(t) or 0)} for t, s in titles]
                 }
             if day_users_out:
                 act_by_date[day_key] = day_users_out
@@ -2814,6 +3250,7 @@ def panel_state(csrf, full=True):
         "computer_today_sec": int(u["today"].get("__computer__", 0)),
         "computer_total_sec": int(u["total"].get("__computer__", 0)),
         "active_windows": agents,
+        "windows_users": list_windows_users(),
         "full": {
             "now": fl["now"],
             "blocked": full_blocked(cfg, u),
@@ -2848,12 +3285,24 @@ def panel_state(csrf, full=True):
         "activity_by_date": act_by_date,
         "stream_active": stream_is_active(),
         "stream_params": stream_params(),
+        "recording": record_status(),
+        "last_screenshot": screenshot_status(),
         "ts": int(time.time() * 1000)
     }
 
 
 def panel_mutate(path, data):
     name = str(data.get("name", "")).strip()
+    if path == "/api/screenshot_hd":
+        # HD-кадр снимает агент сеанса; ответ придёт в PC_STATE → last_screenshot.
+        request_hd_screenshot()
+        return {"ok": True}
+    if path == "/api/record_start":
+        request_record("start", data.get("fps", 10), data.get("quality", 85))
+        return {"ok": True}
+    if path == "/api/record_stop":
+        request_record("stop")
+        return {"ok": True}
     if path == "/api/fulllock":
         with PANEL_LOCK:
             cfg = load_config()
@@ -3224,6 +3673,12 @@ def p2p_bridge_worker(st, host, port):
                                 )
                             if action == "/api/stream_stop":
                                 stream_stop()
+                            if action == "/api/screenshot_hd":
+                                request_hd_screenshot()
+                            if action == "/api/record_start":
+                                request_record("start", data.get("fps", 10), data.get("quality", 85))
+                            if action == "/api/record_stop":
+                                request_record("stop")
                             if action == "/api/screen":
                                 # Снимок — просмотр, не изменение правил: пароль панели не требуем.
                                 scr_res = panel_screen(force=True)
@@ -3241,7 +3696,8 @@ def p2p_bridge_worker(st, host, port):
                                 last_screen_pub = time.time()
                             if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
                                           "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync",
-                                          "/api/stream_start", "/api/screen"):
+                                          "/api/stream_start", "/api/screen", "/api/screenshot_hd",
+                                          "/api/record_start", "/api/record_stop"):
                                 is_sync = action == "/api/sync"
                                 state_payload = panel_state("p2p", full=is_sync)
                                 state_payload["type"] = "PC_STATE"

@@ -83,7 +83,11 @@ data class PcActiveWindow(
 
 data class PcActivityItem(
   val label: String,
-  val seconds: Int
+  val seconds: Int,
+  /** Когда программа/окно были впервые открыты за этот день (epoch ms, часы ПК). 0 = неизвестно. */
+  val startedAtMs: Long = 0L,
+  /** Учётная запись Windows, к которой относится запись (пусто — общая/неизвестна). */
+  val userName: String = ""
 )
 
 data class PcActivityUser(
@@ -115,6 +119,8 @@ data class PcConnectionState(
   val fullLock: PcFullLockState = PcFullLockState(),
   val entries: List<PcEntry> = defaultPcEntries(),
   val activeWindows: List<PcActiveWindow> = emptyList(),
+  /** Все локальные учётные записи Windows (для переключения в «Полной блокировке ПК»). */
+  val windowsUsers: List<String> = emptyList(),
   val activityDate: String = "",
   val activityByUser: List<PcActivityUser> = emptyList(),
   val activityByDate: Map<String, List<PcActivityUser>> = emptyMap(),
@@ -126,6 +132,14 @@ data class PcConnectionState(
   // на час/пояс — для подписи «кадр получен в …» используем именно это значение.
   val screenReceivedAtMs: Long = 0L,
   val lastSyncMs: Long = 0L,
+  /** Запись экрана ПК, которую сейчас пишет сам ПК-агент (HD, без сильного сжатия). */
+  val pcRecordingActive: Boolean = false,
+  val pcRecordingPath: String = "",
+  val pcRecordingSeconds: Int = 0,
+  val pcRecordingFrames: Int = 0,
+  /** Последний HD-скриншот, сохранённый ПК-агентом на диск. */
+  val lastScreenshotPath: String = "",
+  val lastScreenshotAtMs: Long = 0L,
   val statusMessage: String? = null
 )
 
@@ -141,7 +155,8 @@ data class PcLiveFrame(
 enum class PcStreamQuality(val label: String, val width: Int, val height: Int, val jpegQuality: Int) {
   ECONOMY("Эконом", 480, 270, 45),
   BALANCED("Баланс", 640, 360, 50),
-  HD("HD", 960, 540, 60)
+  HD("HD", 1280, 720, 68),
+  FULL_HD("Full HD", 1920, 1080, 80)
 }
 
 /** Состояние живого видеопотока экрана ПК (сколько кадров/с, какой транспорт, ошибки). */
@@ -353,6 +368,37 @@ object PcBlockerClient {
   private val _state = MutableStateFlow(PcConnectionState())
   val state: StateFlow<PcConnectionState> = _state.asStateFlow()
 
+  // Честный онлайн ПК: агент публикует PC_STATE каждые ~4 с, кадры потока идут чаще.
+  // Если 15 с не было ни одного пакета — ПК реально оффлайн (раньше флаг isOnline
+  // оставался true навсегда после первого пакета).
+  @Volatile
+  private var lastPcContactMs: Long = 0L
+
+  private fun markPcContact() {
+    lastPcContactMs = System.currentTimeMillis()
+  }
+
+  init {
+    scope.launch {
+      while (isActive) {
+        delay(3_000L)
+        val last = lastPcContactMs
+        if (last <= 0L) continue
+        val now = System.currentTimeMillis()
+        val silentMs = now - last
+        if (silentMs > 15_000L) {
+          val cur = _state.value
+          if (cur.isOnline) {
+            _state.value = cur.copy(
+              isOnline = false,
+              transportLabel = "🔴 ПК оффлайн • нет пакетов ${silentMs / 1000} с"
+            )
+          }
+        }
+      }
+    }
+  }
+
   fun setPairingCode(code: String) {
     loadPersistedPcIdentity()
     val clean = code.trim().ifBlank { "101-701" }
@@ -399,6 +445,7 @@ object PcBlockerClient {
   }
 
   fun onUdpBeaconReceived(pcName: String, ip: String, port: Int, pairingCode: String, pcId: String = "") {
+    markPcContact()
     loadPersistedPcIdentity()
     // Маяк приходит по локальной сети от реального ПК — он главнее случайно
     // «пойманного» чужого состояния из интернета. Переключаемся на этот ПК.
@@ -431,6 +478,7 @@ object PcBlockerClient {
     val msgCode = msg.optString("pairing_code", "").trim()
     val msgPcId = msg.optString("pc_id", "").trim()
     if (!matchesConfiguredPc(msgCode, msgPcId)) return
+    markPcContact()
     learnPcIdentity(msgCode, msgPcId)
     try {
       val parsed = parseStateJson(
@@ -457,6 +505,7 @@ object PcBlockerClient {
     val msgCode = msg.optString("pairing_code", "").trim()
     val msgPcId = msg.optString("pc_id", "").trim()
     if (!matchesConfiguredPc(msgCode, msgPcId)) return
+    markPcContact()
     learnPcIdentity(msgCode, msgPcId)
     val b64 = msg.optString("screen_b64", "")
     if (b64.isNotBlank()) {
@@ -709,6 +758,7 @@ object PcBlockerClient {
     val topicPcId = parts.lastOrNull().orEmpty().trim()
     val topicCode = if (parts.size >= 2) parts[parts.size - 2].trim() else ""
     if (!matchesConfiguredPc(topicCode, topicPcId)) return
+    markPcContact()
     learnPcIdentity(topicCode, topicPcId)
     try {
       val buf = ByteBuffer.wrap(bytes, offset, length).order(ByteOrder.BIG_ENDIAN)
@@ -730,6 +780,7 @@ object PcBlockerClient {
     val msgCode = msg.optString("pairing_code", "").trim()
     val msgPcId = msg.optString("pc_id", "").trim()
     if (!matchesConfiguredPc(msgCode, msgPcId)) return
+    markPcContact()
     learnPcIdentity(msgCode, msgPcId)
     val b64 = msg.optString("b64", "")
     if (b64.isBlank()) return
@@ -1047,7 +1098,8 @@ object PcBlockerClient {
     // Просмотр (синхронизация/снимок/поток) должен работать сразу, даже пока ПК ещё
     // не опознан по pc_id. Блокируем только ИЗМЕНЕНИЕ правил, чтобы не задеть чужой ПК.
     val isReadOnly = action == "/api/sync" || action == "/api/screen" ||
-      action == "/api/stream_start" || action == "/api/stream_stop"
+      action == "/api/screenshot_hd" || action == "/api/record_start" ||
+      action == "/api/record_stop" || action == "/api/stream_start" || action == "/api/stream_stop"
     if (!isReadOnly && configuredPcId.isBlank() && !codeExplicitlySet) {
       _state.value = _state.value.copy(
         statusMessage = "Укажите код P2P компьютера в «⚙ Настройка подключения к ПК»"
@@ -1097,6 +1149,72 @@ object PcBlockerClient {
         postLanAction("/api/screen", JSONObject())
       }
     }
+  }
+
+  /**
+   * Мгновенный скриншот в исходном разрешении монитора: ПК-агент сохраняет PNG
+   * на диск (без сжатия в 800×450, как у превью) и возвращает путь в PC_STATE.
+   */
+  fun requestPcScreenshotHd() {
+    loadPersistedPcIdentity()
+    _state.value = _state.value.copy(statusMessage = "📸 Запрос HD-скриншота ПК…")
+    scope.launch {
+      sendP2pCommand("/api/screenshot_hd", JSONObject())
+      if (_state.value.isLanHttpAuthenticated) {
+        postLanAction("/api/screenshot_hd", JSONObject())
+      }
+    }
+  }
+
+  /** Запись экрана ПК силами самого агента (Full HD MJPEG/AVI, качество 85). */
+  fun startPcRecording(fps: Int = 10, quality: Int = 85) {
+    loadPersistedPcIdentity()
+    _state.value = _state.value.copy(
+      pcRecordingActive = true,
+      statusMessage = "🔴 ПК пишет экран в HD…"
+    )
+    val data = JSONObject().apply {
+      put("fps", fps.coerceIn(2, 15))
+      put("quality", quality.coerceIn(60, 95))
+    }
+    scope.launch {
+      sendP2pCommand("/api/record_start", data)
+      if (_state.value.isLanHttpAuthenticated) {
+        postLanAction("/api/record_start", data)
+      }
+    }
+  }
+
+  fun stopPcRecording() {
+    loadPersistedPcIdentity()
+    _state.value = _state.value.copy(
+      pcRecordingActive = false,
+      statusMessage = "⏹ Останавливаем запись экрана ПК…"
+    )
+    scope.launch {
+      sendP2pCommand("/api/record_stop", JSONObject())
+      if (_state.value.isLanHttpAuthenticated) {
+        postLanAction("/api/record_stop", JSONObject())
+      }
+    }
+  }
+
+  /** Переключить учётную запись Windows в блоке «Полная блокировка ПК». */
+  fun selectFullPcLockAccount(account: String) {
+    val clean = account.trim()
+    if (clean.isBlank()) return
+    val fl = _state.value.fullLock
+    _state.value = _state.value.copy(
+      fullLock = fl.copy(childAccount = clean),
+      statusMessage = "Аккаунт блокировки: $clean"
+    )
+    saveFullPcLockSchedule(
+      childAccount = clean,
+      daily = fl.daily,
+      total = fl.total,
+      from = fl.from,
+      to = fl.to
+    )
   }
 
   fun toggleEntry(name: String, enabled: Boolean) {
@@ -1258,6 +1376,7 @@ object PcBlockerClient {
   }
 
   fun parseStateJson(msg: JSONObject, current: PcConnectionState, transport: String): PcConnectionState {
+    markPcContact()
     val fullObj = msg.optJSONObject("full") ?: JSONObject()
     val fullState = PcFullLockState(
       now = fullObj.optBoolean("now", false),
@@ -1270,6 +1389,28 @@ object PcBlockerClient {
       from = fullObj.optString("from", ""),
       to = fullObj.optString("to", "")
     )
+
+    // Все локальные пользователи Windows: нужны, чтобы в «Полной блокировке ПК»
+    // переключаться между raufh и остальными учётками, а не блокировать только одну.
+    val windowsUsersArr = msg.optJSONArray("windows_users")
+    val windowsUsers = mutableListOf<String>()
+    if (windowsUsersArr != null) {
+      for (i in 0 until windowsUsersArr.length()) {
+        val u = windowsUsersArr.optString(i, "").trim()
+        if (u.isNotBlank() && windowsUsers.none { it.equals(u, ignoreCase = true) }) {
+          windowsUsers.add(u)
+        }
+      }
+    }
+
+    val recObj = msg.optJSONObject("recording")
+    val recActive = recObj?.optBoolean("active", false) ?: false
+    val recPath = recObj?.optString("path", "").orEmpty()
+    val recSeconds = recObj?.optInt("seconds", 0) ?: 0
+    val recFrames = recObj?.optInt("frames", 0) ?: 0
+    val shotObj = msg.optJSONObject("last_screenshot")
+    val shotPath = shotObj?.optString("path", "").orEmpty()
+    val shotTs = shotObj?.optLong("ts", 0L) ?: 0L
 
     val entriesArr = msg.optJSONArray("entries")
     val parsedEntries = mutableListOf<PcEntry>()
@@ -1352,13 +1493,25 @@ object PcBlockerClient {
         if (pArr != null) {
           for (i in 0 until pArr.length()) {
             val item = pArr.optJSONObject(i) ?: continue
-            procs.add(PcActivityItem(item.optString("name"), item.optInt("seconds", 0)))
+            procs.add(
+              PcActivityItem(
+                label = item.optString("name"),
+                seconds = item.optInt("seconds", 0),
+                startedAtMs = item.optLong("started", 0L)
+              )
+            )
           }
         }
         if (tArr != null) {
           for (i in 0 until tArr.length()) {
             val item = tArr.optJSONObject(i) ?: continue
-            titles.add(PcActivityItem(item.optString("title"), item.optInt("seconds", 0)))
+            titles.add(
+              PcActivityItem(
+                label = item.optString("title"),
+                seconds = item.optInt("seconds", 0),
+                startedAtMs = item.optLong("started", 0L)
+              )
+            )
           }
         }
         result.add(PcActivityUser(user = u, procs = procs, titles = titles))
@@ -1473,6 +1626,15 @@ object PcBlockerClient {
         current.entries
       },
       activeWindows = windows,
+      windowsUsers = when {
+        windowsUsers.isNotEmpty() -> windowsUsers
+        current.windowsUsers.isNotEmpty() -> current.windowsUsers
+        else -> (mergedByDate.values.flatten().map { it.user } +
+          windows.map { it.user } +
+          listOfNotNull(fullState.childAccount.takeIf { it.isNotBlank() }))
+          .filter { it.isNotBlank() }
+          .distinctBy { it.lowercase() }
+      },
       activityDate = todayIso,
       activityByUser = todayUsers,
       activityByDate = mergedByDate,
@@ -1481,6 +1643,12 @@ object PcBlockerClient {
       screenBase64 = resolvedScrB64,
       screenTimestampMs = resolvedScrTs,
       screenReceivedAtMs = if (embeddedScrB64.isNotBlank()) System.currentTimeMillis() else current.screenReceivedAtMs,
+      pcRecordingActive = recActive,
+      pcRecordingPath = recPath.ifBlank { current.pcRecordingPath },
+      pcRecordingSeconds = if (recActive) recSeconds else 0,
+      pcRecordingFrames = recFrames,
+      lastScreenshotPath = shotPath.ifBlank { current.lastScreenshotPath },
+      lastScreenshotAtMs = if (shotTs > 0L) shotTs else current.lastScreenshotAtMs,
       lastSyncMs = System.currentTimeMillis()
     )
   }

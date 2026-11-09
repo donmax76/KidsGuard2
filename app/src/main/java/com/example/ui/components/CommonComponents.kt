@@ -95,6 +95,8 @@ fun HeroBannerCard(
   isLocked: Boolean,
   batteryPercent: Int,
   appEnergyPercent: Int = -1,
+  /** Честный онлайн по PING/PONG, а не «batteryLevel > 0». */
+  isOnline: Boolean = false,
   modifier: Modifier = Modifier
 ) {
   Card(
@@ -198,12 +200,13 @@ fun HeroBannerCard(
         ) {
           Text(
             text = when {
-              batteryPercent in 1..100 && appEnergyPercent in 0..100 ->
-                "🔋 $batteryPercent% • прил. $appEnergyPercent%"
-              batteryPercent in 1..100 -> "🔋 $batteryPercent% • Онлайн"
-              else -> "🔋 Ожидание связи"
+              !isOnline && batteryPercent !in 1..100 -> "🔴 Оффлайн • нет связи"
+              !isOnline -> "🔴 Оффлайн • 🔋 $batteryPercent%"
+              appEnergyPercent in 0..100 -> "🟢 Онлайн • 🔋 $batteryPercent% • прил. $appEnergyPercent%"
+              batteryPercent in 1..100 -> "🟢 Онлайн • 🔋 $batteryPercent%"
+              else -> "🟢 Онлайн"
             },
-            color = if (batteryPercent in 1..100) EmeraldShieldLight else AmberWarning,
+            color = if (isOnline) EmeraldShieldLight else AmberWarning,
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
             maxLines = 1,

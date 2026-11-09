@@ -10,8 +10,12 @@ import com.example.data.model.LocationBreadcrumb
 import com.example.location.LiveLocationTracker
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -108,6 +112,59 @@ object RealtimeCloudRelay {
 
   private val _liveChildrenFlow = MutableStateFlow<List<ChildProfileEntity>>(emptyList())
   val liveChildrenFlow: StateFlow<List<ChildProfileEntity>> = _liveChildrenFlow.asStateFlow()
+
+  // Честный онлайн телефона ребёнка. Раньше UI писал «Онлайн» просто потому,
+  // что batteryLevel > 0, и статус не менялся после потери связи. Теперь родитель
+  // шлёт PING каждые 10 с, ребёнок отвечает CHILD_PONG; нет пакетов 30 с = Оффлайн.
+  private const val CHILD_ONLINE_TIMEOUT_MS = 30_000L
+  private val childLastSeenMs = ConcurrentHashMap<Long, Long>()
+  private val _childOnlineFlow = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
+  val childOnlineFlow: StateFlow<Map<Long, Boolean>> = _childOnlineFlow.asStateFlow()
+  private val presenceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+  init {
+    presenceScope.launch {
+      while (isActive) {
+        delay(3_000L)
+        recomputeChildPresence()
+      }
+    }
+  }
+
+  private fun markChildSeen(childId: Long) {
+    if (childId <= 0L) return
+    val now = System.currentTimeMillis()
+    childLastSeenMs[childId] = now
+    try {
+      val canon = resolveCanonicalChildId(childId)
+      if (canon > 0L) childLastSeenMs[canon] = now
+    } catch (_: Exception) {
+    }
+  }
+
+  fun isChildOnline(childId: Long): Boolean {
+    if (childId <= 0L) return false
+    val last = childLastSeenMs[childId]
+      ?: idAliasMap[childId]?.let { childLastSeenMs[it] }
+      ?: childrenCache[childId]?.let { c -> idAliasMap[c.id]?.let { childLastSeenMs[it] } }
+      ?: return false
+    return System.currentTimeMillis() - last <= CHILD_ONLINE_TIMEOUT_MS
+  }
+
+  private fun recomputeChildPresence() {
+    val now = System.currentTimeMillis()
+    val snapshot = HashMap<Long, Boolean>()
+    for ((id, last) in childLastSeenMs) {
+      if (now - last <= 5 * 60_000L) {
+        snapshot[id] = now - last <= CHILD_ONLINE_TIMEOUT_MS
+      } else {
+        childLastSeenMs.remove(id)
+      }
+    }
+    if (snapshot != _childOnlineFlow.value) {
+      _childOnlineFlow.value = snapshot
+    }
+  }
 
   private val _contentRulesFlow = MutableStateFlow<List<com.example.data.model.ContentRuleEntity>>(emptyList())
   val contentRulesFlow: StateFlow<List<com.example.data.model.ContentRuleEntity>> = _contentRulesFlow.asStateFlow()
@@ -423,9 +480,15 @@ object RealtimeCloudRelay {
         chatCache.remove(deleteTargetId)
         DirectP2pSocketEngine.clearDirectFrameForChild(deleteTargetId)
       }
+      "CHILD_PONG" -> {
+        // Лёгкий ответ на PING: обновляет только присутствие, не трогая профиль/БД.
+        markChildSeen(id)
+        return
+      }
       "CHILD_STATE" -> {
         val isFromChild = msg.optBoolean("isChildDevice", false)
         if (isFromChild) {
+          markChildSeen(id)
           deletedChildIds.remove(id)
           if (rawId > 0L) deletedChildIds.remove(rawId)
         } else if (deletedChildIds.contains(id)) {
@@ -527,6 +590,7 @@ object RealtimeCloudRelay {
         val isFromChild = msg.optBoolean("isChildDevice", false) ||
           msg.has("batteryLevel") ||
           msg.has("lastLocationLat")
+        if (isFromChild) markChildSeen(id)
         val defaultName = "Ребёнок #$id"
         val prev = childrenCache[id] ?: ChildProfileEntity(
           id = id,
@@ -1003,6 +1067,27 @@ object RealtimeCloudRelay {
         retain = true
       )
     }
+  }
+
+  /**
+   * Ответ ребёнка на PING родителя. Это НЕ состояние профиля: только тип CHILD_PONG,
+   * поэтому не пишет Room, не меняет battery/location и не будит лишние экраны.
+   */
+  suspend fun publishChildPong(childId: Long) {
+    val rawId = if (childId > 0L) childId else 1L
+    val targetId = resolveCanonicalChildId(rawId)
+    val json = JSONObject().apply {
+      put("type", "CHILD_PONG")
+      put("id", targetId)
+      put("isChildDevice", true)
+      put("ts", System.currentTimeMillis())
+    }
+    DirectP2pSocketEngine.publishTcpSocketPacket(
+      topic = "${DirectP2pSocketEngine.TOPIC_STATE}/$targetId",
+      json = json,
+      retain = false
+    )
+    DirectP2pSocketEngine.broadcastUdpJson(json)
   }
 
   suspend fun publishChildFields(childId: Long, fields: Map<String, Any>) {
