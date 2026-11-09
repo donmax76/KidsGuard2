@@ -32,8 +32,16 @@
   - `PcConnectionState.pcScriptVersion` — парсинг `script_version` из `PC_STATE`.
 - **`KidsGuardDao.kt`**: `deletePcActivityLogsForChild(childId)` — удаляет только
   `deviceType='PC'` логи при смене компьютера.
+- **`PcBlockerClient.kt` (stale-кадр при смене ПК)**:
+  - `clearPcScopedState()` теперь вызывает `performStop()`, очищает `_liveFrame` и
+    `_streamStatus`, инкрементит `streamEpoch` — старый MJPEG/P2P-поток второго ПК
+    реально закрывается, а не продолжает отдавать кадры;
+  - `performStop()` очищает `_liveFrame` — последний кадр старого ПК больше не
+    остаётся на экране.
 - **`PcControlScreen.kt`**:
   - сброс `selectedHistoryUser` при смене `pairingCode/pcName`;
+  - `snapshotBitmap` очищается, когда `screenBase64` пустой (после смены ПК);
+  - fallback-текст «ПК оффлайн • ожидание кадра» вместо «ПК онлайн».
   - предупреждение, если ПК-агент старее 5.5 (HD-кадр/REC HD не поддерживаются),
     с версией агента;
   - локальная MP4-запись теперь стартует из `LaunchedEffect` (без двойного

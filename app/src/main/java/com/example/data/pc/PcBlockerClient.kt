@@ -393,6 +393,12 @@ object PcBlockerClient {
    * чтобы данные старого компьютера не попадали в UI нового.
    */
   private fun clearPcScopedState(reason: String, deleteRoomHistory: Boolean = true) {
+    // Сначала полностью гасим поток старого ПК: иначе уже открытый MJPEG/P2P
+    // продолжит присылать кадры второго компьютера и «залипнет» на экране.
+    streamEpoch.incrementAndGet()
+    performStop()
+    _liveFrame.value = null
+    _streamStatus.value = PcStreamStatus()
     val cur = _state.value
     _state.value = cur.copy(
       isOnline = false,
@@ -758,6 +764,9 @@ object PcBlockerClient {
     } catch (_: Exception) {
     }
     streamCall = null
+    // Не оставляем последний кадр на экране: при смене ПК он принадлежал другому
+    // компьютеру и вводил в заблуждение.
+    _liveFrame.value = null
     if (wasActive) {
       scope.launch { sendP2pCommand("/api/stream_stop", JSONObject()) }
     }

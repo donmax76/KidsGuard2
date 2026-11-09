@@ -300,7 +300,11 @@ fun PcControlScreen(
   var snapshotBitmap by remember { mutableStateOf<Bitmap?>(null) }
   LaunchedEffect(pcState.screenBase64) {
     val raw = pcState.screenBase64
-    if (raw.isBlank()) return@LaunchedEffect
+    if (raw.isBlank()) {
+      // После смены ПК/очистки состояния старый снимок показывать нельзя.
+      snapshotBitmap = null
+      return@LaunchedEffect
+    }
     snapshotBitmap = withContext(Dispatchers.Default) {
       try {
         val bytes = Base64.decode(raw.substringAfter("base64,"), Base64.DEFAULT)
@@ -313,13 +317,15 @@ fun PcControlScreen(
 
   val pcScreenBitmap = liveFrame?.bitmap ?: snapshotBitmap
 
-  val currentPcSummary = remember(pcState.activeWindows) {
+  val currentPcSummary = remember(pcState.activeWindows, pcState.isOnline) {
     val win = pcState.activeWindows.firstOrNull()
     if (win != null) {
       val cleaned = cleanPcWindowTitle(win.title).ifBlank { win.proc }
       "ПК (${win.proc}) • Смотрит: $cleaned"
-    } else {
+    } else if (pcState.isOnline) {
       "ПК онлайн • Ожидание открытия окна"
+    } else {
+      "ПК оффлайн • ожидание кадра"
     }
   }
 
