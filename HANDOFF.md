@@ -7,10 +7,17 @@
 
 ---
 
-## ЭТАП 3 (интеграция, pre-build, CI/CD) — статус
+## ЭТАП 3 (интеграция, pre-build, CI/CD) — ЗАВЕРШЁН
 
-**Статус: pre-build проверка выполнена, CI НЕ запущен — push в GitHub заблокирован
-отсутствием credentials в текущем окружении.**
+**Статус: сборка успешна.**
+- Коммит: `01771eee3a129e4a1efc5e645cda8c362e1c6819` (`main`, запушен на GitHub).
+- GitHub Actions run **#30**: ✅ `success` (09.11.2026, 15:28–15:30 UTC).
+- Run page: https://github.com/donmax76/KidsGuard2/actions/runs/42645020531
+- Job `build` — APK собран; artifact **`KidsGuard-debug-apk`** (20.8 МБ ZIP).
+- Job `Build Windows PC agent (.exe)` — ПК-агент собран; artifact
+  **`KidsGuard-PC-Agent`** (18.7 МБ ZIP: `hosts_blocker.exe` + `hosts_blocker.py`).
+- Оба job’а `conclusion: success`, ошибок компиляции не было.
+- Artifacts хранятся до 2027-02-07; скачивание — на странице run (нужен вход в GitHub).
 
 Что проверено/исправлено на Этапе 3:
 - `AndroidManifest.xml`: исправлено имя action энергосбережения на правильное
@@ -28,14 +35,15 @@
 - `.gitignore`/сборка: APK собирается job `build` (artifact `KidsGuard-debug-apk`),
   ПК-агент — job `build-pc-agent` (artifact `KidsGuard-PC-Agent`).
 
-Чтобы завершить Этап 3 на машине с доступом к GitHub:
-```powershell
-cd KidsGuard2
-git push origin main
-```
-После push GitHub Actions запустит `Build KidsGuard APK`; зелёный лог и артефакты —
-вкладка Actions → Run → Artifacts. Если сборка упадёт, лог ошибки будет в Summary
-(шаг «Show build errors in summary»), а также в `build-output.log` артефакта.
+Скачивание готовых файлов:
+1. Открыть https://github.com/donmax76/KidsGuard2/actions/runs/42645020531
+2. Внизу страницы — раздел **Artifacts**.
+3. `KidsGuard-debug-apk` → ZIP → внутри `app-debug.apk` (устанавливать на телефон).
+4. `KidsGuard-PC-Agent` → ZIP → внутри `hosts_blocker.exe` (ПК-агент) и
+   `hosts_blocker.py` (исходник).
+
+При следующих push в `main` workflow запускается автоматически; при падении лог
+ошибки будет в Summary (шаг «Show build errors in summary»).
 
 ---
 
