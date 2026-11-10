@@ -1,9 +1,51 @@
-# KidsGuard2 — HANDOFF (состояние после сессии 2026-11-09)
+# KidsGuard2 — HANDOFF
 
 Репозиторий: https://github.com/donmax76/KidsGuard2.git  
 Ветка: `main`  
-Базовая точка до этой сессии: `3c987167d0eebd518d057146ca6e57659f69c918`  
-Работа велась по пунктам 1–3, по пункту 4 — только разведка (код узлов не переписывался).
+Финальный рабочий коммит: **`d18f0b0`**  
+Успешный CI-run: **#34** — https://github.com/donmax76/KidsGuard2/actions/runs/42831899457  
+Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
+
+## Артефакты run #34
+
+- APK: `KidsGuard-debug-apk` → https://github.com/donmax76/KidsGuard2/actions/runs/42831899457
+  (внизу страницы Artifacts; внутри `app-debug.apk`, ~20,8 МБ)
+- ПК-агент: `KidsGuard-PC-Agent` (внутри `hosts_blocker.exe` + `hosts_blocker.py`, ~19,0 МБ)
+
+## Исправленная ошибка компиляции run #33
+
+- `PcBlockerClient.kt:418`: `postLanAction(...)` (suspend) вызывался из
+  не-suspend `dispatchCommand()`. Исправлено: вызов обёрнут в
+  `scope.launch(Dispatchers.IO) { ... }`. Остальные вызовы suspend-функций
+  (`fetchLanStateNow`, `postLanAction`) уже находились внутри корутин/suspend-функций.
+- После фикса run #34 — `success` для обоих job'ов.
+
+## Контрольная ревизия 6 задач (коммит 178c552 + d18f0b0)
+
+1. **Связь «как в WhatsApp» / обрыв на 91%** — `DirectP2pSocketEngine.kt`:
+   `parentSessionActive`, `setParentSessionActive`, `PARENT_SESSION_START/STOP` из
+   `MainActivity.onResume/onPause`; `isParentActivelyConnected()` по сессии +
+   страховочный таймаут 10 мин; `startNetworkMonitor()` переподключает сокет только
+   при смене Wi-Fi↔cellular/появлении сети/падении сокета (не на каждый
+   `onCapabilitiesChanged`); UDP-маяк ребёнка только при активном родителе или без LAN;
+   MQTT keepalive 270 с; «Только Wi-Fi» блокирует 4G через `childNetworkAllowed()`.
+2. **97,5% батареи** — `REQUEST_POWER_STATS` убран из heartbeat (PING раз в 30 с);
+   в `AppEnergyMeter.kt` кэш 3 мин и расчёт от полной ёмкости батареи с защитой
+   от дельт < 0,1 мА·ч (100%→91% больше не даёт 97,5%).
+3. **Direct Boot / глубокий разряд** — `BootPrefs.kt` (Device Protected Storage),
+   `BootCompletedReceiver.startChildFromProtectedStorage()` для `LOCKED_BOOT_COMPLETED`,
+   полная загрузка по `ACTION_USER_UNLOCKED`; сервис сохраняет boot-конфиг.
+4. **ПК-агент** — `multiprocessing.freeze_support()` + `CreateMutexW` (Global движок,
+   Local агент); per-user `usage.json → users[user].today/total`,
+   `blocked_now_for/limit_text_for/effective_for/apply_all_for`; AVI `atexit` +
+   `_REC_OPEN`; время последнего открытия программ/окон (`prev_proc/prev_title`);
+   `write_lock` + фоновый захват экрана, чтобы PC_STATE не блокировался.
+5. **Время запуска программ** — `offline_activity_logs.startedAtMs` (Room migration 9→10),
+   `MAX(startedAtMs)` в `getAggregatedProcsByDateRange`/`getAggregatedWindowTitlesByDateRange`,
+   запись из `PcBlockerClient.syncPcActivityByDateToRoom`, отображение в `PcControlScreen`.
+6. **Стабильный онлайн и сохранение лимитов** — `PcBlockerClient` сглаживание онлайна
+   (25 с + контрольный `/api/sync`, оффлайн после 30 с); очередь команд
+   `sendCommandWithRetry` + Optimistic Lock 10 с для toggle/limit/delete.
 
 ---
 
