@@ -415,7 +415,9 @@ object PcBlockerClient {
     loadPersistedPcIdentity()
     sendP2pCommand(action, data)
     if (_state.value.isLanHttpAuthenticated) {
-      postLanAction(action, data)
+      scope.launch(Dispatchers.IO) {
+        postLanAction(action, data)
+      }
     }
   }
 
