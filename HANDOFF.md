@@ -2,15 +2,37 @@
 
 Репозиторий: https://github.com/donmax76/KidsGuard2.git  
 Ветка: `main`  
-Финальный рабочий коммит: **`d18f0b0`**  
-Успешный CI-run: **#34** — https://github.com/donmax76/KidsGuard2/actions/runs/42831899457  
+Финальный рабочий коммит: **`3b63708`**  
+Успешный CI-run: **#35** — https://github.com/donmax76/KidsGuard2/actions/runs/42864496432  
 Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
 
-## Артефакты run #34
+## Артефакты run #35
 
-- APK: `KidsGuard-debug-apk` → https://github.com/donmax76/KidsGuard2/actions/runs/42831899457
-  (внизу страницы Artifacts; внутри `app-debug.apk`, ~20,8 МБ)
-- ПК-агент: `KidsGuard-PC-Agent` (внутри `hosts_blocker.exe` + `hosts_blocker.py`, ~19,0 МБ)
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/13786851846/zip
+  (~20,85 МБ; внутри `app-debug.apk`)
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/13785514455/zip
+  (~19,0 МБ; внутри `hosts_blocker.exe` + `hosts_blocker.py`)
+- Страница run: https://github.com/donmax76/KidsGuard2/actions/runs/42864496432
+
+## HOTFIX после #34 — причина падения P2P и 4 процессов
+
+- **P2P-релей**: в 178c552 MQTT keepalive был увеличен до 270 с, а сокетный PINGREQ —
+  до 270 с. NAT роутеров/публичный брокер рвут TCP через 60–90 с простоя → сокет
+  «жив», но мёртв. Возвращено: MQTT keepalive **60 с**, PINGREQ раз в **50 с**.
+- **Сеть**: `refreshNetworkState()` теперь синхронно инициализируется из
+  `ConnectivityManager.activeNetwork` (раньше до первого NetworkCallback
+  `hasWifi/hasAnyNetwork=false` блокировали сокет). `childNetworkAllowed()` для
+  PARENT и режима «Wi-Fi + 4G» **никогда** не блокирует; для «Только Wi-Fi»
+  блокирует только при точно известной сотовой сети без Wi-Fi.
+- **bindSocket**: привязка к Wi-Fi только для ребёнка в строгом «Только Wi-Fi»;
+  в остальных случаях ОС маршрутизирует сокет сама (привязка к Wi-Fi без интернета
+  убивала P2P).
+- **4 процесса HostsBlockerEngine.exe**: `single_instance()` при
+  `ERROR_ALREADY_EXISTS` делает `os._exit(0)`; `taskkill /F /T /IM
+  HostsBlockerEngine.exe` перед копированием/запуском движка и при удалении службы.
+  Watchdog больше не плодит копии.
+- `p2p_bridge_worker`: write_lock/фоновый скриншот проверены — deadlock нет;
+  `sock.sendall` под таймаутом 2,5 с.
 
 ## Исправленная ошибка компиляции run #33
 
