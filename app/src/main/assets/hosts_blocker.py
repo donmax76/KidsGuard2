@@ -1686,7 +1686,12 @@ def single_instance(name):
     k32.CreateMutexW.restype = ctypes.c_void_p
     h = k32.CreateMutexW(None, False, name)
     if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-        return False
+        # Дубликат (частый случай: Watchdog/автозапуск поднял вторую копию).
+        # Немедленный выход, чтобы не плодить 4 процесса и не перезаписывать конфиг.
+        try:
+            os._exit(0)
+        except Exception:
+            return False
     _MUTEXES.append(h)
     return True
 
@@ -4058,7 +4063,9 @@ def engine_command():
         if py.lower().endswith("python.exe"):
             py = py[:-10] + "pythonw.exe"
         cmd = f'"{py}" "{dst}"'
-    run_hidden(["taskkill", "/F", "/IM", "HostsBlockerEngine.exe"])  # освободить файл
+    # Жёстко убиваем ВСЕ старые копии движка (включая дочерние), иначе они
+    # держат сокет/конфиг и Watchdog плодит новые.
+    run_hidden(["taskkill", "/F", "/T", "/IM", "HostsBlockerEngine.exe"])
     try:
         shutil.copy2(src, dst)
     except Exception as ex:
@@ -4102,7 +4109,7 @@ def uninstall_background():
     for name, _ in ENGINE_TASKS:
         run_hidden(["schtasks", "/End", "/TN", name])
         run_hidden(["schtasks", "/Delete", "/TN", name, "/F"])
-    run_hidden(["taskkill", "/F", "/IM", "HostsBlockerEngine.exe"])
+    run_hidden(["taskkill", "/F", "/T", "/IM", "HostsBlockerEngine.exe"])
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as k:

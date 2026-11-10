@@ -310,6 +310,18 @@ object DirectP2pSocketEngine {
       if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) wifi = true
       if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) cell = true
     }
+    // Синхронный fallback через activeNetwork: сразу после старта движка
+    // allNetworks может быть пуст/не обновлён, и раньше сокет навсегда блокировался
+    // «нет сети». Теперь состояние инициализируется из активной сети.
+    if (!wifi && !cell) {
+      val active = cm.activeNetwork
+      val caps = active?.let { cm.getNetworkCapabilities(it) }
+      if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) wifi = true
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) cell = true
+        if (!wifi && !cell) wifi = true // сеть есть, транспорт неизвестен — не блокируем
+      }
+    }
     hasWifi = wifi
     hasCellular = cell
     hasAnyNetwork = wifi || cell
@@ -317,12 +329,14 @@ object DirectP2pSocketEngine {
 
   /**
    * True, если глобальному TCP-релею сейчас разрешено подключаться.
-   * Для ребёнка в режиме «Только Wi-Fi» возвращает True только при доступном Wi-Fi.
+   * PARENT и «Wi-Fi + 4G» НИКОГДА не блокируются — пусть ОС маршрутизирует.
+   * Для ребёнка в «Только Wi-Fi» блокируем только когда точно есть сотовая и нет Wi-Fi.
    */
   private fun childNetworkAllowed(): Boolean {
     refreshNetworkState()
     if (currentRole != "CHILD") return true
-    return if (allowMobileData) hasAnyNetwork else hasWifi
+    if (allowMobileData) return true
+    return hasWifi || !hasCellular
   }
 
   /** Будит блокирующее чтение глобального сокета — цикл тут же переподключится. */
@@ -418,6 +432,9 @@ object DirectP2pSocketEngine {
     }
     val myIp = getLocalIpv4Address()
     _status.value = _status.value.copy(localDeviceIp = myIp)
+    // Синхронно инициализируем состояние сети до первого NetworkCallback,
+    // иначе hasWifi/hasAnyNetwork=false и сокет не подключается.
+    refreshNetworkState()
 
     if (!isStarted) {
       isStarted = true
@@ -822,10 +839,13 @@ object DirectP2pSocketEngine {
         var succeeded = false
         try {
           sock = Socket()
-          // Привязываемся к Wi-Fi, если он доступен: в «Только Wi-Fi» это гарантирует,
-          // что сокет не уйдёт в мобильную сеть; в «Wi-Fi + 4G» предпочитаем Wi-Fi.
-          currentWifiNetwork()?.let { wifi ->
-            try { wifi.bindSocket(sock) } catch (_: Exception) {}
+          // bindSocket — ТОЛЬКО для ребёнка в строгом режиме «Только Wi-Fi».
+          // В остальных случаях не привязываем: привязка к Wi-Fi без интернета
+          // (captive portal) или к неверной сети убивала P2P-релей.
+          if (currentRole == "CHILD" && !allowMobileData) {
+            currentWifiNetwork()?.let { wifi ->
+              try { wifi.bindSocket(sock) } catch (_: Exception) {}
+            }
           }
           globalSocket = sock
           sock.connect(InetSocketAddress(host, port), 5000)
@@ -893,7 +913,7 @@ object DirectP2pSocketEngine {
             // 3. Keepalive ping loop (battery-friendly 90s interval matching 120s MQTT keepalive)
             val pingJob = launch {
               while (isActive && sock.isConnected && !sock.isClosed) {
-                delay(270_000L)
+                delay(50_000L)
                 synchronized(globalWriteLock) {
                   try {
                     out.write(byteArrayOf(0xC0.toByte(), 0x00))
@@ -1007,8 +1027,8 @@ object DirectP2pSocketEngine {
     body.write(4) // Protocol level 4 (MQTT 3.1.1)
     body.write(0x02) // Clean session
     body.write(0x00)
-    body.write(0x01)
-    body.write(0x0E) // Keepalive 270s (4.5 мин) — тихий сокет в покое
+    body.write(0x00)
+    body.write(0x3C) // Keepalive 60s — NAT/брокер не рвут сокет; PINGREQ раз в 50 с
     writeUtf8String(body, clientId)
     val bodyBytes = body.toByteArray()
 
