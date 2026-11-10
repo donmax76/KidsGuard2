@@ -25,6 +25,16 @@ object AppEnergyMeter {
   private const val KEY_LEVEL = "base_level"
   private const val KEY_TS = "base_ts"
 
+  // Кэш на 3 минуты: `read()` читает UidHealthStats — это дорого и при частых
+  // вызовах само по себе жрёт батарею и даёт скачущие цифры.
+  private const val CACHE_MS = 3 * 60_000L
+
+  @Volatile
+  private var lastReadAtMs = 0L
+
+  @Volatile
+  private var lastReading: Reading? = null
+
   data class Reading(
     val appPercent: Int,
     val mahPerHour: Float,
@@ -34,6 +44,8 @@ object AppEnergyMeter {
 
   /** Начать окно измерения (после отключения зарядки). */
   fun startWindow(context: Context) {
+    lastReadAtMs = 0L
+    lastReading = null
     try {
       val bm = context.getSystemService(BatteryManager::class.java)
       val counter = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER) ?: -1
@@ -50,6 +62,8 @@ object AppEnergyMeter {
   }
 
   fun reset(context: Context) {
+    lastReadAtMs = 0L
+    lastReading = null
     try {
       context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
     } catch (_: Exception) {
@@ -71,6 +85,19 @@ object AppEnergyMeter {
 
   /** null — данных ещё нет (например, только что включили/поставили на зарядку). */
   fun read(context: Context): Reading? {
+    val now = System.currentTimeMillis()
+    // Возвращаем кэш без чтения тяжёлых HealthStats в течение 3 минут.
+    val cached = lastReading
+    if (cached != null && now - lastReadAtMs < CACHE_MS) {
+      return cached
+    }
+    val fresh = compute(context, now)
+    lastReadAtMs = now
+    lastReading = fresh
+    return fresh
+  }
+
+  private fun compute(context: Context, now: Long): Reading? {
     try {
       val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
       if (!prefs.contains(KEY_TS)) {
@@ -86,7 +113,6 @@ object AppEnergyMeter {
       val baseAppMah = prefs.getFloat(KEY_APP_MAH, -1f)
       val baseLevel = prefs.getInt(KEY_LEVEL, -1)
       val baseTs = prefs.getLong(KEY_TS, 0L)
-      val now = System.currentTimeMillis()
       val appMahNow = appPowerMah(context)
 
       // На части телефонов системные счётчики энергии (HealthStats) недоступны —
@@ -99,36 +125,29 @@ object AppEnergyMeter {
       if (baseTs <= 0L || now - baseTs < 2 * 60_000L) return null
 
       val levelDrop = baseLevel - level
-      // Реальная ёмкость батареи: charge_counter (µА·ч) / уровень заряда. Раньше
-      // здесь был хардкод 4000 мА·ч — на аппаратах с батареей 5000/4500 мА·ч доля
-      // приложения занижалась (28,8% вместо 42% в системных настройках).
-      val derivedCapacityMah = if (counter > 0 && level in 1..100) {
+      // Полная ёмкость батареи: charge_counter (µА·ч) / уровень заряда. Доля считается
+      // от полной ёмкости, а не от маленькой дельты разряда — иначе при разряде 100%→91%
+      // деление на 9% даёт ложные 97,5% для приложения.
+      val capacityMah = if (counter > 0 && level in 1..100) {
         (counter / 1000.0) / (level / 100.0)
       } else {
         4000.0
       }
-      // Всего израсходовано устройством с начала окна: по счётчику заряда, а при
-      // его отсутствии — по проценту заряда и вычисленной ёмкости.
-      val totalMah = when {
-        baseCounter > 0 && counter > 0 && counter < baseCounter ->
-          (baseCounter - counter) / 1000.0
-        levelDrop > 0 -> levelDrop / 100.0 * derivedCapacityMah
-        else -> 0.0
-      }
-      if (totalMah < 0.5) {
+
+      val usedAppMah = appMahNow - baseAppMah.toDouble()
+      // Защита от малых дельт: меньше 0,1 мА·ч — шум, не показываем и не «раздуваем».
+      if (usedAppMah < 0.1) {
         if (counter >= baseCounter || levelDrop <= 0) startWindow(context)
         return null
       }
 
-      val usedAppMah = appMahNow - baseAppMah.toDouble()
-      if (usedAppMah <= 0.0) return null
-      val share = (usedAppMah / totalMah * 100.0).coerceIn(0.0, 100.0)
+      val appPercent = (usedAppMah / capacityMah * 100.0).coerceIn(0.0, 100.0)
       val hours = ((now - baseTs) / 3_600_000.0).coerceAtLeast(0.05)
       val mahPerHour = usedAppMah / hours
-      val pctPerHour = (mahPerHour / derivedCapacityMah * 100.0).coerceIn(0.0, 100.0)
+      val pctPerHour = (mahPerHour / capacityMah * 100.0).coerceIn(0.0, 100.0)
 
       return Reading(
-        appPercent = share.roundToInt(),
+        appPercent = appPercent.roundToInt(),
         mahPerHour = mahPerHour.toFloat(),
         percentPerHour = pctPerHour.toFloat(),
         windowHours = hours.toFloat()

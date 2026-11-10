@@ -34,7 +34,7 @@ import kotlinx.coroutines.launch
     OfflineLocationPointEntity::class,
     OfflineScreenshotEntity::class
   ],
-  version = 9,
+  version = 10,
   exportSchema = false
 )
 abstract class KidsGuardDatabase : RoomDatabase() {
@@ -48,6 +48,14 @@ abstract class KidsGuardDatabase : RoomDatabase() {
       override fun migrate(db: SupportSQLiteDatabase) {
         try {
           db.execSQL("ALTER TABLE child_profiles ADD COLUMN gpsTrackingEnabled INTEGER NOT NULL DEFAULT 1")
+        } catch (_: Exception) {}
+      }
+    }
+
+    private val MIGRATION_9_10 = object : androidx.room.migration.Migration(9, 10) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        try {
+          db.execSQL("ALTER TABLE offline_activity_logs ADD COLUMN startedAtMs INTEGER NOT NULL DEFAULT 0")
         } catch (_: Exception) {}
       }
     }
@@ -75,7 +83,7 @@ abstract class KidsGuardDatabase : RoomDatabase() {
           KidsGuardDatabase::class.java,
           "kidsguard_database"
         )
-          .addMigrations(MIGRATION_6_7, MIGRATION_8_9)
+          .addMigrations(MIGRATION_6_7, MIGRATION_8_9, MIGRATION_9_10)
           .fallbackToDestructiveMigration()
           .addCallback(DatabaseCallback())
           .build()

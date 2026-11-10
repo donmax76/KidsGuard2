@@ -231,6 +231,20 @@ class KidsGuardBackgroundService : Service() {
       com.example.data.cloud.DirectP2pSocketEngine.appContext = applicationContext
       com.example.util.CoreEngineHotUpdater.initializeHotCore(applicationContext)
 
+      // Сохраняем минимальный boot-конфиг в Device Protected Storage, чтобы после
+      // глубокого разряда/перезагрузки (LOCKED_BOOT_COMPLETED) сервис поднимался без Room.
+      try {
+        val bootCfg = dao.getFamilyConfigOnce()
+        val bootChild = dao.getChildByIdOnce(activeChildId)
+        com.example.util.BootPrefs.save(
+          context = applicationContext,
+          role = "CHILD",
+          childId = activeChildId,
+          allowMobileData = bootChild?.allowMobileData ?: true,
+          familyId = bootCfg?.familyId ?: ""
+        )
+      } catch (_: Exception) {}
+
       // Снимаем ограничения оптимизации батареи, чтобы Android не переводил агент
       // в Restricted Bucket при падении заряда ниже 15% и не убивал связь.
       try {
@@ -576,9 +590,24 @@ class KidsGuardBackgroundService : Service() {
                         dao.setChildAllowMobileData(activeChildId, true)
                         com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(true)
                       }
+                      "PARENT_SESSION_START" -> {
+                        // Родитель открыл приложение: выходим из тихого режима и сразу
+                        // отдаём актуальный стейт/батарею.
+                        com.example.data.cloud.DirectP2pSocketEngine.setParentSessionActive(true)
+                        com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
+                        val sessBatt = readBatteryLevel()
+                        dao.updateChildBattery(activeChildId, sessBatt)
+                        cloudSync.upsertBatteryLevel(activeChildId, sessBatt)
+                        com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
+                      "PARENT_SESSION_STOP" -> {
+                        // Родитель свернул/закрыл приложение: переходим в тихий режим.
+                        com.example.data.cloud.DirectP2pSocketEngine.setParentSessionActive(false)
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
                       "PING" -> {
-                        // Дешёвый ping-pong для честного индикатора «Онлайн»: без GPS,
-                        // без выгрузки истории — только присутствие и свежая батарея.
+                        // Дешёвый ping-pong: только присутствие и свежая батарея.
                         com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
                         val pingBatt = readBatteryLevel()
                         dao.updateChildBattery(activeChildId, pingBatt)

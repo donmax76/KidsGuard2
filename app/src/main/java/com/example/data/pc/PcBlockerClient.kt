@@ -12,6 +12,7 @@ import java.nio.ByteOrder
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -387,6 +388,56 @@ object PcBlockerClient {
   @Volatile
   private var pcActivityResetAtMs: Long = 0L
 
+  // Очередь команд + Optimistic Lock: пока изменение правила не подтверждено ПК,
+  // старый входящий PC_STATE не должен откатывать UI. Команда повторяется по
+  // LAN+P2P до получения обновлённого состояния (или до 5 попыток).
+  private data class PendingCmd(val action: String, val data: JSONObject, val createdAtMs: Long)
+
+  private val pendingCommands = ConcurrentHashMap<String, PendingCmd>()
+  private val optimisticEntries = ConcurrentHashMap<String, PcEntry>()
+  private val optimisticDeleted = ConcurrentHashMap<String, Long>()
+  private val optimisticExpiryMs = ConcurrentHashMap<String, Long>()
+  private const val OPTIMISTIC_HOLD_MS = 10_000L
+
+  private fun setOptimisticEntry(entry: PcEntry) {
+    val key = entry.name.trim().lowercase()
+    optimisticEntries[key] = entry
+    optimisticExpiryMs[key] = System.currentTimeMillis() + OPTIMISTIC_HOLD_MS
+  }
+
+  private fun markOptimisticDeleted(name: String) {
+    val key = name.trim().lowercase()
+    optimisticDeleted[key] = System.currentTimeMillis() + OPTIMISTIC_HOLD_MS
+    optimisticEntries.remove(key)
+  }
+
+  private fun dispatchCommand(action: String, data: JSONObject) {
+    loadPersistedPcIdentity()
+    sendP2pCommand(action, data)
+    if (_state.value.isLanHttpAuthenticated) {
+      postLanAction(action, data)
+    }
+  }
+
+  private fun sendCommandWithRetry(action: String, data: JSONObject) {
+    val key = action + ":" + data.optString("name", "")
+    pendingCommands[key] = PendingCmd(action, data, System.currentTimeMillis())
+    dispatchCommand(action, data)
+    scope.launch {
+      var attempts = 0
+      while (isActive) {
+        delay(8_000L)
+        if (!pendingCommands.containsKey(key)) return@launch
+        attempts++
+        if (attempts > 5) {
+          pendingCommands.remove(key)
+          return@launch
+        }
+        dispatchCommand(action, data)
+      }
+    }
+  }
+
   /**
    * Полный сброс всего, что относится к конкретному ПК: пользователи Windows,
    * история, правила, кадр, запись, скриншот. Вызывается при смене pairing code/pc_id,
@@ -457,20 +508,33 @@ object PcBlockerClient {
 
   init {
     scope.launch {
+      var offlinePingSent = false
       while (isActive) {
         delay(3_000L)
         val last = lastPcContactMs
         if (last <= 0L) continue
         val now = System.currentTimeMillis()
         val silentMs = now - last
-        if (silentMs > 15_000L) {
-          val cur = _state.value
-          if (cur.isOnline) {
-            _state.value = cur.copy(
-              isOnline = false,
-              transportLabel = "🔴 ПК оффлайн • нет пакетов ${silentMs / 1000} с"
-            )
-          }
+        if (silentMs <= 25_000L) {
+          // Пакет пришёл — сбрасываем флаг проверочного пинга.
+          offlinePingSent = false
+          continue
+        }
+        val cur = _state.value
+        if (!cur.isOnline) continue
+        if (!offlinePingSent) {
+          // ПК молчит дольше 25 с: шлём контрольный запрос (/api/sync) и ждём
+          // ещё один цикл, прежде чем честно показать «Оффлайн». Это гасит
+          // мигание при микро-задержках стрима/скриншота.
+          offlinePingSent = true
+          try {
+            requestSync()
+          } catch (_: Exception) {}
+        } else if (silentMs > 30_000L) {
+          _state.value = cur.copy(
+            isOnline = false,
+            transportLabel = "🔴 ПК оффлайн • нет пакетов ${silentMs / 1000} с"
+          )
         }
       }
     }
@@ -1334,14 +1398,12 @@ object PcBlockerClient {
       entries = updatedEntries,
       statusMessage = if (enabled) "Правило «$name» включено" else "Правило «$name» выключено"
     )
+    updatedEntries.firstOrNull { it.name == name }?.let { setOptimisticEntry(it) }
     val data = JSONObject().apply {
       put("name", name)
       put("enabled", enabled)
     }
-    scope.launch {
-      sendP2pCommand("/api/toggle", data)
-      postLanAction("/api/toggle", data)
-    }
+    sendCommandWithRetry("/api/toggle", data)
   }
 
   fun updateEntryLimit(name: String, daily: Int, total: Int, from: String, to: String, closeTab: Boolean) {
@@ -1353,6 +1415,7 @@ object PcBlockerClient {
       entries = updatedEntries,
       statusMessage = "Лимиты для «$name» сохранены"
     )
+    updatedEntries.firstOrNull { it.name == name }?.let { setOptimisticEntry(it) }
     val data = JSONObject().apply {
       put("name", name)
       put("daily", daily)
@@ -1361,10 +1424,7 @@ object PcBlockerClient {
       put("to", to.trim())
       put("close_tab", closeTab)
     }
-    scope.launch {
-      sendP2pCommand("/api/limit", data)
-      postLanAction("/api/limit", data)
-    }
+    sendCommandWithRetry("/api/limit", data)
   }
 
   fun resetEntryCounter(name: String) {
@@ -1471,13 +1531,11 @@ object PcBlockerClient {
       entries = _state.value.entries.filterNot { it.name == name },
       statusMessage = "Запись «$name» удалена с ПК"
     )
+    markOptimisticDeleted(name)
     val data = JSONObject().apply {
       put("name", name)
     }
-    scope.launch {
-      sendP2pCommand("/api/delete", data)
-      postLanAction("/api/delete", data)
-    }
+    sendCommandWithRetry("/api/delete", data)
   }
 
   fun parseStateJson(msg: JSONObject, current: PcConnectionState, transport: String): PcConnectionState {
@@ -1727,7 +1785,20 @@ object PcBlockerClient {
       computerTotalSec = msg.optInt("computer_total_sec", current.computerTotalSec),
       fullLock = fullState,
       entries = if (parsedEntries.isNotEmpty()) {
-        parsedEntries.distinctBy { it.name.trim().lowercase() }
+        // Optimistic Lock: пока изменение правила не подтверждено, держим локальную
+        // версию и не даём старому PC_STATE откатить UI. Удалённые — не возвращаем.
+        parsedEntries
+          .filterNot { e ->
+            val exp = optimisticDeleted[e.name.trim().lowercase()] ?: 0L
+            System.currentTimeMillis() < exp
+          }
+          .map { parsed ->
+            val key = parsed.name.trim().lowercase()
+            val opt = optimisticEntries[key]
+            val exp = optimisticExpiryMs[key] ?: 0L
+            if (opt != null && System.currentTimeMillis() < exp) opt else parsed
+          }
+          .distinctBy { it.name.trim().lowercase() }
       } else {
         current.entries
       },
@@ -1844,6 +1915,7 @@ object PcBlockerClient {
                     hourOfDay = hour,
                     dateIso = dateIso,
                     timestamp = anchorTs,
+                    startedAtMs = p.startedAtMs,
                     isSyncedToParent = true
                   )
                 )
@@ -1862,6 +1934,7 @@ object PcBlockerClient {
                     hourOfDay = hour,
                     dateIso = dateIso,
                     timestamp = anchorTs,
+                    startedAtMs = t.startedAtMs,
                     isSyncedToParent = true
                   )
                 )

@@ -405,6 +405,10 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     )
     com.example.util.ApkUpdateInstaller.checkCloudUpdateAvailable(com.example.BuildConfig.VERSION_CODE)
 
+    // Сессия родителя (PARENT_SESSION_START/STOP) отправляется из MainActivity
+    // (onResume/onPause), т.к. там гарантированно есть реальный жизненный цикл
+    // приложения без дополнительной зависимости lifecycle-process.
+
     viewModelScope.launch {
       allGeofences.collect { zones ->
         locationTracker.updateKnownGeofences(zones)
@@ -441,32 +445,22 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
       }
     }
 
-    // Lightweight heartbeat:
-    // - In PARENT mode: PING каждые 10 с + полный PARENT_ONLINE_HEARTBEAT раз в 40 с.
-    //   PING даёт короткий таймаут «Оффлайн» (30 с), не дёргая GPS и выгрузку истории.
-    // - In CHILD mode: checks 00:00 midnight reset and updates battery/location ONLY when Parent is actively connected.
+    // Лёгкий heartbeat родителя: без спама. PING раз в 30 с — только чтобы держать
+    // статус «Онлайн» точным во время активной сессии (сессия задаётся
+    // PARENT_SESSION_START/STOP). Тяжёлый REQUEST_POWER_STATS сюда НЕ входит.
     viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-      var heartbeatTick = 0
       while (true) {
         com.example.util.DeviceUsageTracker.ensureDailyMidnightReset(getApplication())
         if (_deviceRole.value == AppRole.PARENT) {
           val targetChildId = activeChild.value?.id ?: allChildren.value.firstOrNull()?.id ?: 0L
           if (targetChildId > 0L) {
             repository.sendRemoteCloudCommand(targetChildId, "PING", "1")
-            if (heartbeatTick % 4 == 0) {
-              repository.sendRemoteCloudCommand(targetChildId, "PARENT_ONLINE_HEARTBEAT", "1")
-              // Явный запрос расхода энергии: ребёнок сразу шлёт свежие HealthStats,
-              // вместо ожидания фонового цикла 1–30 минут.
-              repository.sendRemoteCloudCommand(targetChildId, "REQUEST_POWER_STATS", "1")
-              // Высокоточный GPS ребёнку нужен только когда открыта карта, а не всегда,
-              // пока приложение родителя просто запущено.
-              if (_activeParentTab.value == ParentTab.LOCATION_MAP) {
-                repository.sendRemoteCloudCommand(targetChildId, "MAP_VIEWING", "1")
-              }
+            // Высокоточный GPS ребёнку нужен только когда открыта карта, а не всегда.
+            if (_activeParentTab.value == ParentTab.LOCATION_MAP) {
+              repository.sendRemoteCloudCommand(targetChildId, "MAP_VIEWING", "1")
             }
           }
-          heartbeatTick++
-          kotlinx.coroutines.delay(10_000L)
+          kotlinx.coroutines.delay(30_000L)
           continue
         }
         if (_deviceRole.value == AppRole.CHILD && !com.example.location.LiveLocationTracker.isEmulator()) {

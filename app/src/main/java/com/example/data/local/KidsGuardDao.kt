@@ -366,7 +366,8 @@ interface KidsGuardDao {
       '' AS windowTitle,
       deviceType AS deviceType,
       COALESCE(SUM(durationSeconds), 0) AS totalDurationSeconds,
-      MAX(timestamp) AS lastTimestamp
+      MAX(timestamp) AS lastTimestamp,
+      MAX(startedAtMs) AS startedAtMs
     FROM offline_activity_logs
     WHERE (:childId <= 0 OR childId = :childId)
       AND deviceType = :deviceType
@@ -394,7 +395,8 @@ interface KidsGuardDao {
       windowTitle AS windowTitle,
       deviceType AS deviceType,
       COALESCE(SUM(durationSeconds), 0) AS totalDurationSeconds,
-      MAX(timestamp) AS lastTimestamp
+      MAX(timestamp) AS lastTimestamp,
+      MAX(startedAtMs) AS startedAtMs
     FROM offline_activity_logs
     WHERE (:childId <= 0 OR childId = :childId)
       AND deviceType = :deviceType

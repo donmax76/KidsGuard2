@@ -107,6 +107,13 @@ class BootCompletedReceiver : BroadcastReceiver() {
       ApkUpdateInstaller.isInstallingUpdate = false
       Log.i(TAG, "Recovery event ($action). Restoring Accessibility Service & 24/7 KidsGuard protection with v${BuildConfig.VERSION_NAME}.")
 
+      // LOCKED_BOOT_COMPLETED приходит ДО ввода ПИН-кода: Room ещё недоступен.
+      // Поднимаем только то, что читается из Device Protected Storage.
+      if (action == Intent.ACTION_LOCKED_BOOT_COMPLETED) {
+        startChildFromProtectedStorage(appContext)
+        return
+      }
+
       // Immediately restore/rebind Accessibility Service after reboot/OTA/recovery
       val a11yRestored = com.example.util.DeviceSecurityPermissionHelper.restoreAccessibilityServiceAfterOta(appContext)
 
@@ -120,6 +127,21 @@ class BootCompletedReceiver : BroadcastReceiver() {
         "SUCCESS"
       )
       restoreServicesAndNotifyParentAfterUpdate(appContext, isPackageReplacedOrSuccess = isSelfPackageReplaced)
+    }
+  }
+
+  /** Direct Boot: старт сервиса и тихого сокета без Room (из device-protected prefs). */
+  private fun startChildFromProtectedStorage(appContext: Context) {
+    try {
+      val boot = com.example.util.BootPrefs.load(appContext)
+      if (boot.role != "CHILD" || boot.childId <= 0L) return
+      com.example.data.cloud.DirectP2pSocketEngine.appContext = appContext
+      com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(boot.allowMobileData)
+      DirectP2pSocketEngine.startEngine("CHILD", boot.childId)
+      KidsGuardBackgroundService.start(appContext, boot.childId, enableProjectionFgs = false)
+      Log.i(TAG, "LOCKED_BOOT_COMPLETED: started child service from protected storage (childId=${boot.childId})")
+    } catch (e: Exception) {
+      Log.e(TAG, "startChildFromProtectedStorage error: ${e.message}")
     }
   }
 
@@ -181,6 +203,18 @@ class BootCompletedReceiver : BroadcastReceiver() {
             ?: config.currentActiveChildId.takeIf { it > 0 }
             ?: dao.getAllChildrenOnce().firstOrNull()?.id
             ?: 1L
+
+          // Обновляем device-protected boot-конфиг для следующей перезагрузки.
+          try {
+            val bootChild = dao.getChildByIdOnce(childId)
+            com.example.util.BootPrefs.save(
+              context = appContext,
+              role = "CHILD",
+              childId = childId,
+              allowMobileData = bootChild?.allowMobileData ?: true,
+              familyId = config.familyId
+            )
+          } catch (_: Exception) {}
 
           com.example.util.CoreEngineHotUpdater.syncUnifiedBuildConfigVersion(appContext, childId)
           com.example.util.CoreEngineHotUpdater.setChildCoreVersionName(appContext, childId, unifiedBuildVer)

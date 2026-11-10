@@ -1483,7 +1483,9 @@ fun PcControlScreen(
             PcActivityItem(
               label = it.packageName,
               seconds = it.totalDurationSeconds.toInt(),
-              startedAtMs = fallbackProcStart[it.packageName.lowercase().trim()] ?: 0L,
+              startedAtMs = it.startedAtMs.takeIf { s -> s > 0L }
+                ?: fallbackProcStart[it.packageName.lowercase().trim()]
+                ?: 0L,
               userName = it.appName
             )
           }
@@ -1510,7 +1512,9 @@ fun PcControlScreen(
             PcActivityItem(
               label = it.windowTitle,
               seconds = it.totalDurationSeconds.toInt(),
-              startedAtMs = fallbackTitleStart[it.windowTitle.lowercase().trim()] ?: 0L,
+              startedAtMs = it.startedAtMs.takeIf { s -> s > 0L }
+                ?: fallbackTitleStart[it.windowTitle.lowercase().trim()]
+                ?: 0L,
               userName = it.appName
             )
           }

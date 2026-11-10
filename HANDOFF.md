@@ -7,6 +7,60 @@
 
 ---
 
+## Фиксы критических багов (после run #32)
+
+### Связь «как в WhatsApp» + обрыв на 91%
+- `DirectP2pSocketEngine.kt`:
+  - `startNetworkMonitor()` больше не будит сокет на каждый `onCapabilitiesChanged`
+    (экран/сигнал Wi-Fi). Переподключение — только при смене типа сети Wi-Fi↔cellular,
+    появлении сети после оффлайна или падении сокета.
+  - Сессия родителя `parentSessionActive` + `setParentSessionActive()`;
+    `isParentActivelyConnected()` живёт по сессии (страховочный таймаут 10 мин).
+  - UDP-маяк ребёнка — только когда родитель активен или нет LAN-соединения.
+  - MQTT keepalive 270 с (тихий сокет в покое), ping-цикл 270 с.
+- `MainActivity.kt`: onResume → `PARENT_SESSION_START` + `REQUEST_POWER_STATS` (один раз),
+  onPause → `PARENT_SESSION_STOP`.
+- `KidsGuardBackgroundService.kt` / `ParentalControlRepository.kt`: обработка
+  `PARENT_SESSION_START/STOP`.
+
+### 97,5% батареи
+- `ParentControlViewModel.kt`: убран `REQUEST_POWER_STATS` из 40-с цикла heartbeat;
+  PING — раз в 30 с (вместо 10 с).
+- `AppEnergyMeter.kt`: кэш на 3 минуты; доля считается от ПОЛНОЙ ёмкости батареи
+  (не от маленькой дельты разряда 100→91), защита от дельт <0,1 мА·ч.
+
+### Выживание после разряда / Direct Boot
+- `BootPrefs.kt` (новый): минимальный boot-конфиг (role, childId, allowMobileData,
+  familyId) в `createDeviceProtectedStorageContext()`.
+- `BootCompletedReceiver.kt`: при `LOCKED_BOOT_COMPLETED` стартует сервис/сокет из
+  device-protected prefs без Room; при `ACTION_USER_UNLOCKED` — полная загрузка.
+- `KidsGuardBackgroundService.kt`: сохраняет BootPrefs при старте.
+
+### ПК-агент (hosts_blocker.py + копии)
+- `multiprocessing.freeze_support()` + существующий `CreateMutexW` (Global для движка,
+  Local для агента) — дубли процессов не плодятся.
+- Per-user лимиты: `usage.json` теперь хранит `users[<username>].today/total`;
+  `blocked_now_for/limit_text_for/effective_for/apply_all_for` считают лимиты по
+  выбранному пользователю; `panel_state` отдаёт per-user `today_sec/total_sec`.
+- AVI: `_REC_OPEN` + `atexit.register(_close_recording_file)` — заголовок видеофайла
+  закрывается при любом выходе/падении.
+- Старт-таймстампы: `proc_started/title_started` обновляются при каждом новом открытии
+  программы/окна после закрытия (prev_proc/prev_title).
+- `p2p_bridge_worker`: запись в сокет под `write_lock`, захват экрана (`/api/screen`,
+  `/api/sync`) вынесен в фоновый поток — PC_STATE/команды не блокируются скриншотом.
+
+### Android ПК-контрол
+- `PcBlockerClient.kt`:
+  - сглаживание онлайна: 25 с + контрольный `/api/sync` перед переходом в «Оффлайн»
+    (таймаут 30 с) — нет мигания;
+  - очередь команд + Optimistic Lock: `sendCommandWithRetry()` повторяет toggle/limit/
+    delete по LAN+P2P до 5 раз; входящий старый PC_STATE не откатывает UI 10 с.
+- `KidsGuardDao.kt`/`Entities.kt`/`KidsGuardDatabase.kt`: колонка `startedAtMs` в
+  `offline_activity_logs` (migration 9→10), агрегация возвращает `MAX(startedAtMs)`;
+  `PcControlScreen.kt` выводит время открытия и из SQL-пути.
+
+---
+
 ## Пост-релизные фиксы (после сборки #30)
 
 Финальный коммит с фиксами: `27670694557ac0d634070f4d923ab110404fe9d0` (запушен).

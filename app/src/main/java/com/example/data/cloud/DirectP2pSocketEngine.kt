@@ -149,10 +149,18 @@ object DirectP2pSocketEngine {
   @Volatile
   var appContext: android.content.Context? = null
 
-  // Tracks when a Parent app was last actively connected (viewing child profile via LAN or Cloud)
+  // Сессия присутствия родителя (PARENT_SESSION_START/STOP) вместо спама пингами.
+  // Ребёнок активен (телеметрия/маяки/GPS) только пока сессия жива; в покое он
+  // держит один тихий входящий сокет и почти не тратит батарею.
+  @Volatile
+  private var parentSessionActive = false
+
   @Volatile
   private var lastParentPresenceTimestampMs: Long = 0L
-  private const val PARENT_PRESENCE_TIMEOUT_MS = 95_000L
+
+  // Страховка от «родитель упал без PARENT_SESSION_STOP»: если пингов/команд
+  // не было дольше этого срока — сессия считается закрытой.
+  private const val PARENT_SESSION_TIMEOUT_MS = 10 * 60_000L
 
   // Отдельный сигнал «родитель открыл карту»: только тогда ребёнку нужен
   // высокоточный GPS. Обычное присутствие родителя (дашборд/чат) — ещё не повод
@@ -175,8 +183,20 @@ object DirectP2pSocketEngine {
   fun isParentActivelyConnected(): Boolean {
     if (currentRole != "CHILD") return true
     if (connectedParentClients.isNotEmpty() || _status.value.isLanSocketConnected) return true
-    val elapsed = System.currentTimeMillis() - lastParentPresenceTimestampMs
-    return lastParentPresenceTimestampMs > 0L && elapsed in 0..PARENT_PRESENCE_TIMEOUT_MS
+    if (!parentSessionActive) return false
+    // Таймаут-страховка: без пингов/команд сессия сама гаснет.
+    if (System.currentTimeMillis() - lastParentPresenceTimestampMs > PARENT_SESSION_TIMEOUT_MS) {
+      parentSessionActive = false
+      return false
+    }
+    return true
+  }
+
+  /** PARENT_SESSION_START / PARENT_SESSION_STOP от родителя. */
+  fun setParentSessionActive(active: Boolean) {
+    parentSessionActive = active
+    if (active) lastParentPresenceTimestampMs = System.currentTimeMillis()
+    Log.d(TAG, "Parent session " + if (active) "START" else "STOP")
   }
 
   /**
@@ -185,6 +205,7 @@ object DirectP2pSocketEngine {
    */
   fun markParentPresenceActive(childId: Long = 0L) {
     val wasOffline = !isParentActivelyConnected()
+    parentSessionActive = true
     lastParentPresenceTimestampMs = System.currentTimeMillis()
     if (wasOffline && currentRole == "CHILD") {
       val ctx = appContext ?: return
@@ -322,20 +343,38 @@ object DirectP2pSocketEngine {
     val cm = ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
       as? ConnectivityManager ?: return
     if (networkMonitorCallback != null) return
+    var prevWifi = hasWifi
+    var prevCell = hasCellular
+    var prevAny = hasAnyNetwork
     val cb = object : ConnectivityManager.NetworkCallback() {
+      // Переподключаем сокет ТОЛЬКО при реальной смене типа сети (Wi-Fi <-> мобильная),
+      // при появлении сети после полного оффлайна или когда сокет сам упал.
+      // Раньше wakeGlobalTcp() вызывался на каждый onCapabilitiesChanged — при гашении
+      // экрана или лёгком изменении сигнала движок сам убивал живой сокет (обрыв на 91%).
+      private fun transportChanged(): Boolean {
+        val w = hasWifi
+        val c = hasCellular
+        val a = hasAnyNetwork
+        val changed = (w != prevWifi) || (c != prevCell) || (a && !prevAny)
+        prevWifi = w
+        prevCell = c
+        prevAny = a
+        return changed
+      }
+
       override fun onAvailable(network: Network) {
         refreshNetworkState()
-        wakeGlobalTcp()
+        if (transportChanged()) wakeGlobalTcp()
       }
 
       override fun onLost(network: Network) {
         refreshNetworkState()
-        wakeGlobalTcp()
+        if (transportChanged()) wakeGlobalTcp()
       }
 
       override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
         refreshNetworkState()
-        wakeGlobalTcp()
+        if (transportChanged()) wakeGlobalTcp()
       }
     }
     val req = NetworkRequest.Builder()
@@ -634,45 +673,54 @@ object DirectP2pSocketEngine {
           // его там не услышит, и трафик/батарея тратится зря.
           val wifiIp = wifiIpv4()
           _status.value = _status.value.copy(localDeviceIp = getLocalIpv4Address())
+          val lanConnected = _status.value.isLanSocketConnected || connectedParentClients.isNotEmpty()
+          // Ребёнок шлёт маяк ТОЛЬКО когда родитель активен или когда LAN-соединения
+          // ещё нет. В тихом режиме (родитель свернул приложение) маяк молчит.
+          val parentActive = isParentActivelyConnected()
+          val shouldChildBeacon = !lanConnected || parentActive
           if (!wifiIp.isNullOrBlank() && wifiIp != "0.0.0.0" && wifiIp != "127.0.0.1") {
             if (currentRole == "CHILD" && !LiveLocationTracker.isEmulator()) {
-              val cachedChild = RealtimeCloudRelay.getCachedChild(thisDeviceBoundChildId)
-              val beacon = JSONObject().apply {
-                put("type", "P2P_BEACON")
-                put("childId", thisDeviceBoundChildId)
-                if (cachedChild != null && cachedChild.pairingCode.isNotBlank()) {
-                  put("pairingCode", cachedChild.pairingCode)
-                  put("name", cachedChild.name)
-                }
-                put("lanIp", wifiIp)
-                put("port", TCP_PORT)
-                put("appVersion", BuildConfig.VERSION_NAME)
-                put("ts", System.currentTimeMillis())
-              }.toString().toByteArray(Charsets.UTF_8)
+              if (shouldChildBeacon) {
+                val cachedChild = RealtimeCloudRelay.getCachedChild(thisDeviceBoundChildId)
+                val beacon = JSONObject().apply {
+                  put("type", "P2P_BEACON")
+                  put("childId", thisDeviceBoundChildId)
+                  if (cachedChild != null && cachedChild.pairingCode.isNotBlank()) {
+                    put("pairingCode", cachedChild.pairingCode)
+                    put("name", cachedChild.name)
+                  }
+                  put("lanIp", wifiIp)
+                  put("port", TCP_PORT)
+                  put("appVersion", BuildConfig.VERSION_NAME)
+                  put("ts", System.currentTimeMillis())
+                }.toString().toByteArray(Charsets.UTF_8)
 
-              try {
-                val broadcastAddr = InetAddress.getByName("255.255.255.255")
-                udpSocket.send(DatagramPacket(beacon, beacon.size, broadcastAddr, UDP_DISCOVERY_PORT))
-              } catch (_: Exception) {}
-
-              val parts = wifiIp.split(".")
-              if (parts.size == 4) {
                 try {
-                  val subnetBroadcast = InetAddress.getByName("${parts[0]}.${parts[1]}.${parts[2]}.255")
-                  udpSocket.send(DatagramPacket(beacon, beacon.size, subnetBroadcast, UDP_DISCOVERY_PORT))
+                  val broadcastAddr = InetAddress.getByName("255.255.255.255")
+                  udpSocket.send(DatagramPacket(beacon, beacon.size, broadcastAddr, UDP_DISCOVERY_PORT))
                 } catch (_: Exception) {}
+
+                val parts = wifiIp.split(".")
+                if (parts.size == 4) {
+                  try {
+                    val subnetBroadcast = InetAddress.getByName("${parts[0]}.${parts[1]}.${parts[2]}.255")
+                    udpSocket.send(DatagramPacket(beacon, beacon.size, subnetBroadcast, UDP_DISCOVERY_PORT))
+                  } catch (_: Exception) {}
+                }
               }
             } else if (currentRole != "CHILD") {
               // Parent role: broadcast known child profiles over LAN UDP so Child phones on same Wi-Fi can pair immediately!
               RealtimeCloudRelay.broadcastCachedChildrenOverLanUdp()
             }
           }
-          // Пока LAN не найден — маяк раз в 30 с (вместо 10 с), чтобы не будить Wi-Fi
-          // радио каждые 10 секунд на простаивающем телефоне ребёнка. После соединения — реже.
           val isAlreadyConnected = _status.value.isLanSocketConnected ||
             _status.value.isGlobalTcpSocketConnected ||
             connectedParentClients.isNotEmpty()
-          val beaconDelay = if (isAlreadyConnected) 60_000L else 30_000L
+          val beaconDelay = when {
+            !shouldChildBeacon -> 60_000L
+            isAlreadyConnected -> 60_000L
+            else -> 30_000L
+          }
           delay(beaconDelay)
         }
       } catch (_: Exception) {
@@ -845,7 +893,7 @@ object DirectP2pSocketEngine {
             // 3. Keepalive ping loop (battery-friendly 90s interval matching 120s MQTT keepalive)
             val pingJob = launch {
               while (isActive && sock.isConnected && !sock.isClosed) {
-                delay(90_000L)
+                delay(270_000L)
                 synchronized(globalWriteLock) {
                   try {
                     out.write(byteArrayOf(0xC0.toByte(), 0x00))
@@ -959,7 +1007,8 @@ object DirectP2pSocketEngine {
     body.write(4) // Protocol level 4 (MQTT 3.1.1)
     body.write(0x02) // Clean session
     body.write(0x00)
-    body.write(0x78) // Keepalive 120s
+    body.write(0x01)
+    body.write(0x0E) // Keepalive 270s (4.5 мин) — тихий сокет в покое
     writeUtf8String(body, clientId)
     val bodyBytes = body.toByteArray()
 

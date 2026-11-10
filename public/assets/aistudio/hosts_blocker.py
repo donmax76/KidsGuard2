@@ -27,6 +27,7 @@ import io
 import ipaddress
 import json
 import math
+import multiprocessing
 import os
 import re
 import secrets
@@ -39,6 +40,7 @@ import sys
 import threading
 import time
 import traceback
+import atexit
 import zlib
 try:
     from PIL import Image as _PILImage
@@ -1508,6 +1510,61 @@ def limit_text(e, u):
     return " · ".join(parts)
 
 
+def _user_today(u, username):
+    username = (username or "").strip()
+    if not username:
+        return u.setdefault("today", {})
+    return u.setdefault("users", {}).setdefault(username, {}).setdefault("today", {})
+
+
+def _user_total(u, username):
+    username = (username or "").strip()
+    if not username:
+        return u.setdefault("total", {})
+    return u.setdefault("users", {}).setdefault(username, {}).setdefault("total", {})
+
+
+def blocked_now_for(e, u, username):
+    """То же, что blocked_now, но лимиты считаются по конкретному пользователю Windows."""
+    if not e["enabled"]:
+        return False
+    L = e["limit"]
+    if not has_limit(e):
+        return True
+    if L["from"] and L["to"] and not in_window(L):
+        return True
+    n = e["name"]
+    today = _user_today(u, username)
+    total = _user_total(u, username)
+    if L["daily"] and today.get(n, 0) >= L["daily"] * 60:
+        return True
+    if L["total"] and total.get(n, 0) >= L["total"] * 60:
+        return True
+    return False
+
+
+def limit_text_for(e, u, username):
+    if not e["enabled"] or not has_limit(e):
+        return ""
+    if blocked_now_for(e, u, username):
+        return "🔒 заблокировано (лимит исчерпан или не разрешённое время)"
+    L, n = e["limit"], e["name"]
+    today = _user_today(u, username)
+    total = _user_total(u, username)
+    parts = []
+    if L["daily"]:
+        parts.append(f"сегодня осталось {max(0, L['daily'] * 60 - int(today.get(n, 0))) // 60} мин")
+    if L["total"]:
+        parts.append(f"всего осталось {max(0, L['total'] * 60 - int(total.get(n, 0))) // 60} мин")
+    if L["from"] and L["to"]:
+        parts.append(f"разрешено {L['from']}–{L['to']}")
+    return " · ".join(parts)
+
+
+def effective_for(entries, u, username):
+    return [dict(e, enabled=blocked_now_for(e, u, username)) for e in entries]
+
+
 def load_usage():
     try:
         with open(USAGE_FILE, "r", encoding="utf-8") as f:
@@ -1516,6 +1573,7 @@ def load_usage():
         u = {}
     u.setdefault("today", {})
     u.setdefault("total", {})
+    u.setdefault("users", {})
     day = datetime.date.today().isoformat()
     if u.get("day") != day:
         u["day"], u["today"] = day, {}
@@ -1545,9 +1603,24 @@ def send_reset(name):
 
 
 def apply_all(entries, u):
-    """Применяет hosts + политики + файрвол по ЭФФЕКТИВНОМУ состоянию."""
+    """Применяет hosts + политики + файрвол по ЭФФЕКТИВНОМУ состоянию (без учёта пользователя)."""
     errors = []
     eff = effective(entries, u)
+    for label, fn in (("hosts", apply_hosts), ("браузеры", apply_browser_policies),
+                      ("файрвол", apply_firewall)):
+        try:
+            fn(eff)
+        except PermissionError:
+            errors.append(f"{label}: нет доступа (нужны права администратора)")
+        except Exception as ex:
+            errors.append(f"{label}: {ex}")
+    return errors
+
+
+def apply_all_for(entries, u, username):
+    """Применяет блокировки/лимиты по эффективному состоянию для конкретного пользователя."""
+    errors = []
+    eff = effective_for(entries, u, username)
     for label, fn in (("hosts", apply_hosts), ("браузеры", apply_browser_policies),
                       ("файрвол", apply_firewall)):
         try:
@@ -2446,6 +2519,26 @@ def _avi_close(f, pos, frames, fps, max_frame):
     f.close()
 
 
+# Открытая запись (для корректного закрытия заголовка AVI при аварийном выходе).
+_REC_OPEN = {"f": None, "pos": None, "frames": 0, "fps": 10.0, "max": 0, "path": ""}
+
+
+def _close_recording_file():
+    try:
+        if _REC_OPEN.get("f") is not None:
+            _avi_close(_REC_OPEN["f"], _REC_OPEN["pos"],
+                       int(_REC_OPEN.get("frames") or 0),
+                       float(_REC_OPEN.get("fps") or 10.0),
+                       int(_REC_OPEN.get("max") or 0))
+    except Exception:
+        pass
+    finally:
+        _REC_OPEN.update(f=None, pos=None, frames=0, max=0, path="")
+
+
+atexit.register(_close_recording_file)
+
+
 def request_hd_screenshot():
     """Просит агент пользовательского сеанса сохранить PNG в исходном разрешении."""
     try:
@@ -2536,14 +2629,17 @@ def agent_main():
            "started": 0.0, "next": 0.0, "fps": 10.0, "quality": 85,
            "w": 0, "h": 0, "max": 0}
     last_rec_poll = 0.0
+    # Для определения «программа/окно закрылась и снова открылась» — обновляем
+    # таймстамп запуска при каждом новом открытии после закрытия.
+    prev_proc = None
+    prev_title_key = None
 
     def _stop_recording(error=""):
-        if not rec.get("active") and rec.get("f") is None:
+        if not rec.get("active") and _REC_OPEN.get("f") is None:
             return
+        # try/finally + atexit: заголовок AVI закрывается даже при выходе/падении.
         try:
-            if rec.get("f") is not None:
-                _avi_close(rec["f"], rec["pos"], int(rec.get("frames") or 0),
-                           float(rec.get("fps") or 10.0), int(rec.get("max") or 0))
+            _close_recording_file()
         except Exception:
             log_error("record stop: " + traceback.format_exc())
         secs = int(max(0.0, time.time() - float(rec.get("started") or time.time())))
@@ -2576,11 +2672,21 @@ def agent_main():
         now_mono_ms = int(time.time() * 1000)
         if proc:
             proc_sec[proc] = proc_sec.get(proc, 0) + 1
-            proc_started.setdefault(proc, now_mono_ms)
+            if prev_proc != proc:
+                # Программа открылась заново после закрытия (или впервые) — фиксируем
+                # точное время последнего запуска.
+                proc_started[proc] = now_mono_ms
+                prev_proc = proc
+        else:
+            prev_proc = None
         key = title.strip()[:70]
         if key:
             title_sec[key] = title_sec.get(key, 0) + 1
-            title_started.setdefault(key, now_mono_ms)
+            if prev_title_key != key:
+                title_started[key] = now_mono_ms
+                prev_title_key = key
+        else:
+            prev_title_key = None
         # Файл активного окна обновляем раз в 3 секунды — этого достаточно, а диск не дёргаем ежесекундно.
         if time.time() - last_agent_write >= 3:
             last_agent_write = time.time()
@@ -2702,6 +2808,7 @@ def agent_main():
                                 "screen_%s.avi" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                             )
                             rf, rpos = _avi_open(rpath, rw, rh, rfps)
+                            _REC_OPEN.update(f=rf, pos=rpos, frames=0, fps=rfps, max=0, path=rpath)
                             rec.update({
                                 "active": True, "f": rf, "pos": rpos, "path": rpath,
                                 "frames": 0, "started": time.time(), "next": 0.0,
@@ -2728,6 +2835,8 @@ def agent_main():
                         _avi_append(rec["f"], frame[0])
                         rec["frames"] = int(rec.get("frames") or 0) + 1
                         rec["max"] = max(int(rec.get("max") or 0), len(frame[0]))
+                        _REC_OPEN["frames"] = rec["frames"]
+                        _REC_OPEN["max"] = rec["max"]
                         rec["next"] = now_rec + 1.0 / max(1.0, float(rec.get("fps") or 10))
                         if rec["frames"] % 10 == 0:
                             _write_json_atomic(RECORD_STATUS, {
@@ -2845,9 +2954,17 @@ def engine_tick(st):
         st["dirty"] = True
 
     procs, agents = running_names(), fresh_agents()
+    # Активные пользователи Windows сейчас за компьютером.
+    active_users = {str(a.get("user") or "").strip() for a in agents}
+    active_users.discard("")
+    acct = st["cfg"].get("child_account", "") or detect_active_username(st["cfg"])
     if agents:  # кто-то реально активен за компьютером — считаем это время
         u["today"]["__computer__"] = u["today"].get("__computer__", 0) + dt
         u["total"]["__computer__"] = u["total"].get("__computer__", 0) + dt
+        # Время ПК считаем и по каждому пользователю Windows отдельно.
+        for username in active_users:
+            _user_today(u, username)["__computer__"] = _user_today(u, username).get("__computer__", 0) + dt
+            _user_total(u, username)["__computer__"] = _user_total(u, username).get("__computer__", 0) + dt
         st["dirty"] = True
 
     fl_now = full_blocked(st["cfg"], u)
@@ -2861,17 +2978,21 @@ def engine_tick(st):
             log_error("full_lock: " + traceback.format_exc())
 
     for e in entries:  # считаем время только пока запись реально используется
-        if e["enabled"] and has_limit(e) and not blocked_now(e, u) and in_use(e, procs, agents):
+        if e["enabled"] and has_limit(e) and not blocked_now_for(e, u, acct) and in_use(e, procs, agents):
             n = e["name"]
             u["today"][n] = u["today"].get(n, 0) + dt
             u["total"][n] = u["total"].get(n, 0) + dt
+            # Время использования программы считаем и по конкретным пользователям.
+            for username in (active_users or [acct]):
+                _user_today(u, username)[n] = _user_today(u, username).get(n, 0) + dt
+                _user_total(u, username)[n] = _user_total(u, username).get(n, 0) + dt
             st["dirty"] = True
 
-    eff = effective(entries, u)
+    eff = effective_for(entries, u, acct)
     sig = (tuple(sorted(e["name"] for e in eff if e["enabled"])), st["mtime"])
     if sig != st["sig"]:  # состояние изменилось — применяем всё сразу
         st["sig"] = sig
-        for err in apply_all(entries, u):
+        for err in apply_all_for(entries, u, acct):
             log_error("apply: " + err)
 
     names = set()  # закрываем запущенные программы в реальном времени
@@ -3278,6 +3399,7 @@ def panel_state(csrf, full=True):
     if act_out:
         act_by_date[today_iso] = act_out
     agents = fresh_agents()
+    acct = cfg.get("child_account", "") or detect_active_username(cfg)
     return {
         "csrf": csrf,
         "pc_name": socket.gethostname(),
@@ -3306,8 +3428,8 @@ def panel_state(csrf, full=True):
             {
                 "name": e["name"],
                 "enabled": e["enabled"],
-                "blocked": blocked_now(e, u),
-                "text": limit_text(e, u),
+                "blocked": blocked_now_for(e, u, acct),
+                "text": limit_text_for(e, u, acct),
                 "limit": e["limit"],
                 "domains_count": len(e["domains"]),
                 "programs_count": len(e["programs"]),
@@ -3315,8 +3437,8 @@ def panel_state(csrf, full=True):
                 "domains": e["domains"][:15],
                 "programs": e["programs"][:15],
                 "ips": e["ips"][:15],
-                "today_sec": int(u["today"].get(e["name"], 0)),
-                "total_sec": int(u["total"].get(e["name"], 0))
+                "today_sec": int(_user_today(u, acct).get(e["name"], u["today"].get(e["name"], 0))),
+                "total_sec": int(_user_total(u, acct).get(e["name"], u["total"].get(e["name"], 0)))
             }
             for e in cfg["entries"]
         ],
@@ -3629,6 +3751,38 @@ def p2p_bridge_worker(st, host, port):
             last_pub = 0.0
             last_full_pub = 0.0
             last_screen_pub = 0.0
+            write_lock = threading.Lock()
+
+            def pub(topic, payload, retain=False):
+                with write_lock:
+                    sock.sendall(_mqtt_pub_pkt(topic, payload, retain=retain))
+
+            def pub_bytes(topic, payload_bytes, retain=False):
+                with write_lock:
+                    sock.sendall(_mqtt_pub_pkt_bytes(topic, payload_bytes, retain=retain))
+
+            def send_screen_in_thread(force):
+                # Захват экрана может ждать агента ~1.5 с — не блокируем приём команд
+                # и отправку PC_STATE этим ожиданием.
+                def _run():
+                    scr = panel_screen(force=force)
+                    if not scr.get("ok"):
+                        return
+                    scr_json_str = json.dumps({
+                        "type": "PC_SCREEN",
+                        "pairing_code": code,
+                        "pc_id": pc_id(),
+                        "screen_b64": scr["screen_b64"],
+                        "fmt": scr.get("fmt", "image/png"),
+                        "ts": scr.get("ts", int(time.time() * 1000))
+                    }, ensure_ascii=False)
+                    for r in roots:
+                        try:
+                            pub(f"{r}/pc_screen/{code}", scr_json_str, retain=True)
+                        except Exception:
+                            return
+                threading.Thread(target=_run, daemon=True).start()
+
             while True:
                 now = time.time()
                 cur_cfg = st.get("cfg") or load_config() or {}
@@ -3650,7 +3804,7 @@ def p2p_bridge_worker(st, host, port):
                     state_json_str = json.dumps(state_payload, ensure_ascii=False)
                     for r in roots:
                         # Лёгкий пакет retained (его получают новые подписчики), полный — только живьём.
-                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_state/{code}", state_json_str, retain=not want_full))
+                        pub(f"{r}/pc_state/{code}", state_json_str, retain=not want_full)
                     # Одиночный кадр для превью (не чаще раза в 30 с и не во время потока).
                     if not stream_is_active() and (now - last_screen_pub) >= 30.0:
                         last_screen_pub = now
@@ -3665,7 +3819,7 @@ def p2p_bridge_worker(st, host, port):
                                 "ts": scr_auto.get("ts", int(time.time() * 1000))
                             }, ensure_ascii=False)
                             for r in roots:
-                                sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+                                pub(f"{r}/pc_screen/{code}", scr_json_str, retain=True)
 
                 try:
                     h = _mqtt_read_exact(sock, 1)[0]
@@ -3721,18 +3875,8 @@ def p2p_bridge_worker(st, host, port):
                                 request_record("stop")
                             if action == "/api/screen":
                                 # Снимок — просмотр, не изменение правил: пароль панели не требуем.
-                                scr_res = panel_screen(force=True)
-                                if scr_res.get("ok"):
-                                    scr_json_str = json.dumps({
-                                        "type": "PC_SCREEN",
-                                        "pairing_code": code,
-                                        "pc_id": pc_id(),
-                                        "screen_b64": scr_res["screen_b64"],
-                                        "fmt": scr_res.get("fmt", "image/png"),
-                                        "ts": scr_res.get("ts", int(time.time() * 1000))
-                                    }, ensure_ascii=False)
-                                    for r in roots:
-                                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+                                # Выполняем в фоне, чтобы не задерживать PC_STATE/команды.
+                                send_screen_in_thread(True)
                                 last_screen_pub = time.time()
                             if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
                                           "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync",
@@ -3745,25 +3889,18 @@ def p2p_bridge_worker(st, host, port):
                                     state_payload["auth_error"] = auth_error
                                 state_json_str = json.dumps(state_payload, ensure_ascii=False)
                                 for r in roots:
-                                    sock.sendall(_mqtt_pub_pkt(f"{r}/pc_state/{code}", state_json_str, retain=True))
+                                    pub(f"{r}/pc_state/{code}", state_json_str, retain=True)
                                 if is_sync:
-                                    scr_now = panel_screen(force=True)
-                                    if scr_now.get("ok"):
-                                        scr_json_str = json.dumps({
-                                            "type": "PC_SCREEN",
-                                            "pairing_code": code,
-                                            "pc_id": pc_id(),
-                                            "screen_b64": scr_now["screen_b64"],
-                                            "fmt": scr_now.get("fmt", "image/png"),
-                                            "ts": scr_now.get("ts", int(time.time() * 1000))
-                                        }, ensure_ascii=False)
-                                        for r in roots:
-                                            sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+                                    send_screen_in_thread(True)
                                     last_screen_pub = time.time()
                                 last_pub = time.time()
                                 last_full_pub = time.time() if is_sync else last_full_pub
                 except socket.timeout:
-                    sock.sendall(bytes([0xC0, 0x00]))
+                    try:
+                        with write_lock:
+                            sock.sendall(bytes([0xC0, 0x00]))
+                    except Exception:
+                        break
         except Exception:
             # Мёртвый брокер не должен долбиться каждые 3 секунды — плавный backoff.
             fails += 1
@@ -4133,6 +4270,8 @@ ASSETS = {
 }
 
 if __name__ == "__main__":
+    # PyInstaller onefile: не даём порождать дубли процессов на каждый запуск.
+    multiprocessing.freeze_support()
     if "--engine" in sys.argv:
         engine_main()
         sys.exit(0)

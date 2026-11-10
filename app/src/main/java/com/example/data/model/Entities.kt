@@ -164,6 +164,8 @@ data class OfflineActivityLogEntity(
   val hourOfDay: Int = 12, // 0..23 for hourly Recharts chart
   val dateIso: String = "", // YYYY-MM-DD
   val timestamp: Long = System.currentTimeMillis(),
+  /** Точное время открытия (запуска) программы/окна (epoch ms). 0 = неизвестно. */
+  val startedAtMs: Long = 0L,
   val isSyncedToParent: Boolean = false
 )
 
@@ -204,7 +206,9 @@ data class AggregatedActivityByDateItem(
   val windowTitle: String,
   val deviceType: String,
   val totalDurationSeconds: Long,
-  val lastTimestamp: Long
+  val lastTimestamp: Long,
+  /** Время последнего открытия (запуска) программы/окна за период. */
+  val startedAtMs: Long = 0L
 )
 
 

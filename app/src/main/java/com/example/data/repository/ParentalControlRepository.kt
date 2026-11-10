@@ -626,6 +626,19 @@ class ParentalControlRepository(private val context: Context) {
                       // Родитель закрыл просмотр — сразу отцепляем зеркало экрана (экономия батареи).
                       com.example.service.KidsGuardAccessibilityService.stopLiveStreamingWindow()
                     }
+                    "PARENT_SESSION_START" -> {
+                      com.example.data.cloud.DirectP2pSocketEngine.setParentSessionActive(true)
+                      com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(thisChildId)
+                      val sessBatt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(context)
+                      dao.updateChildBattery(thisChildId, sessBatt)
+                      cloudSync.upsertBatteryLevel(thisChildId, sessBatt)
+                      com.example.data.cloud.RealtimeCloudRelay.publishChildPong(thisChildId)
+                      cloudSync.clearRemoteCommand(thisChildId)
+                    }
+                    "PARENT_SESSION_STOP" -> {
+                      com.example.data.cloud.DirectP2pSocketEngine.setParentSessionActive(false)
+                      cloudSync.clearRemoteCommand(thisChildId)
+                    }
                     "PING" -> {
                       // Ответ на PING родителя для честного индикатора «Онлайн»
                       // (даже если фоновый сервис ещё не поднялся).
