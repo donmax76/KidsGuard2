@@ -1,5 +1,42 @@
 # KidsGuard2 — HANDOFF
 
+## Финальная сборка (сессия 2026-11-11)
+
+- **Финальный рабочий коммит: `080ff35`**
+- **Успешный CI-run: #38** — https://github.com/donmax76/KidsGuard2/actions/runs/42987379620
+- Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
+- Run #37 (`b030cc1`) падал на компиляции Kotlin: в откаченном к 2767069
+  `DirectP2pSocketEngine.kt` не было `setParentSessionActive`, который вызывают
+  `ParentalControlRepository`/`KidsGuardBackgroundService`. Добавлен совместимый
+  метод в `080ff35`; run #38 — success.
+
+### Артефакты run #38
+
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/13839967619/zip
+  (~20,85 МБ; внутри `app-debug.apk`)
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/13840107291/zip
+  (~19,0 МБ; внутри `hosts_blocker.exe` + `hosts_blocker.py`)
+- Страница run: https://github.com/donmax76/KidsGuard2/actions/runs/42987379620
+
+### Что сделано в этой сессии
+
+- **Android P2P**: `DirectP2pSocketEngine.kt`, `RealtimeCloudRelay.kt`, `MainActivity.kt`
+  откачены к стабильному `2767069` (run #32). Убран `wakeGlobalTcp()` из
+  `onCapabilitiesChanged` (сокет не рвётся при выключении экрана).
+  `REQUEST_POWER_STATS` убран из 40-секундного цикла heartbeat.
+- **ПК-агент**: `p2p_bridge_worker` возвращён к рабочей версии `2767069`
+  (без `write_lock`/фоновых обёрток). Отдельная задача `--watchdog` удалена,
+  проверка агента перенесена в цикл `--engine` (раз в 15 с); `single_instance()`
+  завершает дубликат через `os._exit(0)`; перед установкой —
+  `taskkill /F /T /IM HostsBlockerEngine.exe`. Сохранены: время последнего запуска
+  программ (`proc_started`/`title_started`), раздельные лимиты пользователей
+  Windows (`usage.json -> users`), закрытие AVI через `atexit`, мгновенное
+  сохранение снятия лимита/блокировки.
+- Все копии `hosts_blocker.py` синхронизированы (SHA-256 совпадает), `py_compile` — OK.
+
+---
+
+
 Репозиторий: https://github.com/donmax76/KidsGuard2.git  
 Ветка: `main`  
 Финальный рабочий коммит: **`3ecdf4f`**  
