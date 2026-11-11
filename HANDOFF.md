@@ -2,17 +2,31 @@
 
 Репозиторий: https://github.com/donmax76/KidsGuard2.git  
 Ветка: `main`  
-Финальный рабочий коммит: **`3b63708`**  
-Успешный CI-run: **#35** — https://github.com/donmax76/KidsGuard2/actions/runs/42864496432  
+Финальный рабочий коммит: **`3ecdf4f`**  
+Успешный CI-run: **#36** — https://github.com/donmax76/KidsGuard2/actions/runs/42982124940  
 Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
 
-## Артефакты run #35
+## Артефакты run #36
 
-- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/13786851846/zip
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/13838241727/zip
   (~20,85 МБ; внутри `app-debug.apk`)
-- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/13785514455/zip
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/13837089737/zip
   (~19,0 МБ; внутри `hosts_blocker.exe` + `hosts_blocker.py`)
-- Страница run: https://github.com/donmax76/KidsGuard2/actions/runs/42864496432
+- Страница run: https://github.com/donmax76/KidsGuard2/actions/runs/42982124940
+
+## ОТКАТ «whatsapp-режима» (коммит `3ecdf4f`) — восстановление P2P
+
+- Убраны `parentSessionActive`/10-минутный «тихий сон»; `isParentActivelyConnected()`
+  снова работает по 95-секундному присутствию.
+- `childNetworkAllowed()` всегда `true`; блокировки P2P по сети удалены.
+- `Network.bindSocket()` удалён полностью — ОС сама маршрутизирует TCP.
+- MQTT keepalive возвращён на **120 с**, сокетный PINGREQ — **90 с** (стабильная #32).
+- `startNetworkMonitor()` снова переподключает сокет на любом изменении сети.
+- UDP-маяк ребёнка снова шлётся постоянно (без гейта по сессии родителя).
+- ПК: `Global\HostsBlockerEngineUniqueMutex` + `os._exit(0)` при
+  `ERROR_ALREADY_EXISTS`; `multiprocessing.freeze_support()` первой строкой;
+  `taskkill /F /T /IM HostsBlockerEngine.exe` перед копированием/запуском.
+  Должен оставаться ровно 1 процесс движка.
 
 ## HOTFIX после #34 — причина падения P2P и 4 процессов
 
