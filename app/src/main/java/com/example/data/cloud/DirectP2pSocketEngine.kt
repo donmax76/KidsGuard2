@@ -179,6 +179,11 @@ object DirectP2pSocketEngine {
     return lastParentPresenceTimestampMs > 0L && elapsed in 0..PARENT_PRESENCE_TIMEOUT_MS
   }
 
+  /** PARENT_SESSION_START/STOP: отмечаем присутствие (без «тихого сна»). */
+  fun setParentSessionActive(active: Boolean) {
+    if (active) lastParentPresenceTimestampMs = System.currentTimeMillis()
+  }
+
   /**
    * Marks the Parent app as actively connected and triggers a bulk SQLite store-and-forward flush
    * if transitioning from offline to online on the Child device.
