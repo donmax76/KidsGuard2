@@ -1427,8 +1427,7 @@ USAGE_FILE = os.path.join(CONF_DIR, "usage.json")
 RESET_FILE = os.path.join(CONF_DIR, "reset.json")
 BIN_DIR = os.path.join(CONF_DIR, "bin")
 LOG_FILE = os.path.join(CONF_DIR, "error.log")
-ENGINE_TASKS = (("HostsBlockerEngine", ["/SC", "ONSTART"]),
-                ("HostsBlockerWatchdog", ["/SC", "MINUTE", "/MO", "5"]))
+ENGINE_TASKS = (("HostsBlockerEngine", ["/SC", "ONSTART"]),)
 RUN_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "HostsBlockerAgent"
 BROWSERS = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
@@ -3020,9 +3019,25 @@ def engine_tick(st):
         st["dirty"], st["saved"] = False, now
 
 
+def _agent_launch_cmd():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --agent'
+    py = sys.executable
+    if py.lower().endswith("python.exe"):
+        py = py[:-10] + "pythonw.exe"
+    return f'"{py}" "{os.path.abspath(__file__)}" --agent'
+
+
 def engine_main():
     if not single_instance("Global\\HostsBlockerEngineUniqueMutex"):
         return
+    # Больше нет отдельной задачи HostsBlockerWatchdog — удаляем её, если осталась
+    # со старой установки, чтобы не плодились лишние процессы движка.
+    try:
+        run_hidden(["schtasks", "/End", "/TN", "HostsBlockerWatchdog"])
+        run_hidden(["schtasks", "/Delete", "/TN", "HostsBlockerWatchdog", "/F"])
+    except Exception:
+        pass
     ensure_pub_dir()
     st = {"t": time.time(), "cfg": None, "mtime": 0, "u": load_usage(), "sig": None,
           "kws": None, "dirty": False, "saved": time.time(), "full_prev": None}
@@ -3030,7 +3045,17 @@ def engine_main():
     threading.Thread(target=p2p_bridge_loop, args=(st,), daemon=True).start()
     threading.Thread(target=p2p_stream_loop, args=(st,), daemon=True).start()
     threading.Thread(target=udp_discovery_loop, args=(st,), daemon=True).start()
+    last_agent_check = 0.0
     while True:
+        now = time.time()
+        # Движок сам следит, что агент в активной сессии жив (раз в 15 с).
+        if now - last_agent_check >= 15.0:
+            last_agent_check = now
+            try:
+                if not fresh_agents():
+                    subprocess.Popen(_agent_launch_cmd(), creationflags=NO_WINDOW)
+            except Exception:
+                log_error("agent check: " + traceback.format_exc())
         try:
             engine_tick(st)
         except Exception:
@@ -3756,38 +3781,6 @@ def p2p_bridge_worker(st, host, port):
             last_pub = 0.0
             last_full_pub = 0.0
             last_screen_pub = 0.0
-            write_lock = threading.Lock()
-
-            def pub(topic, payload, retain=False):
-                with write_lock:
-                    sock.sendall(_mqtt_pub_pkt(topic, payload, retain=retain))
-
-            def pub_bytes(topic, payload_bytes, retain=False):
-                with write_lock:
-                    sock.sendall(_mqtt_pub_pkt_bytes(topic, payload_bytes, retain=retain))
-
-            def send_screen_in_thread(force):
-                # Захват экрана может ждать агента ~1.5 с — не блокируем приём команд
-                # и отправку PC_STATE этим ожиданием.
-                def _run():
-                    scr = panel_screen(force=force)
-                    if not scr.get("ok"):
-                        return
-                    scr_json_str = json.dumps({
-                        "type": "PC_SCREEN",
-                        "pairing_code": code,
-                        "pc_id": pc_id(),
-                        "screen_b64": scr["screen_b64"],
-                        "fmt": scr.get("fmt", "image/png"),
-                        "ts": scr.get("ts", int(time.time() * 1000))
-                    }, ensure_ascii=False)
-                    for r in roots:
-                        try:
-                            pub(f"{r}/pc_screen/{code}", scr_json_str, retain=True)
-                        except Exception:
-                            return
-                threading.Thread(target=_run, daemon=True).start()
-
             while True:
                 now = time.time()
                 cur_cfg = st.get("cfg") or load_config() or {}
@@ -3809,7 +3802,7 @@ def p2p_bridge_worker(st, host, port):
                     state_json_str = json.dumps(state_payload, ensure_ascii=False)
                     for r in roots:
                         # Лёгкий пакет retained (его получают новые подписчики), полный — только живьём.
-                        pub(f"{r}/pc_state/{code}", state_json_str, retain=not want_full)
+                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_state/{code}", state_json_str, retain=not want_full))
                     # Одиночный кадр для превью (не чаще раза в 30 с и не во время потока).
                     if not stream_is_active() and (now - last_screen_pub) >= 30.0:
                         last_screen_pub = now
@@ -3824,7 +3817,7 @@ def p2p_bridge_worker(st, host, port):
                                 "ts": scr_auto.get("ts", int(time.time() * 1000))
                             }, ensure_ascii=False)
                             for r in roots:
-                                pub(f"{r}/pc_screen/{code}", scr_json_str, retain=True)
+                                sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
 
                 try:
                     h = _mqtt_read_exact(sock, 1)[0]
@@ -3880,8 +3873,18 @@ def p2p_bridge_worker(st, host, port):
                                 request_record("stop")
                             if action == "/api/screen":
                                 # Снимок — просмотр, не изменение правил: пароль панели не требуем.
-                                # Выполняем в фоне, чтобы не задерживать PC_STATE/команды.
-                                send_screen_in_thread(True)
+                                scr_res = panel_screen(force=True)
+                                if scr_res.get("ok"):
+                                    scr_json_str = json.dumps({
+                                        "type": "PC_SCREEN",
+                                        "pairing_code": code,
+                                        "pc_id": pc_id(),
+                                        "screen_b64": scr_res["screen_b64"],
+                                        "fmt": scr_res.get("fmt", "image/png"),
+                                        "ts": scr_res.get("ts", int(time.time() * 1000))
+                                    }, ensure_ascii=False)
+                                    for r in roots:
+                                        sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
                                 last_screen_pub = time.time()
                             if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
                                           "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync",
@@ -3894,18 +3897,25 @@ def p2p_bridge_worker(st, host, port):
                                     state_payload["auth_error"] = auth_error
                                 state_json_str = json.dumps(state_payload, ensure_ascii=False)
                                 for r in roots:
-                                    pub(f"{r}/pc_state/{code}", state_json_str, retain=True)
+                                    sock.sendall(_mqtt_pub_pkt(f"{r}/pc_state/{code}", state_json_str, retain=True))
                                 if is_sync:
-                                    send_screen_in_thread(True)
+                                    scr_now = panel_screen(force=True)
+                                    if scr_now.get("ok"):
+                                        scr_json_str = json.dumps({
+                                            "type": "PC_SCREEN",
+                                            "pairing_code": code,
+                                            "pc_id": pc_id(),
+                                            "screen_b64": scr_now["screen_b64"],
+                                            "fmt": scr_now.get("fmt", "image/png"),
+                                            "ts": scr_now.get("ts", int(time.time() * 1000))
+                                        }, ensure_ascii=False)
+                                        for r in roots:
+                                            sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
                                     last_screen_pub = time.time()
                                 last_pub = time.time()
                                 last_full_pub = time.time() if is_sync else last_full_pub
                 except socket.timeout:
-                    try:
-                        with write_lock:
-                            sock.sendall(bytes([0xC0, 0x00]))
-                    except Exception:
-                        break
+                    sock.sendall(bytes([0xC0, 0x00]))
         except Exception:
             # Мёртвый брокер не должен долбиться каждые 3 секунды — плавный backoff.
             fails += 1
@@ -4084,6 +4094,9 @@ def install_background():
     errs = []
     cmd = engine_command()
     ensure_pub_dir()
+    # Убираем устаревшую задачу Watchdog — её роль теперь выполняет сам движок.
+    run_hidden(["schtasks", "/End", "/TN", "HostsBlockerWatchdog"])
+    run_hidden(["schtasks", "/Delete", "/TN", "HostsBlockerWatchdog", "/F"])
     for name, sched in ENGINE_TASKS:
         r = run_hidden(["schtasks", "/Create", "/TN", name, "/TR", cmd + " --engine",
                         "/RU", "SYSTEM", "/RL", "HIGHEST", "/F"] + sched)
@@ -4109,6 +4122,8 @@ def uninstall_background():
     for name, _ in ENGINE_TASKS:
         run_hidden(["schtasks", "/End", "/TN", name])
         run_hidden(["schtasks", "/Delete", "/TN", name, "/F"])
+    run_hidden(["schtasks", "/End", "/TN", "HostsBlockerWatchdog"])
+    run_hidden(["schtasks", "/Delete", "/TN", "HostsBlockerWatchdog", "/F"])
     run_hidden(["taskkill", "/F", "/T", "/IM", "HostsBlockerEngine.exe"])
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RUN_KEY, 0,
