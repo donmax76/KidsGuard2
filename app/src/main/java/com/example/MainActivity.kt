@@ -70,37 +70,6 @@ class MainActivity : ComponentActivity() {
     if (!com.example.location.LiveLocationTracker.isEmulator()) {
       syncServicesWithCurrentRole()
     }
-    sendParentSessionCommand(active = true)
-  }
-
-  override fun onPause() {
-    super.onPause()
-    sendParentSessionCommand(active = false)
-  }
-
-  /**
-   * Уведомляет телефон ребёнка о том, что родитель открыл (START) или свернул (STOP)
-   * приложение. Ребёнок активен только во время сессии родителя — в покое он спит.
-   */
-  private fun sendParentSessionCommand(active: Boolean) {
-    lifecycleScope.launch(Dispatchers.IO) {
-      try {
-        val dao = KidsGuardDatabase.getDatabase(applicationContext).kidsGuardDao()
-        val cfg = dao.getFamilyConfigOnce()
-        if (cfg?.selectedRole != "PARENT") return@launch
-        val childId = cfg.currentActiveChildId.takeIf { it > 0L }
-          ?: dao.getAllChildrenOnce().firstOrNull()?.id
-          ?: return@launch
-        val command = if (active) "PARENT_SESSION_START" else "PARENT_SESSION_STOP"
-        com.example.data.cloud.CloudSyncManager(applicationContext)
-          .sendRemoteCommand(childId, command, "1")
-        if (active) {
-          // Один раз при открытии приложения, не в цикле — HealthStats дорогие.
-          com.example.data.cloud.CloudSyncManager(applicationContext)
-            .sendRemoteCommand(childId, "REQUEST_POWER_STATS", "1")
-        }
-      } catch (_: Exception) {}
-    }
   }
 
   private fun syncServicesWithCurrentRole() {
