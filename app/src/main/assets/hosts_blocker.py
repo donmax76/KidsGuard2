@@ -3021,7 +3021,7 @@ def engine_tick(st):
 
 
 def engine_main():
-    if not single_instance("Global\\HostsBlockerEngine"):
+    if not single_instance("Global\\HostsBlockerEngineUniqueMutex"):
         return
     ensure_pub_dir()
     st = {"t": time.time(), "cfg": None, "mtime": 0, "u": load_usage(), "sig": None,
@@ -4277,8 +4277,8 @@ ASSETS = {
 }
 
 if __name__ == "__main__":
-    # PyInstaller onefile: не даём порождать дубли процессов на каждый запуск.
     multiprocessing.freeze_support()
+    # PyInstaller onefile: не даём порождать дубли процессов на каждый запуск.
     if "--engine" in sys.argv:
         engine_main()
         sys.exit(0)

@@ -149,18 +149,10 @@ object DirectP2pSocketEngine {
   @Volatile
   var appContext: android.content.Context? = null
 
-  // Сессия присутствия родителя (PARENT_SESSION_START/STOP) вместо спама пингами.
-  // Ребёнок активен (телеметрия/маяки/GPS) только пока сессия жива; в покое он
-  // держит один тихий входящий сокет и почти не тратит батарею.
-  @Volatile
-  private var parentSessionActive = false
-
+  // Стабильный режим присутствия: без «тихого сна» по сессиям.
   @Volatile
   private var lastParentPresenceTimestampMs: Long = 0L
-
-  // Страховка от «родитель упал без PARENT_SESSION_STOP»: если пингов/команд
-  // не было дольше этого срока — сессия считается закрытой.
-  private const val PARENT_SESSION_TIMEOUT_MS = 10 * 60_000L
+  private const val PARENT_PRESENCE_TIMEOUT_MS = 95_000L
 
   // Отдельный сигнал «родитель открыл карту»: только тогда ребёнку нужен
   // высокоточный GPS. Обычное присутствие родителя (дашборд/чат) — ещё не повод
@@ -183,20 +175,13 @@ object DirectP2pSocketEngine {
   fun isParentActivelyConnected(): Boolean {
     if (currentRole != "CHILD") return true
     if (connectedParentClients.isNotEmpty() || _status.value.isLanSocketConnected) return true
-    if (!parentSessionActive) return false
-    // Таймаут-страховка: без пингов/команд сессия сама гаснет.
-    if (System.currentTimeMillis() - lastParentPresenceTimestampMs > PARENT_SESSION_TIMEOUT_MS) {
-      parentSessionActive = false
-      return false
-    }
-    return true
+    val elapsed = System.currentTimeMillis() - lastParentPresenceTimestampMs
+    return lastParentPresenceTimestampMs > 0L && elapsed in 0..PARENT_PRESENCE_TIMEOUT_MS
   }
 
-  /** PARENT_SESSION_START / PARENT_SESSION_STOP от родителя. */
+  /** Совместимость: сессия больше не усыпляет P2P, только отмечает присутствие. */
   fun setParentSessionActive(active: Boolean) {
-    parentSessionActive = active
     if (active) lastParentPresenceTimestampMs = System.currentTimeMillis()
-    Log.d(TAG, "Parent session " + if (active) "START" else "STOP")
   }
 
   /**
@@ -205,7 +190,6 @@ object DirectP2pSocketEngine {
    */
   fun markParentPresenceActive(childId: Long = 0L) {
     val wasOffline = !isParentActivelyConnected()
-    parentSessionActive = true
     lastParentPresenceTimestampMs = System.currentTimeMillis()
     if (wasOffline && currentRole == "CHILD") {
       val ctx = appContext ?: return
@@ -333,10 +317,8 @@ object DirectP2pSocketEngine {
    * Для ребёнка в «Только Wi-Fi» блокируем только когда точно есть сотовая и нет Wi-Fi.
    */
   private fun childNetworkAllowed(): Boolean {
-    refreshNetworkState()
-    if (currentRole != "CHILD") return true
-    if (allowMobileData) return true
-    return hasWifi || !hasCellular
+    // Откат «whatsapp-режима»: P2P-сокет всегда активен, без блокировок по сети.
+    return true
   }
 
   /** Будит блокирующее чтение глобального сокета — цикл тут же переподключится. */
@@ -357,38 +339,22 @@ object DirectP2pSocketEngine {
     val cm = ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
       as? ConnectivityManager ?: return
     if (networkMonitorCallback != null) return
-    var prevWifi = hasWifi
-    var prevCell = hasCellular
-    var prevAny = hasAnyNetwork
     val cb = object : ConnectivityManager.NetworkCallback() {
-      // Переподключаем сокет ТОЛЬКО при реальной смене типа сети (Wi-Fi <-> мобильная),
-      // при появлении сети после полного оффлайна или когда сокет сам упал.
-      // Раньше wakeGlobalTcp() вызывался на каждый onCapabilitiesChanged — при гашении
-      // экрана или лёгком изменении сигнала движок сам убивал живой сокет (обрыв на 91%).
-      private fun transportChanged(): Boolean {
-        val w = hasWifi
-        val c = hasCellular
-        val a = hasAnyNetwork
-        val changed = (w != prevWifi) || (c != prevCell) || (a && !prevAny)
-        prevWifi = w
-        prevCell = c
-        prevAny = a
-        return changed
-      }
-
+      // Стабильное поведение #32: при любом изменении сети переподключаем сокет,
+      // чтобы P2P не зависал на мёртвом TCP.
       override fun onAvailable(network: Network) {
         refreshNetworkState()
-        if (transportChanged()) wakeGlobalTcp()
+        wakeGlobalTcp()
       }
 
       override fun onLost(network: Network) {
         refreshNetworkState()
-        if (transportChanged()) wakeGlobalTcp()
+        wakeGlobalTcp()
       }
 
       override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
         refreshNetworkState()
-        if (transportChanged()) wakeGlobalTcp()
+        wakeGlobalTcp()
       }
     }
     val req = NetworkRequest.Builder()
@@ -690,11 +656,8 @@ object DirectP2pSocketEngine {
           // его там не услышит, и трафик/батарея тратится зря.
           val wifiIp = wifiIpv4()
           _status.value = _status.value.copy(localDeviceIp = getLocalIpv4Address())
-          val lanConnected = _status.value.isLanSocketConnected || connectedParentClients.isNotEmpty()
-          // Ребёнок шлёт маяк ТОЛЬКО когда родитель активен или когда LAN-соединения
-          // ещё нет. В тихом режиме (родитель свернул приложение) маяк молчит.
-          val parentActive = isParentActivelyConnected()
-          val shouldChildBeacon = !lanConnected || parentActive
+          // Откат «тихого сна»: маяк шлётся постоянно, как в стабильной #32.
+          val shouldChildBeacon = true
           if (!wifiIp.isNullOrBlank() && wifiIp != "0.0.0.0" && wifiIp != "127.0.0.1") {
             if (currentRole == "CHILD" && !LiveLocationTracker.isEmulator()) {
               if (shouldChildBeacon) {
@@ -839,14 +802,7 @@ object DirectP2pSocketEngine {
         var succeeded = false
         try {
           sock = Socket()
-          // bindSocket — ТОЛЬКО для ребёнка в строгом режиме «Только Wi-Fi».
-          // В остальных случаях не привязываем: привязка к Wi-Fi без интернета
-          // (captive portal) или к неверной сети убивала P2P-релей.
-          if (currentRole == "CHILD" && !allowMobileData) {
-            currentWifiNetwork()?.let { wifi ->
-              try { wifi.bindSocket(sock) } catch (_: Exception) {}
-            }
-          }
+          // Никакого bindSocket: пусть ОС маршрутизирует TCP через активную сеть.
           globalSocket = sock
           sock.connect(InetSocketAddress(host, port), 5000)
           sock.keepAlive = true
@@ -913,7 +869,7 @@ object DirectP2pSocketEngine {
             // 3. Keepalive ping loop (battery-friendly 90s interval matching 120s MQTT keepalive)
             val pingJob = launch {
               while (isActive && sock.isConnected && !sock.isClosed) {
-                delay(50_000L)
+                delay(90_000L)
                 synchronized(globalWriteLock) {
                   try {
                     out.write(byteArrayOf(0xC0.toByte(), 0x00))
@@ -1027,8 +983,7 @@ object DirectP2pSocketEngine {
     body.write(4) // Protocol level 4 (MQTT 3.1.1)
     body.write(0x02) // Clean session
     body.write(0x00)
-    body.write(0x00)
-    body.write(0x3C) // Keepalive 60s — NAT/брокер не рвут сокет; PINGREQ раз в 50 с
+    body.write(0x78) // Keepalive 120s — как в стабильной сборке #32
     writeUtf8String(body, clientId)
     val bodyBytes = body.toByteArray()
 
