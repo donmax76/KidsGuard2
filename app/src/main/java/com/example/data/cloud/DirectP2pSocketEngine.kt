@@ -115,6 +115,11 @@ object DirectP2pSocketEngine {
   private val _incomingCommandsFlow = MutableSharedFlow<Triple<Long, String, String>>(extraBufferCapacity = 64)
   val incomingCommandsFlow: SharedFlow<Triple<Long, String, String>> = _incomingCommandsFlow.asSharedFlow()
 
+  // Дедупликация команд: один PING приходит через TCP + LAN + UDP broadcast (3 копии),
+  // и два обработчика (сервис + репозиторий) отвечали 6 раз → по 12–15 CHILD_PONG на родителя.
+  // Это и был главный источник расхода батареи (32%).
+  private val recentCommandKeys = ConcurrentHashMap<String, Long>()
+
   private val _incomingOfflineBundlesFlow = MutableSharedFlow<JSONObject>(extraBufferCapacity = 32)
   val incomingOfflineBundlesFlow: SharedFlow<JSONObject> = _incomingOfflineBundlesFlow.asSharedFlow()
 
@@ -846,8 +851,9 @@ object DirectP2pSocketEngine {
           globalSocket = sock
           sock.keepAlive = true
           sock.tcpNoDelay = true
-          // CONNACK ждём ограниченное время: мёртвый брокер не должен вешать весь P2P.
-          sock.soTimeout = 12_000
+          // CONNACK ждём коротко: мёртвый/блокированный брокер не должен вешать P2P
+          // на 12 секунд — это и делало реконнект «вечным» при переборе 6 хостов.
+          sock.soTimeout = 4_000
           val inp = DataInputStream(BufferedInputStream(sock.getInputStream()))
           val out = BufferedOutputStream(sock.getOutputStream())
 
@@ -1183,7 +1189,13 @@ object DirectP2pSocketEngine {
                   lastParentMapViewMs = now
                 }
               }
-              _incomingCommandsFlow.tryEmit(Triple(cid, cmd, payload))
+              // Дедупликация: одна команда приходит 3 путями (TCP + LAN + UDP).
+              val cmdKey = "$cid|$cmd|$payload|$ts"
+              val lastCmdMs = recentCommandKeys[cmdKey] ?: 0L
+              if (now - lastCmdMs >= 2000L) {
+                recentCommandKeys[cmdKey] = now
+                _incomingCommandsFlow.tryEmit(Triple(cid, cmd, payload))
+              }
               if (cmd == "UNLOCK") {
                 RealtimeCloudRelay.publishAuthoritativeLock(cid, false)
                 applyImmediateLockOrUnlockIfChild(cid, false)
