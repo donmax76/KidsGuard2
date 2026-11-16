@@ -221,7 +221,7 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
   }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
   // Current Device Role
-  private val _deviceRole = MutableStateFlow(AppRole.PARENT)
+  private val _deviceRole = MutableStateFlow(AppRole.UNCONFIGURED)
   val deviceRole: StateFlow<AppRole> = _deviceRole.asStateFlow()
 
   // Active Parent tab

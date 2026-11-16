@@ -77,7 +77,9 @@ object DirectP2pSocketEngine {
 
   private val TCP_RELAY_HOSTS = listOf(
     "broker.emqx.io" to 1883,
-    "broker.hivemq.com" to 1883
+    "broker.hivemq.com" to 1883,
+    "test.mosquitto.org" to 1883,
+    "mqtt.eclipseprojects.io" to 1883
   )
 
   /**
