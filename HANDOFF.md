@@ -1,5 +1,21 @@
 # KidsGuard2 — HANDOFF
 
+## Сборка (2026-11-16)
+
+- Финальный коммит: `4d23016` (`ci: build release apk`)
+- Успешный CI-run: **#48** — https://github.com/donmax76/KidsGuard2/actions/runs/43881847856
+- Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
+
+### Артефакты run #48
+
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14232108758/zip
+  (~20,85 МБ, внутри `app-debug.apk`)
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14233241563/zip
+  (~19,0 МБ, внутри `hosts_blocker.exe` + `hosts_blocker.py`)
+
+---
+
+
 ## CI-сборка релиза (2026-11-16)
 
 - **Финальный коммит: `5a67e54`** (`ci: build release apk`)
