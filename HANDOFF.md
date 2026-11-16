@@ -1,5 +1,21 @@
 # KidsGuard2 — HANDOFF
 
+## Сборка run #50 (2026-11-16)
+
+- Финальный коммит: `61079d5` (syntax-only фикс после падения run #49 на `:app:compileDebugKotlin`)
+- Успешный CI-run: **#50** — https://github.com/donmax76/KidsGuard2/actions/runs/43932039931
+- Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
+- Примечание: run #49 (`dabe4fe`) упал на компиляции Kotlin; исправлено в `61079d5` без изменения логики.
+
+### Артефакты run #50
+
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14258203642/zip
+  (~20,85 МБ, внутри `app-debug.apk`)
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14257978818/zip
+  (~19,0 МБ, внутри `hosts_blocker.exe` + `hosts_blocker.py`)
+
+---
+
 ## Сборка (2026-11-16)
 
 - Финальный коммит: `4d23016` (`ci: build release apk`)
