@@ -485,8 +485,12 @@ object RealtimeCloudRelay {
       }
       "CHILD_PONG" -> {
         // Лёгкий ответ на PING: обновляет только присутствие, не трогая профиль/БД.
-        android.util.Log.d("P2P", "receive CHILD_PONG id=$id battery=${msg.optInt("batteryLevel", -1)} screen=${msg.optBoolean("screenInteractive", false)}")
-        markChildSeen(id)
+        // ВАЖНО: используем rawId (реальный id ребёнка), а не «переписанный» alias.
+        // Иначе при старом alias 3->1 PONG для ребёнка 3 помечал онлайн ребёнку 1,
+        // и ребёнок 3 оставался «Оффлайн».
+        val pongId = if (rawId > 0L) rawId else id
+        android.util.Log.d("P2P", "receive CHILD_PONG id=$pongId battery=${msg.optInt("batteryLevel", -1)} screen=${msg.optBoolean("screenInteractive", false)}")
+        markChildSeen(pongId)
         return
       }
       "CHILD_STATE" -> {
