@@ -229,6 +229,11 @@ class KidsGuardBackgroundService : Service() {
 
       Log.d(TAG, "Background service running for Child ID: $activeChildId")
       com.example.data.cloud.DirectP2pSocketEngine.appContext = applicationContext
+      // Сервис может быть перезапущен системой (START_STICKY) без MainActivity —
+      // тогда P2P-движок не стартовал и ребёнок числился «Оффлайн». Явно поднимаем.
+      try {
+        com.example.data.cloud.DirectP2pSocketEngine.startEngine("CHILD", activeChildId)
+      } catch (_: Exception) {}
       com.example.util.CoreEngineHotUpdater.initializeHotCore(applicationContext)
 
       // Сохраняем минимальный boot-конфиг в Device Protected Storage, чтобы после

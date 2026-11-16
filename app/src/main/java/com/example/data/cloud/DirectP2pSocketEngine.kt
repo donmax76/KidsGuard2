@@ -306,7 +306,12 @@ object DirectP2pSocketEngine {
   private fun childNetworkAllowed(): Boolean {
     refreshNetworkState()
     if (currentRole != "CHILD") return true
-    return if (allowMobileData) hasAnyNetwork else hasWifi
+    // В «Wi-Fi + 4G» НИКОГДА не блокируем сокет: пусть ОС сама выберет сеть.
+    // Раньше при пустом allNetworks/PROVISIONING сокет навсегда зависал в
+    // «нет сети», и ребёнок числился Оффлайн, хотя интернет был.
+    if (allowMobileData) return true
+    // «Только Wi-Fi»: блокируем лишь когда точно есть сотовая и нет Wi-Fi.
+    return hasWifi || !hasCellular
   }
 
   /** Будит блокирующее чтение глобального сокета — цикл тут же переподключится. */
