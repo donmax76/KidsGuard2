@@ -778,10 +778,13 @@ object DirectP2pSocketEngine {
         var succeeded = false
         try {
           sock = Socket()
-          // Привязываемся к Wi-Fi, если он доступен: в «Только Wi-Fi» это гарантирует,
-          // что сокет не уйдёт в мобильную сеть; в «Wi-Fi + 4G» предпочитаем Wi-Fi.
-          currentWifiNetwork()?.let { wifi ->
-            try { wifi.bindSocket(sock) } catch (_: Exception) {}
+          // Жёсткая привязка к Wi-Fi ТОЛЬКО в режиме «Только Wi-Fi».
+          // В «Wi-Fi + 4G» не привязываем сокет, чтобы он свободно работал через
+          // мобильный интернет и не рвался при captive portal / Wi-Fi без сети.
+          if (!allowMobileData) {
+            currentWifiNetwork()?.let { wifi ->
+              try { wifi.bindSocket(sock) } catch (_: Exception) {}
+            }
           }
           globalSocket = sock
           sock.connect(InetSocketAddress(host, port), 5000)
@@ -846,10 +849,10 @@ object DirectP2pSocketEngine {
               } catch (_: Exception) {}
             }
 
-            // 3. Keepalive ping loop (battery-friendly 90s interval matching 120s MQTT keepalive)
+            // 3. Keepalive ping loop (45 с — держит NAT/брокер открытыми, статус не падает)
             val pingJob = launch {
               while (isActive && sock.isConnected && !sock.isClosed) {
-                delay(90_000L)
+                delay(45_000L)
                 synchronized(globalWriteLock) {
                   try {
                     out.write(byteArrayOf(0xC0.toByte(), 0x00))
@@ -963,7 +966,8 @@ object DirectP2pSocketEngine {
     body.write(4) // Protocol level 4 (MQTT 3.1.1)
     body.write(0x02) // Clean session
     body.write(0x00)
-    body.write(0x78) // Keepalive 120s
+    body.write(0x00)
+    body.write(0x32) // Keepalive 50s (0x0032) — как в рабочем ПК-мосте
     writeUtf8String(body, clientId)
     val bodyBytes = body.toByteArray()
 

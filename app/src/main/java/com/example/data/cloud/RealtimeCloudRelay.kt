@@ -115,8 +115,8 @@ object RealtimeCloudRelay {
 
   // Честный онлайн телефона ребёнка. Раньше UI писал «Онлайн» просто потому,
   // что batteryLevel > 0, и статус не менялся после потери связи. Теперь родитель
-  // шлёт PING каждые 10 с, ребёнок отвечает CHILD_PONG; нет пакетов 30 с = Оффлайн.
-  private const val CHILD_ONLINE_TIMEOUT_MS = 30_000L
+  // шлёт PING, ребёнок отвечает CHILD_PONG мгновенно; нет пакетов 75 с = Оффлайн.
+  private const val CHILD_ONLINE_TIMEOUT_MS = 75_000L
   private val childLastSeenMs = ConcurrentHashMap<Long, Long>()
   private val _childOnlineFlow = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
   val childOnlineFlow: StateFlow<Map<Long, Boolean>> = _childOnlineFlow.asStateFlow()

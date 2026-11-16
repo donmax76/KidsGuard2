@@ -568,7 +568,7 @@ class LiveLocationTracker(
                 12_000L
               )
                 .setMinUpdateIntervalMillis(8_000L)
-                .setMinUpdateDistanceMeters(10f)
+                .setMinUpdateDistanceMeters(25f)
                 .setWaitForAccurateLocation(true)
                 .build()
               fused.requestLocationUpdates(fusedReq, cb, Looper.getMainLooper())
@@ -584,7 +584,7 @@ class LiveLocationTracker(
               if (lm.allProviders.contains(provider)) {
                 val isSatelliteGps = provider == LocationManager.GPS_PROVIDER
                 val intervalMs = if (isSatelliteGps) 15_000L else 20_000L
-                val minDistanceM = 10f
+                val minDistanceM = 25f
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                   val quality = if (isSatelliteGps) {
                     android.location.LocationRequest.QUALITY_HIGH_ACCURACY
@@ -643,8 +643,9 @@ class LiveLocationTracker(
 
     // Геокодинг — только при заметном перемещении или раз в 2 минуты (сеть/Geocoder дорогие).
     val needGeocode = lastGeocodeAddress.isBlank() || movedMeters > 60.0 || nowMs - lastGeocodeMs > 120_000L
-    // Запись маршрута в SQLite — при перемещении >40 м или раз в минуту.
-    val needPersist = movedMeters > 40.0 || nowMs - lastPersistMs > 60_000L
+    // Запись маршрута в SQLite — ТОЛЬКО при реальном перемещении ≥25 м.
+    // Без движения никаких записей координат не делаем (0% лишнего расхода).
+    val needPersist = movedMeters >= 25.0
 
     scope.launch(Dispatchers.IO) {
       val effectiveLat = loc.latitude
