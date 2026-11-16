@@ -342,14 +342,14 @@ object PcBlockerClient {
   private fun normalizePcCode(code: String): String =
     code.replace("-", "").replace(" ", "").trim().uppercase()
 
-  /** Принимаем пакет, только если он от нашего ПК: совпал код и (если известен) pc_id. */
+  /** Принимаем пакет, только если он от нашего ПК: совпал код (pc_id уточняем отдельно). */
   private fun matchesConfiguredPc(code: String, pcId: String): Boolean {
     if (code.isNotBlank() && normalizePcCode(code) != normalizePcCode(configuredCode)) {
-      // Пока код не задан пользователем и ПК ещё не опознан — принимаем первый пакет
-      // (обратная совместимость со старой версией скрипта без pc_id). Дальше — только свой.
+      // Пока код не задан пользователем и ПК ещё не опознан — принимаем первый пакет.
       if (codeExplicitlySet || configuredPcId.isNotBlank()) return false
     }
-    if (pcId.isNotBlank() && configuredPcId.isNotBlank() && pcId.trim() != configuredPcId) return false
+    // pc_id расхождение больше НЕ отбрасывает пакет: если код совпал, а pc_id другой —
+    // это тот же ПК после переустановки/смены id; learnPcIdentity обновит id.
     return true
   }
 
@@ -361,11 +361,19 @@ object PcBlockerClient {
       configuredCode = code.trim()
       changed = true
     }
-    if (pcId.isNotBlank() && configuredPcId.isBlank()) {
-      // Опознали конкретный ПК — фиксируем его и больше не слушаем чужие с тем же кодом.
-      configuredPcId = pcId.trim()
-      codeExplicitlySet = true
-      changed = true
+    if (pcId.isNotBlank()) {
+      if (configuredPcId.isBlank()) {
+        // Опознали конкретный ПК — фиксируем его и больше не слушаем чужие с тем же кодом.
+        configuredPcId = pcId.trim()
+        codeExplicitlySet = true
+        changed = true
+      } else if (configuredPcId != pcId.trim()) {
+        // Тот же код, но другой pc_id (ПК переустановлен/пересоздан) — обновляем id,
+        // а не отбрасываем пакеты нового ПК из-за старого learnedPcId.
+        clearPcScopedState("ПК переопознан: новый pc_id")
+        configuredPcId = pcId.trim()
+        changed = true
+      }
     }
     if (changed) persistPcIdentity()
   }
@@ -1304,6 +1312,11 @@ object PcBlockerClient {
 
   fun requestSync() {
     loadPersistedPcIdentity()
+    // После смены кода/пароля гарантируем, что глобальный P2P-сокет подключён,
+    // и сразу шлём /api/sync на топик нового pairingCode.
+    try {
+      DirectP2pSocketEngine.ensureConnectedAndWake()
+    } catch (_: Exception) {}
     scope.launch {
       sendP2pCommand("/api/sync", JSONObject())
       if (_state.value.isLanHttpAuthenticated) {
