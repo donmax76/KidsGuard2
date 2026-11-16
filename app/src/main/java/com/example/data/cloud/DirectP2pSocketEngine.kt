@@ -799,7 +799,7 @@ object DirectP2pSocketEngine {
     }
   }
 
-  private suspend fun runBinaryTcpSocketLoop(host: String, port: Int) {
+  private suspend fun CoroutineScope.runBinaryTcpSocketLoop(host: String, port: Int) {
     var retryDelayMs = 2_000L
     while (isActive) {
       if (!childNetworkAllowed()) {
@@ -915,7 +915,7 @@ object DirectP2pSocketEngine {
         Log.d(TAG, "Binary TCP socket ($host:$port) reconnect: ${e.message}")
       } finally {
         if (out != null) globalTcpOuts.remove(out)
-        globalSockets.remove(sock)
+        if (sock != null) globalSockets.remove(sock)
         try { sock?.close() } catch (_: Exception) {}
         if (globalTcpOuts.isEmpty()) {
           _status.value = _status.value.copy(
@@ -1036,15 +1036,14 @@ object DirectP2pSocketEngine {
       synchronized(globalWriteLock) {
         // Пишем сразу во ВСЕ активные брокеры (родитель + ребёнок + ПК видят друг
         // друга мгновенно из любых сетей, даже если сидят на разных брокерах).
-        val iter = globalTcpOuts.iterator()
-        while (iter.hasNext()) {
-          val out = iter.next()
+        val snapshot = globalTcpOuts.toList()
+        for (out in snapshot) {
           try {
             out.write(packetBytes)
             out.flush()
             ok = true
           } catch (_: Exception) {
-            iter.remove()
+            globalTcpOuts.remove(out)
           }
         }
       }
