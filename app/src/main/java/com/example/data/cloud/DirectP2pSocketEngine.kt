@@ -857,6 +857,7 @@ object DirectP2pSocketEngine {
               )
             }
             sendMqttSubscribe(out, subscriptions)
+            Log.d(TAG, "P2P subscribed role=$currentRole topics=${subscriptions.size}")
 
             // 2b. Immediately flush all retained packets (such as newly created Child profiles & pairing codes!)
             for ((retTopic, retJson) in retainedPacketsOutbox) {

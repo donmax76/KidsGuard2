@@ -58,15 +58,12 @@ object RealtimeCloudRelay {
   private var latestGlobalLockOverride: Pair<Boolean, Long>? = null
 
   fun setAuthoritativeChildCoreVersion(childId: Long, versionName: String) {
-    val clean = normalizeAppVersion(versionName)
-    if (clean.isBlank()) return
+    // Пишем версию СТРОГО в этого ребёнка (и его канонический id), без рассылки
+    // в 1L/2L/всех детей — иначе версия одного ребёнка затирает остальных.
+    val clean = versionName?.trim().orEmpty()
+    if (clean.isBlank() || clean.startsWith("1.") || clean.startsWith("2.")) return
     val canonId = resolveCanonicalChildId(childId)
-    val targets = linkedSetOf(childId, canonId, 1L, 2L).apply {
-      idAliasMap[childId]?.let { add(it) }
-      idAliasMap[canonId]?.let { add(it) }
-      addAll(childrenCache.keys)
-    }
-    for (tid in targets) {
+    for (tid in linkedSetOf(childId, canonId)) {
       if (tid <= 0L) continue
       val prevVer = authoritativeCoreVersionMap[tid]
       if (prevVer.isNullOrBlank() || com.example.util.ApkUpdateInstaller.compareVersions(clean, prevVer) >= 0) {
@@ -81,23 +78,24 @@ object RealtimeCloudRelay {
   }
 
   fun resolveHighestChildVersion(childId: Long, vararg candidates: String?): String {
-    var best = BuildConfig.VERSION_NAME
+    // Фактическая версия ребёнка. Версию родителя (BuildConfig) НЕ подставляем как
+    // минимум — иначе старая версия ребёнка (например Pro.39) никогда не отображается.
     val authVer = authoritativeCoreVersionMap[childId]
       ?: idAliasMap[childId]?.let { authoritativeCoreVersionMap[it] }
       ?: ""
-    if (authVer.isNotBlank() && com.example.util.ApkUpdateInstaller.compareVersions(authVer, best) > 0) {
-      best = authVer
-    }
+    var best = if (authVer.isNotBlank()) authVer else ""
     for (c in candidates) {
-      val norm = if (!c.isNullOrBlank()) normalizeAppVersion(c) else ""
-      if (norm.isNotBlank()) {
-        if (com.example.util.ApkUpdateInstaller.compareVersions(norm, best) > 0) {
-          best = norm
-        }
+      val norm = c?.trim().orEmpty()
+      if (norm.isBlank() || norm.startsWith("1.") || norm.startsWith("2.")) continue
+      if (best.isBlank() || com.example.util.ApkUpdateInstaller.compareVersions(norm, best) > 0) {
+        best = norm
       }
     }
-    authoritativeCoreVersionMap[childId] = best
-    return best
+    val resolved = best.ifBlank { BuildConfig.VERSION_NAME }
+    if (resolved != BuildConfig.VERSION_NAME) {
+      authoritativeCoreVersionMap[childId] = resolved
+    }
+    return resolved
   }
 
   private val appsCache = ConcurrentHashMap<Long, List<AppControlEntity>>()
@@ -162,6 +160,11 @@ object RealtimeCloudRelay {
       }
     }
     if (snapshot != _childOnlineFlow.value) {
+      for ((id, on) in snapshot) {
+        if (_childOnlineFlow.value[id] == true && !on) {
+          android.util.Log.d("P2P", "offline timeout childId=$id (last ${(now - (childLastSeenMs[id] ?: now)) / 1000}s ago)")
+        }
+      }
       _childOnlineFlow.value = snapshot
     }
   }
@@ -482,6 +485,7 @@ object RealtimeCloudRelay {
       }
       "CHILD_PONG" -> {
         // Лёгкий ответ на PING: обновляет только присутствие, не трогая профиль/БД.
+        android.util.Log.d("P2P", "receive CHILD_PONG id=$id battery=${msg.optInt("batteryLevel", -1)} screen=${msg.optBoolean("screenInteractive", false)}")
         markChildSeen(id)
         return
       }
@@ -1098,6 +1102,7 @@ object RealtimeCloudRelay {
       retain = false
     )
     DirectP2pSocketEngine.broadcastUdpJson(json)
+    android.util.Log.d("P2P", "publish CHILD_PONG id=$targetId battery=$battery screen=$screenOn")
   }
 
   suspend fun publishChildFields(childId: Long, fields: Map<String, Any>) {
@@ -1286,6 +1291,9 @@ object RealtimeCloudRelay {
     }
     DirectP2pSocketEngine.pushDirectLanPacket(json)
     DirectP2pSocketEngine.broadcastUdpJson(json)
+    if (commandType == "PING") {
+      android.util.Log.d("P2P", "publish PING childId=$targetId")
+    }
   }
 
   fun observeRemoteCommandsFlow(childId: Long): Flow<Pair<String, String>?> = flow<Pair<String, String>?> {

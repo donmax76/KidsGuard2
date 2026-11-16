@@ -598,6 +598,7 @@ class KidsGuardBackgroundService : Service() {
                       }
                       "PING" -> {
                         // Дешёвый ping-pong: только присутствие и свежая батарея.
+                        android.util.Log.d("P2P", "receive PING childId=$activeChildId")
                         com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
                         val pingBatt = readBatteryLevel()
                         dao.updateChildBattery(activeChildId, pingBatt)

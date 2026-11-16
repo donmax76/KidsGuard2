@@ -113,41 +113,35 @@ object CoreEngineHotUpdater {
   }
 
   fun getChildCoreVersionName(context: Context, childId: Long): String? {
+    // Возвращаем ТОЛЬКО фактическую сохранённую версию ядра РЕБЁНКА.
+    // Никогда не подменяем её версией родителя (BuildConfig этого устройства).
     return try {
       val prefs = context.getSharedPreferences(CORE_PREFS, Context.MODE_PRIVATE)
-      val raw = prefs.getString("child_core_ver_$childId", null)?.takeIf { it.isNotBlank() }
-      if (raw != null && ApkUpdateInstaller.compareVersions(raw, BuildConfig.VERSION_NAME) != 0) {
-        prefs.edit().putString("child_core_ver_$childId", BuildConfig.VERSION_NAME).apply()
-        BuildConfig.VERSION_NAME
-      } else {
-        raw ?: BuildConfig.VERSION_NAME
-      }
+      prefs.getString("child_core_ver_$childId", null)?.takeIf { it.isNotBlank() }
     } catch (_: Exception) {
-      BuildConfig.VERSION_NAME
+      null
     }
   }
 
   fun setChildCoreVersionName(context: Context, childId: Long, versionName: String) {
-    val unified = BuildConfig.VERSION_NAME
+    // Сохраняем именно переданную версию ребёнка, а не BuildConfig родителя.
+    val clean = versionName.trim()
+    if (clean.isBlank()) return
     try {
       val prefs = context.getSharedPreferences(CORE_PREFS, Context.MODE_PRIVATE)
-      prefs.edit()
-        .putString("child_core_ver_$childId", unified)
-        .putString(KEY_CORE_VERSION_NAME, unified)
-        .apply()
-      _activeCoreVersion.value = unified
+      prefs.edit().putString("child_core_ver_$childId", clean).apply()
     } catch (_: Exception) {}
   }
 
   fun resolveHighestChildVersion(context: Context, childId: Long, reportedVersion: String?): String {
+    // Фактическая версия ребёнка: отчёт ребёнка > сохранённое > версия родителя (fallback).
     val cleanReported = reportedVersion?.trim().orEmpty()
-    val unifiedBuildVer = BuildConfig.VERSION_NAME
-    return if (cleanReported.isNotBlank() &&
-        ApkUpdateInstaller.compareVersions(cleanReported, unifiedBuildVer) > 0) {
-      cleanReported
-    } else {
-      unifiedBuildVer
+    if (cleanReported.isNotBlank() && !cleanReported.startsWith("1.") && !cleanReported.startsWith("2.")) {
+      return cleanReported
     }
+    val stored = getChildCoreVersionName(context, childId)
+    if (!stored.isNullOrBlank()) return stored
+    return BuildConfig.VERSION_NAME
   }
 
   fun getEffectiveVersionCode(context: Context): Int {
