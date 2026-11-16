@@ -920,7 +920,7 @@ object DirectP2pSocketEngine {
             }
           }
         } catch (e: Exception) {
-          Log.d("P2P", "reconnect host=$host role=$currentRole err=${e.message}")
+          Log.d("P2P", "reconnect host=$host role=$currentRole err=${e::class.simpleName}:${e.message}")
         } finally {
           globalTcpOut = null
           globalSocket = null
@@ -982,9 +982,8 @@ object DirectP2pSocketEngine {
     writeUtf8String(body, "MQTT")
     body.write(4) // Protocol level 4 (MQTT 3.1.1)
     body.write(0x02) // Clean session
-    body.write(0x00)
-    body.write(0x00)
-    body.write(0x32) // Keepalive 50s (0x0032) — как в рабочем ПК-мосте
+    body.write(0x00) // Keepalive HIGH byte
+    body.write(0x32) // Keepalive LOW byte = 50s (0x0032)
     writeUtf8String(body, clientId)
     val bodyBytes = body.toByteArray()
 
