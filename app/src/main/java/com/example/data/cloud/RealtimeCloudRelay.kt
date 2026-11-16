@@ -1076,10 +1076,20 @@ object RealtimeCloudRelay {
   suspend fun publishChildPong(childId: Long) {
     val rawId = if (childId > 0L) childId else 1L
     val targetId = resolveCanonicalChildId(rawId)
+    val ctx = DirectP2pSocketEngine.appContext
+    val battery = ctx?.let {
+      try { com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(it) } catch (_: Exception) { 0 }
+    } ?: 0
+    val screenOn = ctx?.let {
+      try { com.example.util.DeviceUsageTracker.isInteractive(it) } catch (_: Exception) { true }
+    } ?: true
     val json = JSONObject().apply {
       put("type", "CHILD_PONG")
       put("id", targetId)
       put("isChildDevice", true)
+      put("batteryLevel", battery)
+      put("screenInteractive", screenOn)
+      put("currentApp", com.example.service.KidsGuardAccessibilityService.currentForegroundApp())
       put("ts", System.currentTimeMillis())
     }
     DirectP2pSocketEngine.publishTcpSocketPacket(

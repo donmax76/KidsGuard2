@@ -21,6 +21,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+  companion object {
+    /** Родитель на переднем плане: только тогда шлём PING/телеметрию. */
+    @Volatile
+    var isAppForeground: Boolean = false
+  }
+
   private val locationPermissionLauncher = registerForActivityResult(
     androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
   ) {
@@ -66,9 +72,41 @@ class MainActivity : ComponentActivity() {
 
   override fun onResume() {
     super.onResume()
+    isAppForeground = true
     com.example.util.ScreenShotManager.restorePersistentLiveStreamState(applicationContext)
     if (!com.example.location.LiveLocationTracker.isEmulator()) {
       syncServicesWithCurrentRole()
+    }
+    sendParentSession(active = true)
+  }
+
+  override fun onPause() {
+    super.onPause()
+    isAppForeground = false
+    sendParentSession(active = false)
+  }
+
+  /**
+   * PARENT_SESSION_START/STOP: ребёнок просыпается только на время сессии родителя,
+   * а REQUEST_POWER_STATS читает HealthStats ровно один раз при открытии.
+   */
+  private fun sendParentSession(active: Boolean) {
+    lifecycleScope.launch(Dispatchers.IO) {
+      try {
+        val dao = KidsGuardDatabase.getDatabase(applicationContext).kidsGuardDao()
+        val cfg = dao.getFamilyConfigOnce()
+        if (cfg?.selectedRole != "PARENT") return@launch
+        val childId = cfg.currentActiveChildId.takeIf { it > 0L }
+          ?: dao.getAllChildrenOnce().firstOrNull()?.id
+          ?: return@launch
+        val cloud = com.example.data.cloud.CloudSyncManager(applicationContext)
+        if (active) {
+          cloud.sendRemoteCommand(childId, "PARENT_SESSION_START", "1")
+          cloud.sendRemoteCommand(childId, "REQUEST_POWER_STATS", "1")
+        } else {
+          cloud.sendRemoteCommand(childId, "PARENT_SESSION_STOP", "1")
+        }
+      } catch (_: Exception) {}
     }
   }
 

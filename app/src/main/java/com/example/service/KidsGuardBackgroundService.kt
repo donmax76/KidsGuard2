@@ -454,23 +454,8 @@ class KidsGuardBackgroundService : Service() {
                   cloudSync.syncChildAppVersion(activeChildId, apkVer)
                 }
               }
-              // Тяжёлое чтение HealthStats — ТОЛЬКО при включённом экране и когда
-              // родитель на связи. При выключенном экране агент спит глубже.
-              val energyNow = System.currentTimeMillis()
-              if (screenInteractive &&
-                energyNow - lastEnergyPublishMs >= 60_000L &&
-                com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
-              ) {
-                lastEnergyPublishMs = energyNow
-                com.example.util.AppEnergyMeter.read(applicationContext)?.let { reading ->
-                  com.example.data.cloud.RealtimeCloudRelay.publishPowerStats(
-                    activeChildId,
-                    reading.appPercent,
-                    reading.mahPerHour,
-                    reading.percentPerHour
-                  )
-                }
-              }
+              // HealthStats — ТОЛЬКО по явному REQUEST_POWER_STATS при открытии
+              // приложения родителя (обработчик команды ниже). В цикле НЕ читаем.
             }
           } catch (e: Exception) {
             Log.e(TAG, "Battery sync error: ${e.message}")

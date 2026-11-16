@@ -133,6 +133,10 @@ class KidsGuardAccessibilityService : AccessibilityService() {
     }
 
     fun isAccessibilityEnabled(): Boolean = instance != null
+
+    /** Текущая открытая программа — для короткого CHILD_PONG родителю. */
+    fun currentForegroundApp(): String =
+      instance?.currentForegroundAppLabel?.takeIf { it.isNotBlank() } ?: "Главный экран Android"
   }
 
   private val serviceScope = CoroutineScope(Dispatchers.Main + Job())

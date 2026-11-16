@@ -152,6 +152,10 @@ object DirectP2pSocketEngine {
   // Tracks when a Parent app was last actively connected (viewing child profile via LAN or Cloud)
   @Volatile
   private var lastParentPresenceTimestampMs: Long = 0L
+  // Сессия родителя (PARENT_SESSION_START/STOP): в покое ребёнок не шлёт телеметрию
+  // и маяки чаще 120 с. Сам TCP-сокет при этом НЕ блокируется — он всегда слушает.
+  @Volatile
+  private var parentSessionActive: Boolean = false
   private const val PARENT_PRESENCE_TIMEOUT_MS = 95_000L
 
   // Отдельный сигнал «родитель открыл карту»: только тогда ребёнку нужен
@@ -175,13 +179,16 @@ object DirectP2pSocketEngine {
   fun isParentActivelyConnected(): Boolean {
     if (currentRole != "CHILD") return true
     if (connectedParentClients.isNotEmpty() || _status.value.isLanSocketConnected) return true
+    if (!parentSessionActive) return false
     val elapsed = System.currentTimeMillis() - lastParentPresenceTimestampMs
     return lastParentPresenceTimestampMs > 0L && elapsed in 0..PARENT_PRESENCE_TIMEOUT_MS
   }
 
-  /** PARENT_SESSION_START/STOP: отмечаем присутствие (без «тихого сна»). */
+  /** PARENT_SESSION_START/STOP: ребёнок просыпается/засыпает (сокет всегда слушает). */
   fun setParentSessionActive(active: Boolean) {
+    parentSessionActive = active
     if (active) lastParentPresenceTimestampMs = System.currentTimeMillis()
+    Log.d(TAG, "Parent session " + if (active) "START" else "STOP")
   }
 
   /**
@@ -190,6 +197,7 @@ object DirectP2pSocketEngine {
    */
   fun markParentPresenceActive(childId: Long = 0L) {
     val wasOffline = !isParentActivelyConnected()
+    parentSessionActive = true
     lastParentPresenceTimestampMs = System.currentTimeMillis()
     if (wasOffline && currentRole == "CHILD") {
       val ctx = appContext ?: return
@@ -676,12 +684,15 @@ object DirectP2pSocketEngine {
               RealtimeCloudRelay.broadcastCachedChildrenOverLanUdp()
             }
           }
-          // Пока LAN не найден — маяк раз в 30 с (вместо 10 с), чтобы не будить Wi-Fi
-          // радио каждые 10 секунд на простаивающем телефоне ребёнка. После соединения — реже.
+          // Маяк: активная сессия родителя — 30/60 с; простой — 120 с (не будим Wi-Fi).
           val isAlreadyConnected = _status.value.isLanSocketConnected ||
             _status.value.isGlobalTcpSocketConnected ||
             connectedParentClients.isNotEmpty()
-          val beaconDelay = if (isAlreadyConnected) 60_000L else 30_000L
+          val beaconDelay = when {
+            !isAlreadyConnected && (parentSessionActive || currentRole != "CHILD") -> 30_000L
+            isAlreadyConnected -> 60_000L
+            else -> 120_000L
+          }
           delay(beaconDelay)
         }
       } catch (_: Exception) {
