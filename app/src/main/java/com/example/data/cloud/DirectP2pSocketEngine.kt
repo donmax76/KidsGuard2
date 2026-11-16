@@ -833,7 +833,7 @@ object DirectP2pSocketEngine {
                 "⚡ Прямой бинарный TCP-Сокет ($host:$port)"
               }
             )
-            Log.d(TAG, "Connected persistent binary TCP socket to $host:$port")
+            Log.d("P2P", "CONNACK ok host=$host role=$currentRole")
 
             // 2. Подписки строго по роли. Ребёнку НЕ нужны pc_state/pc_stream и чужие
             // state/chat: раньше wildcard '#' будил радио каждые 4 секунды от состояний ПК,
@@ -857,7 +857,7 @@ object DirectP2pSocketEngine {
               )
             }
             sendMqttSubscribe(out, subscriptions)
-            Log.d(TAG, "P2P subscribed role=$currentRole topics=${subscriptions.size}")
+            Log.d("P2P", "subscribed role=$currentRole topics=${subscriptions.size}")
 
             // 2b. Immediately flush all retained packets (such as newly created Child profiles & pairing codes!)
             for ((retTopic, retJson) in retainedPacketsOutbox) {
@@ -920,7 +920,7 @@ object DirectP2pSocketEngine {
             }
           }
         } catch (e: Exception) {
-          Log.d(TAG, "Binary TCP socket ($host:$port) reconnect: ${e.message}")
+          Log.d("P2P", "reconnect host=$host role=$currentRole err=${e.message}")
         } finally {
           globalTcpOut = null
           globalSocket = null

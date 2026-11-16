@@ -452,16 +452,15 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
       while (true) {
         com.example.util.DeviceUsageTracker.ensureDailyMidnightReset(getApplication())
         if (_deviceRole.value == AppRole.PARENT) {
-          // PING только пока приложение родителя на переднем плане — в фоне
-          // не будим радио каждые 30 с (главный вклад в расход батареи).
-          if (com.example.MainActivity.isAppForeground) {
-            val targetChildId = activeChild.value?.id ?: allChildren.value.firstOrNull()?.id ?: 0L
-            if (targetChildId > 0L) {
-              repository.sendRemoteCloudCommand(targetChildId, "PING", "1")
-              // Высокоточный GPS ребёнку нужен только когда открыта карта, а не всегда.
-              if (_activeParentTab.value == ParentTab.LOCATION_MAP) {
-                repository.sendRemoteCloudCommand(targetChildId, "MAP_VIEWING", "1")
-              }
+          // PING — это keepalive статуса «Онлайн»: он обязан идти всегда, иначе
+          // ребёнок становится «Оффлайн». Это лёгкий 2-байтовый пакет, не источник
+          // расхода батареи (его блокировка и ломала связь).
+          val targetChildId = activeChild.value?.id ?: allChildren.value.firstOrNull()?.id ?: 0L
+          if (targetChildId > 0L) {
+            repository.sendRemoteCloudCommand(targetChildId, "PING", "1")
+            // Высокоточный GPS ребёнку нужен только когда открыта карта, а не всегда.
+            if (_activeParentTab.value == ParentTab.LOCATION_MAP) {
+              repository.sendRemoteCloudCommand(targetChildId, "MAP_VIEWING", "1")
             }
           }
           kotlinx.coroutines.delay(30_000L)
