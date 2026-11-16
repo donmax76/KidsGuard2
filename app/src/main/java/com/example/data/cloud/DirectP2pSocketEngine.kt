@@ -26,6 +26,11 @@ import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.X509TrustManager
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -75,11 +80,18 @@ object DirectP2pSocketEngine {
   const val TOPIC_DATA = "kidsguard/eb6ecfcf/v34_p2p/data"
   const val TOPIC_LOCK = "kidsguard/eb6ecfcf/v34_p2p/lock"
 
+  private data class RelayHost(val host: String, val port: Int, val tls: Boolean)
+
+  // Сначала обычный MQTT 1883, затем TLS 8883. Многие мобильные сети и Wi-Fi
+  // блокируют порт 1883 — тогда P2P работал только по UDP/LAN, а из разных сетей
+  // телефоны друг друга не видели. TLS 8883 проходит даже там, где 1883 закрыт.
   private val TCP_RELAY_HOSTS = listOf(
-    "broker.emqx.io" to 1883,
-    "broker.hivemq.com" to 1883,
-    "test.mosquitto.org" to 1883,
-    "mqtt.eclipseprojects.io" to 1883
+    RelayHost("broker.emqx.io", 1883, false),
+    RelayHost("broker.emqx.io", 8883, true),
+    RelayHost("broker.hivemq.com", 1883, false),
+    RelayHost("broker.hivemq.com", 8883, true),
+    RelayHost("test.mosquitto.org", 1883, false),
+    RelayHost("mqtt.eclipseprojects.io", 1883, false)
   )
 
   /**
@@ -344,13 +356,20 @@ object DirectP2pSocketEngine {
     if (networkMonitorCallback != null) return
     val cb = object : ConnectivityManager.NetworkCallback() {
       override fun onAvailable(network: Network) {
+        val wasAny = hasAnyNetwork
         refreshNetworkState()
-        wakeGlobalTcp()
+        // Проснулись из ПОЛНОГО оффлайна — поднимаем сокет. На одиночный onAvailable
+        // (когда рядом уже есть Wi-Fi или 4G) не рвём живой сокет.
+        if (hasAnyNetwork && !wasAny) wakeGlobalTcp()
       }
 
       override fun onLost(network: Network) {
+        val wasAny = hasAnyNetwork
         refreshNetworkState()
-        wakeGlobalTcp()
+        // Будим только при уходе в ПОЛНЫЙ оффлайн. Раньше каждый onLost (например,
+        // отвал сотовой при живом Wi-Fi) закрывал рабочий сокет и вызывал
+        // «Software caused connection abort» + долгий реконнект.
+        if (!hasAnyNetwork && wasAny) wakeGlobalTcp()
       }
 
       override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
@@ -777,6 +796,21 @@ object DirectP2pSocketEngine {
    * Subscribes to TOPIC_WILDCARD_ALL ("kidsguard/eb6ecfcf/v32/#") so every child has its own
    * retained state, screen, lock, and command subtopics without ever overwriting another child!
    */
+  /** TLS-сокет для порта 8883 (публичные брокеры с разными сертификатами). */
+  private fun createTlsSocket(host: String, port: Int): Socket {
+    val trustAll = object : X509TrustManager {
+      override fun checkClientTrusted(chain: Array<X509Certificate>?, authType: String?) {}
+      override fun checkServerTrusted(chain: Array<X509Certificate>?, authType: String?) {}
+      override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+    }
+    val ctx = SSLContext.getInstance("TLS")
+    ctx.init(null, arrayOf(trustAll), SecureRandom())
+    val ssl = ctx.socketFactory.createSocket() as SSLSocket
+    ssl.useClientMode = true
+    ssl.connect(InetSocketAddress(host, port), 5000)
+    return ssl
+  }
+
   private fun startGlobalBinaryTcpSocketLoop() {
     scope.launch {
       var hostIdx = preferredRelayHost
@@ -790,22 +824,26 @@ object DirectP2pSocketEngine {
           delay(3_000L)
           continue
         }
-        val (host, port) = TCP_RELAY_HOSTS[hostIdx % TCP_RELAY_HOSTS.size]
+        val relay = TCP_RELAY_HOSTS[hostIdx % TCP_RELAY_HOSTS.size]
+        val host = relay.host
+        val port = relay.port
         hostIdx++
         var sock: Socket? = null
         var succeeded = false
         try {
-          sock = Socket()
-          // Жёсткая привязка к Wi-Fi ТОЛЬКО в режиме «Только Wi-Fi».
-          // В «Wi-Fi + 4G» не привязываем сокет, чтобы он свободно работал через
-          // мобильный интернет и не рвался при captive portal / Wi-Fi без сети.
-          if (!allowMobileData) {
-            currentWifiNetwork()?.let { wifi ->
-              try { wifi.bindSocket(sock) } catch (_: Exception) {}
+          sock = if (relay.tls) createTlsSocket(host, port) else Socket()
+          if (!relay.tls) {
+            // Жёсткая привязка к Wi-Fi ТОЛЬКО в режиме «Только Wi-Fi».
+            // В «Wi-Fi + 4G» не привязываем сокет, чтобы он свободно работал через
+            // мобильный интернет и не рвался при captive portal / Wi-Fi без сети.
+            if (!allowMobileData) {
+              currentWifiNetwork()?.let { wifi ->
+                try { wifi.bindSocket(sock) } catch (_: Exception) {}
+              }
             }
+            sock.connect(InetSocketAddress(host, port), 5000)
           }
           globalSocket = sock
-          sock.connect(InetSocketAddress(host, port), 5000)
           sock.keepAlive = true
           sock.tcpNoDelay = true
           // CONNACK ждём ограниченное время: мёртвый брокер не должен вешать весь P2P.
