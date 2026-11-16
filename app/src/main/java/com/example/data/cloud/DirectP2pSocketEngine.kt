@@ -26,11 +26,6 @@ import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
-import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLSocket
-import javax.net.ssl.X509TrustManager
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -80,18 +75,9 @@ object DirectP2pSocketEngine {
   const val TOPIC_DATA = "kidsguard/eb6ecfcf/v34_p2p/data"
   const val TOPIC_LOCK = "kidsguard/eb6ecfcf/v34_p2p/lock"
 
-  private data class RelayHost(val host: String, val port: Int, val tls: Boolean)
-
-  // Сначала обычный MQTT 1883, затем TLS 8883. Многие мобильные сети и Wi-Fi
-  // блокируют порт 1883 — тогда P2P работал только по UDP/LAN, а из разных сетей
-  // телефоны друг друга не видели. TLS 8883 проходит даже там, где 1883 закрыт.
   private val TCP_RELAY_HOSTS = listOf(
-    RelayHost("broker.emqx.io", 1883, false),
-    RelayHost("broker.emqx.io", 8883, true),
-    RelayHost("broker.hivemq.com", 1883, false),
-    RelayHost("broker.hivemq.com", 8883, true),
-    RelayHost("test.mosquitto.org", 1883, false),
-    RelayHost("mqtt.eclipseprojects.io", 1883, false)
+    "broker.emqx.io" to 1883,
+    "broker.hivemq.com" to 1883
   )
 
   /**
@@ -114,11 +100,6 @@ object DirectP2pSocketEngine {
   // Multicast command stream: Triple(targetChildId, command, payload)
   private val _incomingCommandsFlow = MutableSharedFlow<Triple<Long, String, String>>(extraBufferCapacity = 64)
   val incomingCommandsFlow: SharedFlow<Triple<Long, String, String>> = _incomingCommandsFlow.asSharedFlow()
-
-  // Дедупликация команд: один PING приходит через TCP + LAN + UDP broadcast (3 копии),
-  // и два обработчика (сервис + репозиторий) отвечали 6 раз → по 12–15 CHILD_PONG на родителя.
-  // Это и был главный источник расхода батареи (32%).
-  private val recentCommandKeys = ConcurrentHashMap<String, Long>()
 
   private val _incomingOfflineBundlesFlow = MutableSharedFlow<JSONObject>(extraBufferCapacity = 32)
   val incomingOfflineBundlesFlow: SharedFlow<JSONObject> = _incomingOfflineBundlesFlow.asSharedFlow()
@@ -171,10 +152,6 @@ object DirectP2pSocketEngine {
   // Tracks when a Parent app was last actively connected (viewing child profile via LAN or Cloud)
   @Volatile
   private var lastParentPresenceTimestampMs: Long = 0L
-  // Сессия родителя (PARENT_SESSION_START/STOP): в покое ребёнок не шлёт телеметрию
-  // и маяки чаще 120 с. Сам TCP-сокет при этом НЕ блокируется — он всегда слушает.
-  @Volatile
-  private var parentSessionActive: Boolean = false
   private const val PARENT_PRESENCE_TIMEOUT_MS = 95_000L
 
   // Отдельный сигнал «родитель открыл карту»: только тогда ребёнку нужен
@@ -198,16 +175,13 @@ object DirectP2pSocketEngine {
   fun isParentActivelyConnected(): Boolean {
     if (currentRole != "CHILD") return true
     if (connectedParentClients.isNotEmpty() || _status.value.isLanSocketConnected) return true
-    if (!parentSessionActive) return false
     val elapsed = System.currentTimeMillis() - lastParentPresenceTimestampMs
     return lastParentPresenceTimestampMs > 0L && elapsed in 0..PARENT_PRESENCE_TIMEOUT_MS
   }
 
-  /** PARENT_SESSION_START/STOP: ребёнок просыпается/засыпает (сокет всегда слушает). */
+  /** PARENT_SESSION_START/STOP: только отмечаем присутствие. Сокет НЕ блокируем. */
   fun setParentSessionActive(active: Boolean) {
-    parentSessionActive = active
     if (active) lastParentPresenceTimestampMs = System.currentTimeMillis()
-    Log.d(TAG, "Parent session " + if (active) "START" else "STOP")
   }
 
   /**
@@ -216,7 +190,6 @@ object DirectP2pSocketEngine {
    */
   fun markParentPresenceActive(childId: Long = 0L) {
     val wasOffline = !isParentActivelyConnected()
-    parentSessionActive = true
     lastParentPresenceTimestampMs = System.currentTimeMillis()
     if (wasOffline && currentRole == "CHILD") {
       val ctx = appContext ?: return
@@ -333,12 +306,11 @@ object DirectP2pSocketEngine {
   private fun childNetworkAllowed(): Boolean {
     refreshNetworkState()
     if (currentRole != "CHILD") return true
-    // В «Wi-Fi + 4G» НИКОГДА не блокируем сокет: пусть ОС сама выберет сеть.
-    // Раньше при пустом allNetworks/PROVISIONING сокет навсегда зависал в
-    // «нет сети», и ребёнок числился Оффлайн, хотя интернет был.
+    // «Wi-Fi + 4G» (allowMobileData=true) НИКОГДА не блокируем сокет: пусть система
+    // сама маршрутизирует через активную сеть с интернетом. Только в строгом
+    // «Только Wi-Fi» (false) требуем наличие Wi-Fi.
     if (allowMobileData) return true
-    // «Только Wi-Fi»: блокируем лишь когда точно есть сотовая и нет Wi-Fi.
-    return hasWifi || !hasCellular
+    return hasWifi
   }
 
   /** Будит блокирующее чтение глобального сокета — цикл тут же переподключится. */
@@ -361,24 +333,19 @@ object DirectP2pSocketEngine {
     if (networkMonitorCallback != null) return
     val cb = object : ConnectivityManager.NetworkCallback() {
       override fun onAvailable(network: Network) {
-        val wasAny = hasAnyNetwork
         refreshNetworkState()
-        // Проснулись из ПОЛНОГО оффлайна — поднимаем сокет. На одиночный onAvailable
-        // (когда рядом уже есть Wi-Fi или 4G) не рвём живой сокет.
-        if (hasAnyNetwork && !wasAny) wakeGlobalTcp()
+        wakeGlobalTcp()
       }
 
       override fun onLost(network: Network) {
-        val wasAny = hasAnyNetwork
         refreshNetworkState()
-        // Будим только при уходе в ПОЛНЫЙ оффлайн. Раньше каждый onLost (например,
-        // отвал сотовой при живом Wi-Fi) закрывал рабочий сокет и вызывал
-        // «Software caused connection abort» + долгий реконнект.
-        if (!hasAnyNetwork && wasAny) wakeGlobalTcp()
+        wakeGlobalTcp()
       }
 
       override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
         refreshNetworkState()
+        // Без wakeGlobalTcp(): частые сигналы (гашение экрана, смена уровня сигнала)
+        // не должны рвать живой сокет. Переподключение — только в onAvailable/onLost.
       }
     }
     val req = NetworkRequest.Builder()
@@ -710,15 +677,12 @@ object DirectP2pSocketEngine {
               RealtimeCloudRelay.broadcastCachedChildrenOverLanUdp()
             }
           }
-          // Маяк: активная сессия родителя — 30/60 с; простой — 120 с (не будим Wi-Fi).
+          // Пока LAN не найден — маяк раз в 30 с (вместо 10 с), чтобы не будить Wi-Fi
+          // радио каждые 10 секунд на простаивающем телефоне ребёнка. После соединения — реже.
           val isAlreadyConnected = _status.value.isLanSocketConnected ||
             _status.value.isGlobalTcpSocketConnected ||
             connectedParentClients.isNotEmpty()
-          val beaconDelay = when {
-            !isAlreadyConnected && (parentSessionActive || currentRole != "CHILD") -> 30_000L
-            isAlreadyConnected -> 60_000L
-            else -> 120_000L
-          }
+          val beaconDelay = if (isAlreadyConnected) 60_000L else 30_000L
           delay(beaconDelay)
         }
       } catch (_: Exception) {
@@ -801,21 +765,6 @@ object DirectP2pSocketEngine {
    * Subscribes to TOPIC_WILDCARD_ALL ("kidsguard/eb6ecfcf/v32/#") so every child has its own
    * retained state, screen, lock, and command subtopics without ever overwriting another child!
    */
-  /** TLS-сокет для порта 8883 (публичные брокеры с разными сертификатами). */
-  private fun createTlsSocket(host: String, port: Int): Socket {
-    val trustAll = object : X509TrustManager {
-      override fun checkClientTrusted(chain: Array<X509Certificate>?, authType: String?) {}
-      override fun checkServerTrusted(chain: Array<X509Certificate>?, authType: String?) {}
-      override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-    }
-    val ctx = SSLContext.getInstance("TLS")
-    ctx.init(null, arrayOf(trustAll), SecureRandom())
-    val ssl = ctx.socketFactory.createSocket() as SSLSocket
-    ssl.useClientMode = true
-    ssl.connect(InetSocketAddress(host, port), 5000)
-    return ssl
-  }
-
   private fun startGlobalBinaryTcpSocketLoop() {
     scope.launch {
       var hostIdx = preferredRelayHost
@@ -829,31 +778,26 @@ object DirectP2pSocketEngine {
           delay(3_000L)
           continue
         }
-        val relay = TCP_RELAY_HOSTS[hostIdx % TCP_RELAY_HOSTS.size]
-        val host = relay.host
-        val port = relay.port
+        val (host, port) = TCP_RELAY_HOSTS[hostIdx % TCP_RELAY_HOSTS.size]
         hostIdx++
         var sock: Socket? = null
         var succeeded = false
         try {
-          sock = if (relay.tls) createTlsSocket(host, port) else Socket()
-          if (!relay.tls) {
-            // Жёсткая привязка к Wi-Fi ТОЛЬКО в режиме «Только Wi-Fi».
-            // В «Wi-Fi + 4G» не привязываем сокет, чтобы он свободно работал через
-            // мобильный интернет и не рвался при captive portal / Wi-Fi без сети.
-            if (!allowMobileData) {
-              currentWifiNetwork()?.let { wifi ->
-                try { wifi.bindSocket(sock) } catch (_: Exception) {}
-              }
+          sock = Socket()
+          // bindSocket только в строгом «Только Wi-Fi». В «Wi-Fi + 4G» НЕ привязываем,
+          // чтобы система свободно маршрутизировала сокет через Wi-Fi или 4G и телефоны
+          // видели друг друга из разных сетей.
+          if (!allowMobileData) {
+            currentWifiNetwork()?.let { wifi ->
+              try { wifi.bindSocket(sock) } catch (_: Exception) {}
             }
-            sock.connect(InetSocketAddress(host, port), 5000)
           }
           globalSocket = sock
+          sock.connect(InetSocketAddress(host, port), 5000)
           sock.keepAlive = true
           sock.tcpNoDelay = true
-          // CONNACK ждём коротко: мёртвый/блокированный брокер не должен вешать P2P
-          // на 12 секунд — это и делало реконнект «вечным» при переборе 6 хостов.
-          sock.soTimeout = 4_000
+          // CONNACK ждём ограниченное время: мёртвый брокер не должен вешать весь P2P.
+          sock.soTimeout = 12_000
           val inp = DataInputStream(BufferedInputStream(sock.getInputStream()))
           val out = BufferedOutputStream(sock.getOutputStream())
 
@@ -879,7 +823,7 @@ object DirectP2pSocketEngine {
                 "⚡ Прямой бинарный TCP-Сокет ($host:$port)"
               }
             )
-            Log.d("P2P", "CONNACK ok host=$host role=$currentRole")
+            Log.d(TAG, "Connected persistent binary TCP socket to $host:$port")
 
             // 2. Подписки строго по роли. Ребёнку НЕ нужны pc_state/pc_stream и чужие
             // state/chat: раньше wildcard '#' будил радио каждые 4 секунды от состояний ПК,
@@ -903,7 +847,6 @@ object DirectP2pSocketEngine {
               )
             }
             sendMqttSubscribe(out, subscriptions)
-            Log.d("P2P", "subscribed role=$currentRole topics=${subscriptions.size}")
 
             // 2b. Immediately flush all retained packets (such as newly created Child profiles & pairing codes!)
             for ((retTopic, retJson) in retainedPacketsOutbox) {
@@ -912,7 +855,7 @@ object DirectP2pSocketEngine {
               } catch (_: Exception) {}
             }
 
-            // 3. Keepalive ping loop (45 с — держит NAT/брокер открытыми, статус не падает)
+            // 3. Keepalive ping loop (battery-friendly 90s interval matching 120s MQTT keepalive)
             val pingJob = launch {
               while (isActive && sock.isConnected && !sock.isClosed) {
                 delay(45_000L)
@@ -966,7 +909,7 @@ object DirectP2pSocketEngine {
             }
           }
         } catch (e: Exception) {
-          Log.d("P2P", "reconnect host=$host role=$currentRole err=${e::class.simpleName}:${e.message}")
+          Log.d(TAG, "Binary TCP socket ($host:$port) reconnect: ${e.message}")
         } finally {
           globalTcpOut = null
           globalSocket = null
@@ -1028,8 +971,9 @@ object DirectP2pSocketEngine {
     writeUtf8String(body, "MQTT")
     body.write(4) // Protocol level 4 (MQTT 3.1.1)
     body.write(0x02) // Clean session
-    body.write(0x00) // Keepalive HIGH byte
-    body.write(0x32) // Keepalive LOW byte = 50s (0x0032)
+    body.write(0x00)
+    body.write(0x00)
+    body.write(0x32) // Keepalive 50s (0x0032)
     writeUtf8String(body, clientId)
     val bodyBytes = body.toByteArray()
 
@@ -1189,13 +1133,7 @@ object DirectP2pSocketEngine {
                   lastParentMapViewMs = now
                 }
               }
-              // Дедупликация: одна команда приходит 3 путями (TCP + LAN + UDP).
-              val cmdKey = "$cid|$cmd|$payload|$ts"
-              val lastCmdMs = recentCommandKeys[cmdKey] ?: 0L
-              if (now - lastCmdMs >= 2000L) {
-                recentCommandKeys[cmdKey] = now
-                _incomingCommandsFlow.tryEmit(Triple(cid, cmd, payload))
-              }
+              _incomingCommandsFlow.tryEmit(Triple(cid, cmd, payload))
               if (cmd == "UNLOCK") {
                 RealtimeCloudRelay.publishAuthoritativeLock(cid, false)
                 applyImmediateLockOrUnlockIfChild(cid, false)

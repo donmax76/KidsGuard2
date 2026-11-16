@@ -58,12 +58,15 @@ object RealtimeCloudRelay {
   private var latestGlobalLockOverride: Pair<Boolean, Long>? = null
 
   fun setAuthoritativeChildCoreVersion(childId: Long, versionName: String) {
-    // Пишем версию СТРОГО в этого ребёнка (и его канонический id), без рассылки
-    // в 1L/2L/всех детей — иначе версия одного ребёнка затирает остальных.
-    val clean = versionName?.trim().orEmpty()
-    if (clean.isBlank() || clean.startsWith("1.") || clean.startsWith("2.")) return
+    val clean = normalizeAppVersion(versionName)
+    if (clean.isBlank()) return
     val canonId = resolveCanonicalChildId(childId)
-    for (tid in linkedSetOf(childId, canonId)) {
+    val targets = linkedSetOf(childId, canonId, 1L, 2L).apply {
+      idAliasMap[childId]?.let { add(it) }
+      idAliasMap[canonId]?.let { add(it) }
+      addAll(childrenCache.keys)
+    }
+    for (tid in targets) {
       if (tid <= 0L) continue
       val prevVer = authoritativeCoreVersionMap[tid]
       if (prevVer.isNullOrBlank() || com.example.util.ApkUpdateInstaller.compareVersions(clean, prevVer) >= 0) {
@@ -78,24 +81,23 @@ object RealtimeCloudRelay {
   }
 
   fun resolveHighestChildVersion(childId: Long, vararg candidates: String?): String {
-    // Фактическая версия ребёнка. Версию родителя (BuildConfig) НЕ подставляем как
-    // минимум — иначе старая версия ребёнка (например Pro.39) никогда не отображается.
+    var best = BuildConfig.VERSION_NAME
     val authVer = authoritativeCoreVersionMap[childId]
       ?: idAliasMap[childId]?.let { authoritativeCoreVersionMap[it] }
       ?: ""
-    var best = if (authVer.isNotBlank()) authVer else ""
+    if (authVer.isNotBlank() && com.example.util.ApkUpdateInstaller.compareVersions(authVer, best) > 0) {
+      best = authVer
+    }
     for (c in candidates) {
-      val norm = c?.trim().orEmpty()
-      if (norm.isBlank() || norm.startsWith("1.") || norm.startsWith("2.")) continue
-      if (best.isBlank() || com.example.util.ApkUpdateInstaller.compareVersions(norm, best) > 0) {
-        best = norm
+      val norm = if (!c.isNullOrBlank()) normalizeAppVersion(c) else ""
+      if (norm.isNotBlank()) {
+        if (com.example.util.ApkUpdateInstaller.compareVersions(norm, best) > 0) {
+          best = norm
+        }
       }
     }
-    val resolved = best.ifBlank { BuildConfig.VERSION_NAME }
-    if (resolved != BuildConfig.VERSION_NAME) {
-      authoritativeCoreVersionMap[childId] = resolved
-    }
-    return resolved
+    authoritativeCoreVersionMap[childId] = best
+    return best
   }
 
   private val appsCache = ConcurrentHashMap<Long, List<AppControlEntity>>()
@@ -113,7 +115,7 @@ object RealtimeCloudRelay {
 
   // Честный онлайн телефона ребёнка. Раньше UI писал «Онлайн» просто потому,
   // что batteryLevel > 0, и статус не менялся после потери связи. Теперь родитель
-  // шлёт PING, ребёнок отвечает CHILD_PONG мгновенно; нет пакетов 75 с = Оффлайн.
+  // шлёт PING каждые 10 с, ребёнок отвечает CHILD_PONG; нет пакетов 30 с = Оффлайн.
   private const val CHILD_ONLINE_TIMEOUT_MS = 75_000L
   private val childLastSeenMs = ConcurrentHashMap<Long, Long>()
   private val _childOnlineFlow = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
@@ -160,11 +162,6 @@ object RealtimeCloudRelay {
       }
     }
     if (snapshot != _childOnlineFlow.value) {
-      for ((id, on) in snapshot) {
-        if (_childOnlineFlow.value[id] == true && !on) {
-          android.util.Log.d("P2P", "offline timeout childId=$id (last ${(now - (childLastSeenMs[id] ?: now)) / 1000}s ago)")
-        }
-      }
       _childOnlineFlow.value = snapshot
     }
   }
@@ -485,12 +482,7 @@ object RealtimeCloudRelay {
       }
       "CHILD_PONG" -> {
         // Лёгкий ответ на PING: обновляет только присутствие, не трогая профиль/БД.
-        // ВАЖНО: используем rawId (реальный id ребёнка), а не «переписанный» alias.
-        // Иначе при старом alias 3->1 PONG для ребёнка 3 помечал онлайн ребёнку 1,
-        // и ребёнок 3 оставался «Оффлайн».
-        val pongId = if (rawId > 0L) rawId else id
-        android.util.Log.d("P2P", "receive CHILD_PONG id=$pongId battery=${msg.optInt("batteryLevel", -1)} screen=${msg.optBoolean("screenInteractive", false)}")
-        markChildSeen(pongId)
+        markChildSeen(id)
         return
       }
       "CHILD_STATE" -> {
@@ -1084,20 +1076,10 @@ object RealtimeCloudRelay {
   suspend fun publishChildPong(childId: Long) {
     val rawId = if (childId > 0L) childId else 1L
     val targetId = resolveCanonicalChildId(rawId)
-    val ctx = DirectP2pSocketEngine.appContext
-    val battery = ctx?.let {
-      try { com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(it) } catch (_: Exception) { 0 }
-    } ?: 0
-    val screenOn = ctx?.let {
-      try { com.example.util.DeviceUsageTracker.isInteractive(it) } catch (_: Exception) { true }
-    } ?: true
     val json = JSONObject().apply {
       put("type", "CHILD_PONG")
       put("id", targetId)
       put("isChildDevice", true)
-      put("batteryLevel", battery)
-      put("screenInteractive", screenOn)
-      put("currentApp", com.example.service.KidsGuardAccessibilityService.currentForegroundApp())
       put("ts", System.currentTimeMillis())
     }
     DirectP2pSocketEngine.publishTcpSocketPacket(
@@ -1106,7 +1088,6 @@ object RealtimeCloudRelay {
       retain = false
     )
     DirectP2pSocketEngine.broadcastUdpJson(json)
-    android.util.Log.d("P2P", "publish CHILD_PONG id=$targetId battery=$battery screen=$screenOn")
   }
 
   suspend fun publishChildFields(childId: Long, fields: Map<String, Any>) {
@@ -1295,9 +1276,6 @@ object RealtimeCloudRelay {
     }
     DirectP2pSocketEngine.pushDirectLanPacket(json)
     DirectP2pSocketEngine.broadcastUdpJson(json)
-    if (commandType == "PING") {
-      android.util.Log.d("P2P", "publish PING childId=$targetId")
-    }
   }
 
   fun observeRemoteCommandsFlow(childId: Long): Flow<Pair<String, String>?> = flow<Pair<String, String>?> {
