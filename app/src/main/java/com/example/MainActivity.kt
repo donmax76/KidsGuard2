@@ -74,10 +74,13 @@ class MainActivity : ComponentActivity() {
   }
 
   /**
-   * Один раз при открытии приложения родителя просим ребёнка прислать статистику
-   * расхода энергии (AppEnergyMeter.read() на телефоне ребёнка). В циклы НЕ ставим.
+   * При открытии приложения родителя: гарантируем подключение глобального сокета,
+   * сразу шлём PING активному ребёнку и один раз просим статистику энергии.
    */
   private fun requestPowerStatsOnce() {
+    try {
+      com.example.data.cloud.DirectP2pSocketEngine.ensureConnectedAndWake()
+    } catch (_: Exception) {}
     lifecycleScope.launch(Dispatchers.IO) {
       try {
         val dao = KidsGuardDatabase.getDatabase(applicationContext).kidsGuardDao()
@@ -86,8 +89,9 @@ class MainActivity : ComponentActivity() {
         val childId = cfg.currentActiveChildId.takeIf { it > 0L }
           ?: dao.getAllChildrenOnce().firstOrNull()?.id
           ?: return@launch
-        com.example.data.cloud.CloudSyncManager(applicationContext)
-          .sendRemoteCommand(childId, "REQUEST_POWER_STATS", "1")
+        val cloud = com.example.data.cloud.CloudSyncManager(applicationContext)
+        cloud.sendRemoteCommand(childId, "PING", "1")
+        cloud.sendRemoteCommand(childId, "REQUEST_POWER_STATS", "1")
       } catch (_: Exception) {}
     }
   }

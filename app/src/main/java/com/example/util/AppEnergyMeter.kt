@@ -128,13 +128,22 @@ object AppEnergyMeter {
       // Полная ёмкость батареи: charge_counter (µА·ч) / уровень заряда. Доля считается
       // от полной ёмкости, а не от маленькой дельты разряда — иначе при разряде 100%→91%
       // деление на 9% даёт ложные 97,5% для приложения.
-      val capacityMah = if (counter > 0 && level in 1..100) {
+      var capacityMah = if (counter > 0 && level in 1..100) {
         (counter / 1000.0) / (level / 100.0)
       } else {
         4000.0
       }
+      capacityMah = maxOf(capacityMah, 4500.0)
 
-      val usedAppMah = appMahNow - baseAppMah.toDouble()
+      var usedAppMah = appMahNow - baseAppMah.toDouble()
+      // Аномалия единиц: на некоторых прошивках UidHealthStats отдаёт мА·с или мкА·ч.
+      // Если «расход» неправдоподобно велик (>15% ёмкости), делим до адекватного уровня.
+      if (usedAppMah > capacityMah * 0.15) {
+        usedAppMah /= 1000.0
+        if (usedAppMah > capacityMah * 0.15) {
+          usedAppMah /= 3.6
+        }
+      }
       // Защита от малых дельт: меньше 0,1 мА·ч — шум, не показываем и не «раздуваем».
       if (usedAppMah < 0.1) {
         if (counter >= baseCounter || levelDrop <= 0) startWindow(context)
@@ -157,17 +166,20 @@ object AppEnergyMeter {
     }
   }
 
-  /** Резерв, когда телефон не отдаёт системные счётчики энергии: доля CPU-времени. */
+  /** Резерв, когда телефон не отдаёт системные счётчики энергии: оценка по CPU-времени. */
   private fun cpuFallback(): Reading? {
     return try {
       val startElapsed = android.os.Process.getStartElapsedRealtime()
       val elapsed = android.os.SystemClock.elapsedRealtime() - startElapsed
       if (elapsed < 2 * 60_000L) return null
       val cpuMs = android.os.Process.getElapsedCpuTime().coerceAtLeast(0L)
-      val share = (cpuMs.toDouble() / elapsed.toDouble()).coerceIn(0.0, 1.0)
+      // Физическая оценка: ~120 мА на ядро при полной загрузке. НЕ выдаём сырое
+      // cpuMs/elapsed*100 за процент батареи (раньше это давало ложные 78,9%).
+      val estimatedMah = (cpuMs / 3_600_000.0) * 120.0
+      val pct = ((estimatedMah / 4500.0) * 100.0).coerceIn(0.1, 12.0)
       Reading(
-        appPercent = (share * 100.0).roundToInt(),
-        mahPerHour = 0f,
+        appPercent = pct.roundToInt(),
+        mahPerHour = (estimatedMah / (elapsed / 3_600_000.0)).toFloat(),
         percentPerHour = 0f,
         windowHours = elapsed / 3_600_000f
       )

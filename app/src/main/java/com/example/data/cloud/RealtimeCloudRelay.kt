@@ -53,27 +53,26 @@ object RealtimeCloudRelay {
 
   // Authoritative lock state set by Parent or PIN unlock: childId -> Pair(isLocked, timestampMs)
   private val authoritativeLockState = ConcurrentHashMap<Long, Pair<Boolean, Long>>()
+  // 15-секундная защита: после LOCK/UNLOCK игнорируем isDeviceLocked из входящих
+  // CHILD_STATE/CHILD_PATCH, чтобы старый пакет не откатывал только что нажатую кнопку.
+  private val lockToggleGraceUntilMs = ConcurrentHashMap<Long, Long>()
   private val authoritativeCoreVersionMap = ConcurrentHashMap<Long, String>()
   @Volatile
   private var latestGlobalLockOverride: Pair<Boolean, Long>? = null
 
   fun setAuthoritativeChildCoreVersion(childId: Long, versionName: String) {
-    val clean = normalizeAppVersion(versionName)
-    if (clean.isBlank()) return
+    // Пишем версию СТРОГО в этого ребёнка (и его канонический id), без рассылки
+    // в 1L/2L/всех детей — иначе версия одного ребёнка затирает остальных.
+    val clean = versionName?.trim().orEmpty()
+    if (clean.isBlank() || clean.startsWith("1.") || clean.startsWith("2.")) return
     val canonId = resolveCanonicalChildId(childId)
-    val targets = linkedSetOf(childId, canonId, 1L, 2L).apply {
-      idAliasMap[childId]?.let { add(it) }
-      idAliasMap[canonId]?.let { add(it) }
-      addAll(childrenCache.keys)
-    }
-    for (tid in targets) {
+    for (tid in linkedSetOf(childId, canonId)) {
       if (tid <= 0L) continue
       val prevVer = authoritativeCoreVersionMap[tid]
       if (prevVer.isNullOrBlank() || com.example.util.ApkUpdateInstaller.compareVersions(clean, prevVer) >= 0) {
         authoritativeCoreVersionMap[tid] = clean
       }
       childrenCache[tid]?.let { prev ->
-        // Не подменяем appVersion версией ядра: это отдельные сущности.
         childrenCache[tid] = prev.copy(updatePending = false)
       }
     }
@@ -81,23 +80,24 @@ object RealtimeCloudRelay {
   }
 
   fun resolveHighestChildVersion(childId: Long, vararg candidates: String?): String {
-    var best = BuildConfig.VERSION_NAME
+    // Фактическая версия ребёнка. Версию родителя (BuildConfig) НЕ берём за базу и
+    // НЕ выбираем максимум — иначе старая версия ребёнка (Pro.39) никогда не отображается.
     val authVer = authoritativeCoreVersionMap[childId]
       ?: idAliasMap[childId]?.let { authoritativeCoreVersionMap[it] }
       ?: ""
-    if (authVer.isNotBlank() && com.example.util.ApkUpdateInstaller.compareVersions(authVer, best) > 0) {
-      best = authVer
-    }
+    var best = if (authVer.isNotBlank()) authVer else ""
     for (c in candidates) {
-      val norm = if (!c.isNullOrBlank()) normalizeAppVersion(c) else ""
-      if (norm.isNotBlank()) {
-        if (com.example.util.ApkUpdateInstaller.compareVersions(norm, best) > 0) {
-          best = norm
-        }
+      val norm = c?.trim().orEmpty()
+      if (norm.isBlank() || norm.startsWith("1.") || norm.startsWith("2.")) continue
+      if (best.isBlank() || com.example.util.ApkUpdateInstaller.compareVersions(norm, best) > 0) {
+        best = norm
       }
     }
-    authoritativeCoreVersionMap[childId] = best
-    return best
+    val resolved = best.ifBlank { BuildConfig.VERSION_NAME }
+    if (resolved != BuildConfig.VERSION_NAME) {
+      authoritativeCoreVersionMap[childId] = resolved
+    }
+    return resolved
   }
 
   private val appsCache = ConcurrentHashMap<Long, List<AppControlEntity>>()
@@ -162,6 +162,12 @@ object RealtimeCloudRelay {
       }
     }
     if (snapshot != _childOnlineFlow.value) {
+      for ((id, on) in snapshot) {
+        if (_childOnlineFlow.value[id] == true && !on) {
+          // Ребёнок ушёл оффлайн — стираем старый кадр экрана.
+          DirectP2pSocketEngine.clearDirectFrameForChild(id)
+        }
+      }
       _childOnlineFlow.value = snapshot
     }
   }
@@ -355,6 +361,7 @@ object RealtimeCloudRelay {
     }
     for (tid in allTargets) {
       authoritativeLockState[tid] = pair
+      lockToggleGraceUntilMs[tid] = now + 15_000L
     }
     val cachedProfile = childrenCache[targetId] ?: (if (aliasId != null) childrenCache[aliasId] else null) ?: childrenCache.values.firstOrNull()
     cachedProfile?.let { prev ->
@@ -619,11 +626,17 @@ object RealtimeCloudRelay {
           val locked = msg.optBoolean("isDeviceLocked", false)
           val now = System.currentTimeMillis()
           val ts = msg.optLong("ts", now)
-          if (!locked || kotlin.math.abs(now - ts) <= 20_000L) {
+          val inGrace = now < (lockToggleGraceUntilMs[id] ?: 0L)
+          // В течение 15 с после LOCK/UNLOCK не даём входящему пакету откатить состояние.
+          if (!inGrace && (!locked || kotlin.math.abs(now - ts) <= 20_000L)) {
             val pair = Pair(locked, ts)
             latestGlobalLockOverride = pair
             authoritativeLockState[id] = pair
             updated = updated.copy(isDeviceLocked = locked)
+          } else if (inGrace) {
+            getAuthoritativeLock(id)?.let { auth ->
+              updated = updated.copy(isDeviceLocked = auth.first)
+            }
           }
         } else {
           getAuthoritativeLock(id)?.let { auth ->
@@ -1317,7 +1330,6 @@ object RealtimeCloudRelay {
 
   suspend fun publishActiveAppOnly(childId: Long, activeAppName: String) {
     val targetId = if (childId > 0L) childId else 1L
-    val prevB64 = DirectP2pSocketEngine.getLatestDirectFrameForChild(targetId)?.second.orEmpty()
     val cachedProfile = getCachedChild(targetId)
     val json = JSONObject().apply {
       put("type", "DIRECT_SCREEN_FRAME")
@@ -1326,7 +1338,7 @@ object RealtimeCloudRelay {
         put("pairingCode", cachedProfile?.pairingCode)
       }
       put("activeAppName", activeAppName)
-      if (prevB64.isNotBlank()) put("base64Bitmap", prevB64)
+      // Без старого prevB64: иначе 3-часовой кадр снова уходил в DIRECT_SCREEN_FRAME.
       put("lanIp", DirectP2pSocketEngine.getLocalIpv4Address())
       put("timestamp", System.currentTimeMillis())
     }

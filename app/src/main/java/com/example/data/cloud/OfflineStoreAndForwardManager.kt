@@ -136,26 +136,10 @@ object OfflineStoreAndForwardManager {
     base64Bitmap: String,
     deviceType: String = "PHONE"
   ) {
+    // Оффлайн-скриншоты экрана НЕ копим: они жгли батарею и память, а старые кадры
+    // (часами) всё равно неактуальны. При онлайне кадр идёт напрямую через
+    // pushDirectScreenFrame / uploadScreenSnapshot.
     if (childId <= 0L || base64Bitmap.isBlank()) return
-    scope.launch {
-      try {
-        val now = System.currentTimeMillis()
-        val dao = KidsGuardDatabase.getDatabase(context).kidsGuardDao()
-        dao.insertOfflineScreenshot(
-          OfflineScreenshotEntity(
-            childId = childId,
-            deviceType = deviceType,
-            activeAppName = activeAppName,
-            statusNote = statusNote,
-            base64Bitmap = base64Bitmap,
-            timestamp = now,
-            isSyncedToParent = false
-          )
-        )
-        dao.trimOfflineScreenshots(childId)
-        refreshPendingCounts(context, childId)
-      } catch (_: Exception) {}
-    }
   }
 
   private suspend fun refreshPendingCounts(context: Context, childId: Long) {
@@ -245,7 +229,7 @@ object OfflineStoreAndForwardManager {
         val sent = DirectP2pSocketEngine.publishTcpSocketPacket(
           "${DirectP2pSocketEngine.TOPIC_DATA}/$childId",
           packet,
-          retain = true
+          retain = false
         )
         if (sent) {
           if (unsyncedLogs.isNotEmpty()) {

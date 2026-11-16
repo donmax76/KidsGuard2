@@ -63,7 +63,9 @@ object CoreEngineHotUpdater {
       val editor = prefs.edit()
         .putString(KEY_CORE_VERSION_NAME, unifiedVer)
         .putInt(KEY_CORE_VERSION_CODE, BuildConfig.VERSION_CODE)
-      if (childId > 0L) {
+      // Версию ребёнка пишем только когда это устройство САМО является ребёнком.
+      // На родителе НЕ перезаписываем child_core_ver_$childId своей версией.
+      if (childId > 0L && com.example.data.cloud.DirectP2pSocketEngine.currentRole == "CHILD") {
         editor.putString("child_core_ver_$childId", unifiedVer)
       }
       editor.apply()

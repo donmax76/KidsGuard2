@@ -110,11 +110,11 @@ object DirectP2pSocketEngine {
   private var parentClientSocket: Socket? = null
   private var parentSocketWriter: PrintWriter? = null
 
-  @Volatile
-  private var globalTcpOut: BufferedOutputStream? = null
-
-  @Volatile
-  private var globalSocket: Socket? = null
+  // Параллельные подключения к обоим брокерам (как P2P_BROKERS в ПК-агенте):
+  // publishTcpSocketPacket пишет сразу во все, чтобы родитель/ребёнок/ПК видели
+  // друг друга мгновенно из любых сетей.
+  private val globalTcpOuts = CopyOnWriteArrayList<BufferedOutputStream>()
+  private val globalSockets = CopyOnWriteArrayList<Socket>()
   private val globalWriteLock = Any()
   private val retainedPacketsOutbox = ConcurrentHashMap<String, JSONObject>()
 
@@ -196,7 +196,12 @@ object DirectP2pSocketEngine {
       val targetId = if (childId > 0L) childId else (thisDeviceBoundChildId.takeIf { it > 0L } ?: 1L)
       scope.launch {
         try {
-          OfflineStoreAndForwardManager.flushUnsyncedHistoryToParent(ctx, targetId)
+          // Тяжёлую выгрузку оффлайн-истории делаем автоматически ТОЛЬКО при включённом
+          // экране ребёнка. При чёрном экране отвечаем лишь коротким PONG + батареей;
+          // полную синхронизацию родитель запускает вручную (REQUEST_OFFLINE_SYNC).
+          if (com.example.util.DeviceUsageTracker.isInteractive(ctx)) {
+            OfflineStoreAndForwardManager.flushUnsyncedHistoryToParent(ctx, targetId)
+          }
           val dao = com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
           val child = dao.getChildByIdOnce(targetId)
           if (child != null) {
@@ -238,6 +243,18 @@ object DirectP2pSocketEngine {
     currentMap.remove(childId)
     _framesByChild.value = currentMap
     childLanIps.remove(childId)
+    // Стираем старый retained-кадр с брокера пустым retained-пакетом.
+    try {
+      val cid = if (childId > 0) childId else 1L
+      val empty = JSONObject().apply {
+        put("type", "DIRECT_SCREEN_FRAME")
+        put("childId", cid)
+        put("activeAppName", "")
+        put("base64Bitmap", "")
+        put("timestamp", System.currentTimeMillis())
+      }
+      publishTcpSocketPacket("$TOPIC_SCREEN/$cid", empty, retain = true)
+    } catch (_: Exception) {}
   }
 
   fun clearAllFrames() {
@@ -315,7 +332,14 @@ object DirectP2pSocketEngine {
 
   /** Будит блокирующее чтение глобального сокета — цикл тут же переподключится. */
   private fun wakeGlobalTcp() {
-    try { globalSocket?.close() } catch (_: Exception) {}
+    for (s in globalSockets) {
+      try { s.close() } catch (_: Exception) {}
+    }
+  }
+
+  /** Если ни один глобальный сокет не подключён — будим переподключение. */
+  fun ensureConnectedAndWake() {
+    if (globalTcpOuts.isEmpty()) wakeGlobalTcp()
   }
 
   /** Родитель переключил режим сети ребёнка: применяем мгновенно. */
@@ -766,154 +790,134 @@ object DirectP2pSocketEngine {
    * retained state, screen, lock, and command subtopics without ever overwriting another child!
    */
   private fun startGlobalBinaryTcpSocketLoop() {
-    scope.launch {
-      var hostIdx = preferredRelayHost
-      var retryDelayMs = 2_000L
-      while (isActive) {
-        // В режиме «Только Wi-Fi» без Wi-Fi не пытаемся лезть в 4G и не крутим
-        // бесконечный реконнект — просто ждём, пока NetworkCallback разбудит нас
-        // при появлении Wi-Fi (или родитель переключит режим).
-        if (!childNetworkAllowed()) {
-          retryDelayMs = 2_000L
-          delay(3_000L)
-          continue
-        }
-        val (host, port) = TCP_RELAY_HOSTS[hostIdx % TCP_RELAY_HOSTS.size]
-        hostIdx++
-        var sock: Socket? = null
-        var succeeded = false
-        try {
-          sock = Socket()
-          // bindSocket только в строгом «Только Wi-Fi». В «Wi-Fi + 4G» НЕ привязываем,
-          // чтобы система свободно маршрутизировала сокет через Wi-Fi или 4G и телефоны
-          // видели друг друга из разных сетей.
-          if (!allowMobileData) {
-            currentWifiNetwork()?.let { wifi ->
-              try { wifi.bindSocket(sock) } catch (_: Exception) {}
-            }
+    // Параллельное подключение к каждому брокеру (как P2P_BROKERS в ПК-агенте):
+    // по корутине на брокер, пакеты пишутся сразу во все активные сокеты.
+    for (relay in TCP_RELAY_HOSTS) {
+      scope.launch {
+        runBinaryTcpSocketLoop(relay.first, relay.second)
+      }
+    }
+  }
+
+  private suspend fun runBinaryTcpSocketLoop(host: String, port: Int) {
+    var retryDelayMs = 2_000L
+    while (isActive) {
+      if (!childNetworkAllowed()) {
+        retryDelayMs = 2_000L
+        delay(3_000L)
+        continue
+      }
+      var sock: Socket? = null
+      var out: BufferedOutputStream? = null
+      try {
+        sock = Socket()
+        if (!allowMobileData) {
+          currentWifiNetwork()?.let { wifi ->
+            try { wifi.bindSocket(sock) } catch (_: Exception) {}
           }
-          globalSocket = sock
-          sock.connect(InetSocketAddress(host, port), 5000)
-          sock.keepAlive = true
-          sock.tcpNoDelay = true
-          // CONNACK ждём ограниченное время: мёртвый брокер не должен вешать весь P2P.
-          sock.soTimeout = 12_000
-          val inp = DataInputStream(BufferedInputStream(sock.getInputStream()))
-          val out = BufferedOutputStream(sock.getOutputStream())
+        }
+        sock.connect(InetSocketAddress(host, port), 5000)
+        sock.keepAlive = true
+        sock.tcpNoDelay = true
+        sock.soTimeout = 12_000
+        val inp = DataInputStream(BufferedInputStream(sock.getInputStream()))
+        out = BufferedOutputStream(sock.getOutputStream())
 
-          // 1. Send CONNECT packet
-          val clientId = "kg_${UUID.randomUUID().toString().take(10)}"
-          sendMqttConnect(out, clientId)
-          val connAckType = inp.readUnsignedByte()
-          val connAckLen = readRemainingLength(inp)
-          val connAckBody = ByteArray(connAckLen)
-          inp.readFully(connAckBody)
+        val clientId = "kg_${UUID.randomUUID().toString().take(10)}"
+        sendMqttConnect(out, clientId)
+        val connAckType = inp.readUnsignedByte()
+        val connAckLen = readRemainingLength(inp)
+        val connAckBody = ByteArray(connAckLen)
+        inp.readFully(connAckBody)
 
-          if ((connAckType and 0xF0) == 0x20) {
-            retryDelayMs = 2_000L // Reset backoff on successful connection
-            sock.soTimeout = 0
-            succeeded = true
-            preferredRelayHost = (hostIdx - 1) % TCP_RELAY_HOSTS.size
-            globalTcpOut = out
-            _status.value = _status.value.copy(
-              isGlobalTcpSocketConnected = true,
-              activeTransportLabel = if (_status.value.isLanSocketConnected) {
-                "🟢 Прямой P2P Сокет LAN (${_status.value.childLanIp}:$TCP_PORT)"
-              } else {
-                "⚡ Прямой бинарный TCP-Сокет ($host:$port)"
-              }
+        if ((connAckType and 0xF0) == 0x20) {
+          retryDelayMs = 2_000L
+          sock.soTimeout = 0
+          globalSockets.add(sock)
+          globalTcpOuts.add(out)
+          _status.value = _status.value.copy(
+            isGlobalTcpSocketConnected = true,
+            activeTransportLabel = "⚡ Прямой бинарный TCP-Сокет ($host:$port)"
+          )
+          Log.d(TAG, "Connected persistent binary TCP socket to $host:$port")
+
+          val subscriptions = if (currentRole == "CHILD") {
+            listOf(
+              "$TOPIC_ROOT/cmd/#",
+              "$TOPIC_ROOT/lock/#",
+              "$TOPIC_ROOT/data/#",
+              "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+              "$TOPIC_ROOT_LEGACY_PC/lock/#",
+              "$TOPIC_ROOT_LEGACY_PC/data/#"
             )
-            Log.d(TAG, "Connected persistent binary TCP socket to $host:$port")
+          } else {
+            listOf(
+              TOPIC_WILDCARD_ALL,
+              "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
+            )
+          }
+          sendMqttSubscribe(out, subscriptions)
 
-            // 2. Подписки строго по роли. Ребёнку НЕ нужны pc_state/pc_stream и чужие
-            // state/chat: раньше wildcard '#' будил радио каждые 4 секунды от состояний ПК,
-            // даже когда родитель ничего не смотрел — это давало десятки процентов расхода.
-            val subscriptions = if (currentRole == "CHILD") {
-              listOf(
-                "$TOPIC_ROOT/cmd/#",
-                "$TOPIC_ROOT/lock/#",
-                "$TOPIC_ROOT/data/#",
-                // совместимость со старым родительским приложением (v33)
-                "$TOPIC_ROOT_LEGACY_PC/cmd/#",
-                "$TOPIC_ROOT_LEGACY_PC/lock/#",
-                "$TOPIC_ROOT_LEGACY_PC/data/#"
-              )
-            } else {
-              listOf(
-                TOPIC_WILDCARD_ALL,
-                "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
-                "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
-                "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
-              )
-            }
-            sendMqttSubscribe(out, subscriptions)
+          for ((retTopic, retJson) in retainedPacketsOutbox) {
+            try {
+              publishTcpSocketPacket(retTopic, retJson, retain = true)
+            } catch (_: Exception) {}
+          }
 
-            // 2b. Immediately flush all retained packets (such as newly created Child profiles & pairing codes!)
-            for ((retTopic, retJson) in retainedPacketsOutbox) {
-              try {
-                publishTcpSocketPacket(retTopic, retJson, retain = true)
-              } catch (_: Exception) {}
-            }
-
-            // 3. Keepalive ping loop (battery-friendly 90s interval matching 120s MQTT keepalive)
-            val pingJob = launch {
-              while (isActive && sock.isConnected && !sock.isClosed) {
-                delay(45_000L)
-                synchronized(globalWriteLock) {
-                  try {
-                    out.write(byteArrayOf(0xC0.toByte(), 0x00))
-                    out.flush()
-                  } catch (_: Exception) {
-                    // Соединение умерло — закрываем сокет, чтобы разбудить блокирующее чтение
-                    // и переподключиться (иначе поток навсегда зависал на read()).
-                    try { sock.close() } catch (_: Exception) {}
-                  }
+          val pingJob = launch {
+            while (isActive && sock.isConnected && !sock.isClosed) {
+              delay(45_000L)
+              synchronized(globalWriteLock) {
+                try {
+                  out.write(byteArrayOf(0xC0.toByte(), 0x00))
+                  out.flush()
+                } catch (_: Exception) {
+                  try { sock.close() } catch (_: Exception) {}
                 }
               }
             }
+          }
 
-            // 4. Read incoming binary TCP packets continuously
-            try {
-              while (isActive && sock.isConnected && !sock.isClosed) {
-                val header = inp.readUnsignedByte()
-                val remLen = readRemainingLength(inp)
-                val payloadBytes = ByteArray(remLen)
-                inp.readFully(payloadBytes)
+          try {
+            while (isActive && sock.isConnected && !sock.isClosed) {
+              val header = inp.readUnsignedByte()
+              val remLen = readRemainingLength(inp)
+              val payloadBytes = ByteArray(remLen)
+              inp.readFully(payloadBytes)
 
-                val packetType = (header and 0xF0) shr 4
-                if (packetType == 3 && remLen >= 2) { // PUBLISH packet
-                  val topicLen = ((payloadBytes[0].toInt() and 0xFF) shl 8) or (payloadBytes[1].toInt() and 0xFF)
-                  if (remLen >= 2 + topicLen) {
-                    val topic = String(payloadBytes, 2, topicLen, Charsets.UTF_8)
-                    val qos = (header and 0x06) shr 1
-                    val msgOffset = if (qos > 0) 2 + topicLen + 2 else 2 + topicLen
-                    if (remLen > msgOffset) {
-                      if (topic.contains("/pc_stream_bin")) {
-                        // Живой кадр ПК в бинарном виде: без Base64 и без JSON-парсинга.
-                        com.example.data.pc.PcBlockerClient.ingestP2pStreamFrameBinary(
-                          topic,
-                          payloadBytes,
-                          msgOffset,
-                          remLen - msgOffset
-                        )
-                      } else {
-                        val jsonStr = String(payloadBytes, msgOffset, remLen - msgOffset, Charsets.UTF_8)
-                        handleIncomingJsonPacket(topic, jsonStr, isFromLan = false)
-                      }
+              val packetType = (header and 0xF0) shr 4
+              if (packetType == 3 && remLen >= 2) {
+                val topicLen = ((payloadBytes[0].toInt() and 0xFF) shl 8) or (payloadBytes[1].toInt() and 0xFF)
+                if (remLen >= 2 + topicLen) {
+                  val topic = String(payloadBytes, 2, topicLen, Charsets.UTF_8)
+                  val qos = (header and 0x06) shr 1
+                  val msgOffset = if (qos > 0) 2 + topicLen + 2 else 2 + topicLen
+                  if (remLen > msgOffset) {
+                    if (topic.contains("/pc_stream_bin")) {
+                      com.example.data.pc.PcBlockerClient.ingestP2pStreamFrameBinary(
+                        topic, payloadBytes, msgOffset, remLen - msgOffset
+                      )
+                    } else {
+                      val jsonStr = String(payloadBytes, msgOffset, remLen - msgOffset, Charsets.UTF_8)
+                      handleIncomingJsonPacket(topic, jsonStr, isFromLan = false)
                     }
                   }
                 }
               }
-            } finally {
-              pingJob.cancel()
             }
+          } finally {
+            pingJob.cancel()
           }
-        } catch (e: Exception) {
-          Log.d(TAG, "Binary TCP socket ($host:$port) reconnect: ${e.message}")
-        } finally {
-          globalTcpOut = null
-          globalSocket = null
-          try { sock?.close() } catch (_: Exception) {}
+        }
+      } catch (e: Exception) {
+        Log.d(TAG, "Binary TCP socket ($host:$port) reconnect: ${e.message}")
+      } finally {
+        if (out != null) globalTcpOuts.remove(out)
+        globalSockets.remove(sock)
+        try { sock?.close() } catch (_: Exception) {}
+        if (globalTcpOuts.isEmpty()) {
           _status.value = _status.value.copy(
             isGlobalTcpSocketConnected = false,
             activeTransportLabel = if (_status.value.isLanSocketConnected) {
@@ -923,14 +927,9 @@ object DirectP2pSocketEngine {
             }
           )
         }
-        delay(retryDelayMs)
-        retryDelayMs = (retryDelayMs * 2L).coerceAtMost(30_000L)
-        // После обрыва снова идём на «любимый» брокер; если он не ответил CONNACK,
-        // hostIdx уже указывает на следующий — попробуем его.
-        if (succeeded) {
-          hostIdx = preferredRelayHost
-        }
       }
+      delay(retryDelayMs)
+      retryDelayMs = (retryDelayMs * 2L).coerceAtMost(4_000L)
     }
   }
 
@@ -1019,7 +1018,7 @@ object DirectP2pSocketEngine {
       }
     }
     val sent = pushDirectLanPacket(json)
-    val out = globalTcpOut ?: return sent
+    if (globalTcpOuts.isEmpty()) return sent
     return try {
       val body = ByteArrayOutputStream()
       writeUtf8String(body, topic)
@@ -1031,12 +1030,25 @@ object DirectP2pSocketEngine {
       pkt.write(if (retain) 0x31 else 0x30)
       encodeRemainingLength(pkt, bodyBytes.size)
       pkt.write(bodyBytes)
+      val packetBytes = pkt.toByteArray()
 
+      var ok = false
       synchronized(globalWriteLock) {
-        out.write(pkt.toByteArray())
-        out.flush()
+        // Пишем сразу во ВСЕ активные брокеры (родитель + ребёнок + ПК видят друг
+        // друга мгновенно из любых сетей, даже если сидят на разных брокерах).
+        val iter = globalTcpOuts.iterator()
+        while (iter.hasNext()) {
+          val out = iter.next()
+          try {
+            out.write(packetBytes)
+            out.flush()
+            ok = true
+          } catch (_: Exception) {
+            iter.remove()
+          }
+        }
       }
-      true
+      ok || sent
     } catch (e: Exception) {
       Log.d(TAG, "publishTcpSocketPacket error: ${e.message}")
       sent
@@ -1077,6 +1089,8 @@ object DirectP2pSocketEngine {
             val cid = RealtimeCloudRelay.resolveCanonicalChildId(rawCid, pktPairingCode)
             val ts = msg.optLong("timestamp", msg.optLong("ts", now))
             if (cid <= 0L) return@launch
+            // Кадр старше 60 с — не сохраняем (брокер мог отдать старый retained-кадр).
+            if (now - ts > 60_000L) return@launch
             val appName = msg.optString("activeAppName", "Экран ребёнка")
             val directB64 = msg.optString("base64Bitmap", "")
             val key = msg.optString("blobKey", "")
@@ -1148,11 +1162,10 @@ object DirectP2pSocketEngine {
               val reqIp = msg.optString("requesterIp", "")
               RealtimeCloudRelay.rebroadcastAllChildrenForPairing(reqIp)
             } else {
+              // Блокировку/разблокировку управляем ТОЛЬКО через LOCK_STATE и CMD
+              // (LOCK/UNLOCK). Старый CHILD_STATE с isDeviceLocked=false НЕ должен
+              // мгновенно снимать только что включённую блокировку.
               RealtimeCloudRelay.ingestImmediateStateJson(msg)
-              if (msg.has("isDeviceLocked") && !msg.optBoolean("isDeviceLocked", true)) {
-                val rawCid = msg.optLong("childId", msg.optLong("id", 1L))
-                applyImmediateLockOrUnlockIfChild(rawCid, false)
-              }
             }
           }
           type == "PC_STATE" || topic.contains("/pc_state") -> {
@@ -1225,7 +1238,8 @@ object DirectP2pSocketEngine {
     }
     // Если есть прямой LAN-сокет — кадр идёт и по Wi-Fi, без мобильного трафика.
     val sentLan = pushDirectLanPacket(packet)
-    val sentCloud = publishTcpSocketPacket("$TOPIC_SCREEN/$cid", packet, retain = true)
+    // НЕ retain: иначе брокер часами хранит старый кадр и присылает его при реконнекте.
+    val sentCloud = publishTcpSocketPacket("$TOPIC_SCREEN/$cid", packet, retain = false)
     return sentLan || sentCloud
   }
 
