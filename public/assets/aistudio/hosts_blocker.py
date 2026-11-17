@@ -1025,7 +1025,7 @@ class App(tk.Tk):
         dlg = tk.Toplevel(self)
         dlg.title("Веб-панель и KidsGuard Pro")
         dlg.configure(bg=CARD)
-        dlg.geometry(f"{S(540)}x{S(480)}")
+        dlg.geometry(f"{S(560)}x{S(720)}")
         dlg.transient(self)
         dlg.grab_set()
         pad = {"padx": S(22)}
@@ -1055,6 +1055,31 @@ class App(tk.Tk):
         addr = tk.Label(dlg, text="", bg=CARD, fg=ACCENT, font=("Segoe UI", 12, "bold"))
         addr.pack(anchor="w", pady=S(14), **pad)
 
+        # --- ☁️ Свой VPS / Cloudflare Релей ---
+        tk.Label(dlg, text="☁️ Свой VPS / Cloudflare Релей", bg=CARD, fg=TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(S(10), S(4)), **pad)
+        vps_var = tk.BooleanVar(value=bool(web.get("vps_enabled", False)))
+        tk.Checkbutton(dlg, text="Включить подключение через VPS / Cloudflare (параллельно со стандартным P2P)",
+                       variable=vps_var, bg=CARD, fg=TEXT, selectcolor=BG, activebackground=CARD,
+                       activeforeground=TEXT, font=("Segoe UI", 10)).pack(anchor="w", **pad)
+        vps_host = tk.Entry(dlg, bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat", font=("Segoe UI", 11))
+        vps_host.insert(0, str(web.get("vps_host", "")))
+        vps_host.pack(fill="x", **pad)
+        tk.Label(dlg, text="Домен Cloudflare или IP VPS (например relay.donmaxai.trade или IP)",
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", **pad)
+        vrow = tk.Frame(dlg, bg=CARD)
+        vrow.pack(fill="x", **pad)
+        tk.Label(vrow, text="Порт VPS:", bg=CARD, fg=TEXT, font=("Segoe UI", 10)).pack(side="left")
+        vps_port = tk.Entry(vrow, width=7, bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat", font=("Segoe UI", 11))
+        vps_port.insert(0, str(web.get("vps_port", 443)))
+        vps_port.pack(side="left", padx=S(8))
+        tk.Label(vrow, text="Пароль VPS:", bg=CARD, fg=TEXT, font=("Segoe UI", 10)).pack(side="left", padx=(S(10), 0))
+        vps_pwd = tk.Entry(vrow, width=14, bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat", font=("Segoe UI", 11), show="*")
+        vps_pwd.insert(0, str(web.get("vps_password", "1234")))
+        vps_pwd.pack(side="left", padx=S(8))
+        tk.Label(dlg, text="Room № = Код привязки P2P (поле «Код привязки KidsGuard» выше)",
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", **pad)
+
         def show():
             addr.config(text=f"Wi-Fi: http://{local_ip()}:{port.get().strip() or 8765}  |  Код P2P: {pcode.get().strip() or '101-701'}")
 
@@ -1068,7 +1093,19 @@ class App(tk.Tk):
             except ValueError:
                 return messagebox.showwarning("Порт", "Порт: число от 1024 до 65535.", parent=dlg)
             code_val = pcode.get().strip() or "101-701"
-            self.cfg["web"] = {"enabled": var.get(), "port": p, "pairing_code": code_val}
+            try:
+                vp = int(vps_port.get().strip())
+            except ValueError:
+                vp = 443
+            self.cfg["web"] = {
+                "enabled": var.get(),
+                "port": p,
+                "pairing_code": code_val,
+                "vps_enabled": bool(vps_var.get()),
+                "vps_host": (vps_host.get() or "").strip(),
+                "vps_port": vp,
+                "vps_password": (vps_pwd.get() or "1234")
+            }
             save_config(self.cfg)
             show()
             messagebox.showinfo(
