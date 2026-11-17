@@ -1,5 +1,21 @@
 # KidsGuard2 — HANDOFF
 
+## Сборка run #56 (2026-11-17)
+
+- Финальный коммит: `2b1f378` (VPS UI stream + legacy P2P fallback + PIN lock; фикс `onVerifyUninstallPin`)
+- Успешный CI-run: **#56** — https://github.com/donmax76/KidsGuard2/actions/runs/44106697118
+- Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
+- Примечание: run #55 (`45461b8`) упал на вызове `onVerifyUninstallPin(... onSuccess=...)`; исправлено на позиционные лямбды в `2b1f378`.
+
+### Артефакты run #56
+
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14339002347/zip
+  (~20,88 МБ, внутри `app-debug.apk`)
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14339615468/zip
+  (~19,0 МБ, внутри `hosts_blocker.exe` + `hosts_blocker.py`)
+
+---
+
 ## Сборка run #54 (2026-11-17)
 
 - Финальный коммит: `d6f7124` (VPS/Cloudflare relay в панели ПК-агента)
