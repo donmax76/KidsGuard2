@@ -272,6 +272,10 @@ object PcBlockerClient {
   @Volatile
   private var pcIdentityLoaded: Boolean = false
 
+  // Пользователь стёр LAN IP -> подключаемся строго по P2P, без поиска локального ПК.
+  @Volatile
+  private var forceP2pOnlyMode: Boolean = false
+
   @Volatile
   private var lanLoginInFlight: Boolean = false
 
@@ -329,6 +333,7 @@ object PcBlockerClient {
     if (savedId.isNotBlank()) configuredPcId = savedId
     val savedPwd = p.getString("pc_password", "").orEmpty()
     if (savedPwd.isNotBlank()) pcPassword = savedPwd
+    forceP2pOnlyMode = p.getBoolean("pc_force_p2p_only", false)
     _state.value = _state.value.copy(pairingCode = configuredCode)
   }
 
@@ -336,6 +341,7 @@ object PcBlockerClient {
     val editor = pcPrefs()?.edit() ?: return
     editor.putString("pc_code", configuredCode)
     editor.putString("pc_id", configuredPcId)
+    editor.putBoolean("pc_force_p2p_only", forceP2pOnlyMode)
     editor.apply()
   }
 
@@ -603,6 +609,7 @@ object PcBlockerClient {
   }
 
   fun onUdpBeaconReceived(pcName: String, ip: String, port: Int, pairingCode: String, pcId: String = "") {
+    if (forceP2pOnlyMode) return
     loadPersistedPcIdentity()
     val beaconCode = pairingCode.trim()
     val beaconId = pcId.trim()
@@ -1030,22 +1037,38 @@ object PcBlockerClient {
       pcPassword = effectivePassword
       pcPrefs()?.edit()?.putString("pc_password", effectivePassword)?.apply()
     }
-    if (pairingCode.isNotBlank()) {
-      configuredCode = pairingCode.trim()
-      configuredPcId = ""
-      codeExplicitlySet = true
-      persistPcIdentity()
-      _state.value = _state.value.copy(pairingCode = configuredCode)
+    val newCode = pairingCode.trim().ifBlank { configuredCode.ifBlank { "101-701" } }
+    val codeChanged = normalizePcCode(newCode) != normalizePcCode(configuredCode)
+
+    // Если пользователь стер IP или сменил код P2P — ПОЛНОСТЬЮ отвязываемся от старого LAN ПК!
+    if (cleanIp.isBlank() || codeChanged) {
+      clearPcScopedState("Переключение на ПК (Код $newCode)")
     }
+    forceP2pOnlyMode = cleanIp.isBlank()
+    configuredCode = newCode
+    configuredPcId = ""
+    codeExplicitlySet = true
+    persistPcIdentity()
+    _state.value = _state.value.copy(
+      pairingCode = configuredCode,
+      lanIp = cleanIp,
+      isLanHttpAuthenticated = false
+    )
+
     lanLoginInFlight = true
     scope.launch {
       if (cleanIp.isBlank()) {
         lanLoginInFlight = false
+        sessionCookie = null
+        csrfToken = ""
         _state.value = _state.value.copy(
-          transportLabel = "🌐 Интернет P2P-мост (Код ${_state.value.pairingCode})",
-          statusMessage = "Подключение через Интернет по коду P2P (${_state.value.pairingCode})..."
+          lanIp = "",
+          isLanHttpAuthenticated = false,
+          transportLabel = "🌐 Интернет P2P-мост (Код $configuredCode)",
+          statusMessage = "Подключение строго через P2P по коду $configuredCode (LAN IP отключён)..."
         )
         requestSync()
+        requestPcScreenshot()
         return@launch
       }
       try {
@@ -1112,6 +1135,7 @@ object PcBlockerClient {
 
   /** Автовход по сохранённому паролю, когда появился LAN-IP (маяк/состояние). */
   fun ensureSavedLanLogin() {
+    if (forceP2pOnlyMode) return
     loadPersistedPcIdentity()
     val st = _state.value
     if (lanLoginInFlight || st.isLanHttpAuthenticated || pcPassword.isBlank() || st.lanIp.isBlank()) return
@@ -1124,6 +1148,7 @@ object PcBlockerClient {
    * пользователя (открытие экрана ПК), не в фоне — чтобы не сажать батарею.
    */
   fun discoverLanPc(force: Boolean = false) {
+    if (forceP2pOnlyMode) return
     if (DirectP2pSocketEngine.currentRole == "CHILD") return
     loadPersistedPcIdentity()
     val now = System.currentTimeMillis()
@@ -1774,7 +1799,7 @@ object PcBlockerClient {
     // Синхронизируем по-дневные снимки активности ПК в локальную БД SQLite (offline_activity_logs)
     syncPcActivityByDateToRoom(mergedByDate)
 
-    val ipFromMsg = msg.optString("local_ip", "")
+    val ipFromMsg = if (forceP2pOnlyMode) "" else msg.optString("local_ip", "")
     val embeddedScrB64 = msg.optString("screen_b64", "")
     val resolvedScrB64 = if (embeddedScrB64.isNotBlank()) embeddedScrB64 else current.screenBase64
     val resolvedScrTs = if (embeddedScrB64.isNotBlank()) msg.optLong("screen_ts", System.currentTimeMillis()) else current.screenTimestampMs

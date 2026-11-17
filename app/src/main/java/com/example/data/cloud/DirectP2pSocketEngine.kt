@@ -76,8 +76,7 @@ object DirectP2pSocketEngine {
   const val TOPIC_LOCK = "kidsguard/eb6ecfcf/v34_p2p/lock"
 
   private val TCP_RELAY_HOSTS = listOf(
-    "broker.emqx.io" to 1883,
-    "broker.hivemq.com" to 1883
+    "broker.emqx.io" to 1883
   )
 
   /**
@@ -862,7 +861,18 @@ object DirectP2pSocketEngine {
 
           for ((retTopic, retJson) in retainedPacketsOutbox) {
             try {
-              publishTcpSocketPacket(retTopic, retJson, retain = true)
+              val body = ByteArrayOutputStream()
+              writeUtf8String(body, retTopic)
+              body.write(retJson.toString().toByteArray(Charsets.UTF_8))
+              val bodyBytes = body.toByteArray()
+              val pkt = ByteArrayOutputStream()
+              pkt.write(0x31)
+              encodeRemainingLength(pkt, bodyBytes.size)
+              pkt.write(bodyBytes)
+              synchronized(globalWriteLock) {
+                out.write(pkt.toByteArray())
+                out.flush()
+              }
             } catch (_: Exception) {}
           }
 
@@ -1019,39 +1029,36 @@ object DirectP2pSocketEngine {
     }
     val sent = pushDirectLanPacket(json)
     if (globalTcpOuts.isEmpty()) return sent
-    return try {
-      val body = ByteArrayOutputStream()
-      writeUtf8String(body, topic)
-      val payloadBytes = json.toString().toByteArray(Charsets.UTF_8)
-      body.write(payloadBytes)
-      val bodyBytes = body.toByteArray()
+    scope.launch(Dispatchers.IO) {
+      try {
+        val body = ByteArrayOutputStream()
+        writeUtf8String(body, topic)
+        val payloadBytes = json.toString().toByteArray(Charsets.UTF_8)
+        body.write(payloadBytes)
+        val bodyBytes = body.toByteArray()
 
-      val pkt = ByteArrayOutputStream()
-      pkt.write(if (retain) 0x31 else 0x30)
-      encodeRemainingLength(pkt, bodyBytes.size)
-      pkt.write(bodyBytes)
-      val packetBytes = pkt.toByteArray()
+        val pkt = ByteArrayOutputStream()
+        pkt.write(if (retain) 0x31 else 0x30)
+        encodeRemainingLength(pkt, bodyBytes.size)
+        pkt.write(bodyBytes)
+        val packetBytes = pkt.toByteArray()
 
-      var ok = false
-      synchronized(globalWriteLock) {
-        // Пишем сразу во ВСЕ активные брокеры (родитель + ребёнок + ПК видят друг
-        // друга мгновенно из любых сетей, даже если сидят на разных брокерах).
-        val snapshot = globalTcpOuts.toList()
-        for (out in snapshot) {
-          try {
-            out.write(packetBytes)
-            out.flush()
-            ok = true
-          } catch (_: Exception) {
-            globalTcpOuts.remove(out)
+        synchronized(globalWriteLock) {
+          val snapshot = globalTcpOuts.toList()
+          for (out in snapshot) {
+            try {
+              out.write(packetBytes)
+              out.flush()
+            } catch (_: Exception) {
+              globalTcpOuts.remove(out)
+            }
           }
         }
+      } catch (e: Exception) {
+        Log.d(TAG, "publishTcpSocketPacket error: ${e.message}")
       }
-      ok || sent
-    } catch (e: Exception) {
-      Log.d(TAG, "publishTcpSocketPacket error: ${e.message}")
-      sent
     }
+    return true
   }
 
   private fun handleIncomingJsonPacket(topic: String, rawJson: String, isFromLan: Boolean) {
