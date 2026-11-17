@@ -1,5 +1,20 @@
 # KidsGuard2 — HANDOFF
 
+## Сборка run #52 (2026-11-17)
+
+- Финальный коммит: `ab52656` (VPS/Cloudflare WebSocket relay + 3 багфикса)
+- Успешный CI-run: **#52** — https://github.com/donmax76/KidsGuard2/actions/runs/44067346901
+- Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
+
+### Артефакты run #52
+
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14321411696/zip
+  (~20,86 МБ, внутри `app-debug.apk`)
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14320776878/zip
+  (~19,0 МБ, внутри `hosts_blocker.exe` + `hosts_blocker.py`)
+
+---
+
 ## Сборка run #51 (2026-11-17)
 
 - Финальный коммит: `213ce54` («single emqx broker non-blocking write & strict P2P-only mode»)
