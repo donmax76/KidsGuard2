@@ -460,6 +460,10 @@ class KidsGuardBackgroundService : Service() {
           } catch (e: Exception) {
             Log.e(TAG, "Battery sync error: ${e.message}")
           }
+          // Ребёнок всегда сообщает о своём онлайне на каждой итерации цикла.
+          try {
+            com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+          } catch (_: Exception) {}
           // Экран погашен — нет смысла будить процесс каждую минуту: переходим в
           // глубокий экономный режим (раз в 5 минут), чтобы не сажать батарею.
           val screenInteractiveForDelay = DeviceUsageTracker.isInteractive(applicationContext)

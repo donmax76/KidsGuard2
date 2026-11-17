@@ -463,7 +463,7 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
               repository.sendRemoteCloudCommand(targetChildId, "MAP_VIEWING", "1")
             }
           }
-          kotlinx.coroutines.delay(30_000L)
+          kotlinx.coroutines.delay(12_000L)
           continue
         }
         if (_deviceRole.value == AppRole.CHILD && !com.example.location.LiveLocationTracker.isEmulator()) {

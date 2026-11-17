@@ -133,7 +133,11 @@ object DirectP2pSocketEngine {
   @Volatile private var vpsRoomCode = "101-701"
   @Volatile private var vpsWebSocket: WebSocket? = null
   @Volatile private var vpsConnected = false
-  private val vpsHttpClient: OkHttpClient by lazy { OkHttpClient.Builder().build() }
+  private val vpsHttpClient: OkHttpClient by lazy {
+    OkHttpClient.Builder()
+      .pingInterval(20, java.util.concurrent.TimeUnit.SECONDS)
+      .build()
+  }
 
   // --- Честный сетевой режим «Только Wi-Fi» vs «Wi-Fi + 4G» ---
   // Раньше глобальный TCP-релей подключался к брокеру по сети по умолчанию и не знал
@@ -322,15 +326,17 @@ object DirectP2pSocketEngine {
       as? ConnectivityManager ?: return
     var wifi = false
     var cell = false
+    var vpn = false
     for (n in cm.allNetworks) {
       val caps = cm.getNetworkCapabilities(n) ?: continue
       if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
       if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) wifi = true
       if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) cell = true
+      if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) vpn = true
     }
     hasWifi = wifi
-    hasCellular = cell
-    hasAnyNetwork = wifi || cell
+    hasCellular = cell || vpn
+    hasAnyNetwork = wifi || cell || vpn
   }
 
   /**
@@ -867,7 +873,8 @@ object DirectP2pSocketEngine {
 
         if ((connAckType and 0xF0) == 0x20) {
           retryDelayMs = 2_000L
-          sock.soTimeout = 0
+          // Если 40с нет пакетов/PINGRESP от сервера — переподключаемся!
+          sock.soTimeout = 40_000
           globalSockets.add(sock)
           globalTcpOuts.add(out)
           _status.value = _status.value.copy(
@@ -880,12 +887,13 @@ object DirectP2pSocketEngine {
           // никогда не терял команды PING/LOCK, а родитель не терял CHILD_STATE/PONG.
           val subscriptions = listOf(
             TOPIC_WILDCARD_ALL,
-            "$TOPIC_ROOT_LEGACY_PC/cmd/#",
-            "$TOPIC_ROOT_LEGACY_PC/lock/#",
-            "$TOPIC_ROOT_LEGACY_PC/data/#",
             "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
             "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
-            "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
+            "$TOPIC_ROOT_LEGACY_PC/pc_stream/#",
+            "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#",
+            "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+            "$TOPIC_ROOT_LEGACY_PC/lock/#",
+            "$TOPIC_ROOT_LEGACY_PC/data/#"
           )
           sendMqttSubscribe(out, subscriptions)
 
@@ -913,7 +921,7 @@ object DirectP2pSocketEngine {
 
           val pingJob = launch {
             while (isActive && sock.isConnected && !sock.isClosed) {
-              delay(45_000L)
+              delay(20_000L)
               synchronized(globalWriteLock) {
                 try {
                   out.write(byteArrayOf(0xC0.toByte(), 0x00))

@@ -2402,7 +2402,7 @@ def agent_screen_frame(max_age=5.0):
     прямой GDI-захват в сессии 0 даёт чёрный экран, а агент видит рабочий стол."""
     path = os.path.join(PUB_DIR, "screen.png")
     try:
-        if time.time() - os.path.getmtime(path) <= max_age:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) <= max_age:
             with open(path, "rb") as f:
                 data = f.read()
             if data.startswith(b"\xff\xd8"):
@@ -2411,16 +2411,9 @@ def agent_screen_frame(max_age=5.0):
                 return data, "image/png"
     except Exception:
         pass
-    # Fallback: если агент сеанса не пишет screen.png (или кадр устарел) — пробуем
-    # снять напрямую GDI. Работает, когда процесс запущен не в сессии 0 (SYSTEM).
-    try:
-        if _process_session_id() not in (0, None):
-            frame = capture_screen_frame(800, 450, 60)
-            if frame and frame[1] == "image/jpeg":
-                return frame
-    except Exception:
-        pass
-    return None
+    # Fallback: если агент сеанса не пишет screen.png (или кадр устарел) — снимаем напрямую.
+    p = stream_params()
+    return capture_screen_frame(p.get("w", 640), p.get("h", 360), quality=p.get("quality", 55))
 
 
 def _process_session_id():
@@ -3906,11 +3899,29 @@ def p2p_vps_bridge_worker(st):
                 for idx, r in enumerate((P2P_TOPIC_ROOT, P2P_TOPIC_ROOT_V34), 1):
                     _ws_send(sock, _mqtt_sub_pkt(idx, "%s/pc_cmd/%s" % (r, code)))
                 last_ping = time.time()
+                last_stream_send = 0.0
                 while True:
                     now = time.time()
                     if now - last_ping >= 30:
                         last_ping = now
                         _ws_send(sock, bytes([0xC0, 0x00]))
+                    # Живой стрим экрана ПК через уже открытый WS-сокет (без второго сокета).
+                    if stream_p2p_active() and (now - last_stream_send) >= 0.35:
+                        last_stream_send = now
+                        try:
+                            fr = agent_screen_frame(max_age=5.0)
+                            if fr:
+                                fj = json.dumps({
+                                    "type": "PC_STREAM_FRAME",
+                                    "pairing_code": code,
+                                    "pc_id": pc_id(),
+                                    "ts": int(time.time() * 1000),
+                                    "b64": base64.b64encode(fr[0]).decode("ascii")
+                                })
+                                for r in (P2P_TOPIC_ROOT, P2P_TOPIC_ROOT_V34):
+                                    _ws_send(sock, _mqtt_pub_pkt("%s/pc_stream/%s" % (r, code), fj))
+                        except Exception:
+                            pass
                     try:
                         sock.settimeout(0.5)
                         opcode, payload = _ws_recv_frame(sock)
@@ -4021,6 +4032,7 @@ def p2p_bridge_worker(st, host, port):
             last_pub = 0.0
             last_full_pub = 0.0
             last_screen_pub = 0.0
+            last_stream_send = 0.0
             while True:
                 now = time.time()
                 cur_cfg = st.get("cfg") or load_config() or {}
@@ -4058,6 +4070,24 @@ def p2p_bridge_worker(st, host, port):
                             }, ensure_ascii=False)
                             for r in roots:
                                 sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
+
+                # Живой стрим экрана ПК через тот же сокет (каждый проход цикла).
+                if stream_p2p_active() and (now - last_stream_send) >= 0.35:
+                    last_stream_send = now
+                    try:
+                        fr = agent_screen_frame(max_age=5.0)
+                        if fr:
+                            fj = json.dumps({
+                                "type": "PC_STREAM_FRAME",
+                                "pairing_code": code,
+                                "pc_id": pc_id(),
+                                "ts": int(time.time() * 1000),
+                                "b64": base64.b64encode(fr[0]).decode("ascii")
+                            })
+                            for r in roots:
+                                sock.sendall(_mqtt_pub_pkt(f"{r}/pc_stream/{code}", fj))
+                    except Exception:
+                        pass
 
                 try:
                     h = _mqtt_read_exact(sock, 1)[0]

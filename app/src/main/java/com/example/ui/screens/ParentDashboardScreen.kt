@@ -57,6 +57,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -637,9 +638,9 @@ fun ParentDashboardScreen(
       }
     }
 
-    // VPS / Cloudflare Relay настройка (родитель задаёт и шлёт ребёнку CONFIGURE_VPS)
+    // VPS / Cloudflare Relay настройка (скрыта по умолчанию, разворачивается кнопкой).
     item {
-      var showVpsSetupPanel by remember { mutableStateOf(false) }
+      var showVpsSetupPanel by rememberSaveable { mutableStateOf(false) }
       Button(
         onClick = { showVpsSetupPanel = !showVpsSetupPanel },
         colors = ButtonDefaults.buttonColors(containerColor = Slate800, contentColor = CyanLight),
@@ -651,7 +652,7 @@ fun ParentDashboardScreen(
           fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis
         )
       }
-      if (showVpsSetupPanel) {
+      androidx.compose.animation.AnimatedVisibility(visible = showVpsSetupPanel) {
         VpsRelaySetupPanel { enabled, host, port, password, roomCode ->
           currentChild?.let { child ->
             val payload = org.json.JSONObject().apply {
