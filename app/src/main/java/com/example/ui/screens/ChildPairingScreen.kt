@@ -548,6 +548,8 @@ fun ChildPairingScreen(
         Text("Назад к выбору роли", color = Slate400)
       }
       Spacer(modifier = Modifier.height(20.dp))
+      // VPS / Cloudflare Relay — можно прописать сразу при сопряжении.
+      VpsRelaySetupPanel { _, _, _, _, _ -> }
     }
   }
 }

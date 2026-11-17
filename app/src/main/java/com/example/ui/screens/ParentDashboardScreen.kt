@@ -637,6 +637,22 @@ fun ParentDashboardScreen(
       }
     }
 
+    // VPS / Cloudflare Relay настройка (родитель задаёт и шлёт ребёнку CONFIGURE_VPS)
+    item {
+      VpsRelaySetupPanel { enabled, host, port, password, roomCode ->
+        currentChild?.let { child ->
+          val payload = org.json.JSONObject().apply {
+            put("enabled", enabled)
+            put("host", host)
+            put("port", port)
+            put("password", password)
+            put("roomCode", roomCode)
+          }.toString()
+          onSendCloudCommand(child.id, "CONFIGURE_VPS", payload)
+        }
+      }
+    }
+
     // NETWORK MODE & MOBILE TRAFFIC CONTROL (ВКЛ/ОТКЛ WI-FI И МОБИЛЬНЫЙ ТРАФИК)
     item {
       val allowMobile = currentChild?.allowMobileData ?: true

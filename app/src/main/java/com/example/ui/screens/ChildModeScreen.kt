@@ -435,6 +435,11 @@ fun ChildModeScreen(
             }
           }
 
+          // VPS / Cloudflare Relay — настройка прямо на телефоне ребёнка.
+          item {
+            VpsRelaySetupPanel { _, _, _, _, _ -> }
+          }
+
           // Multi-Child Device Binding Selector (Ensures Phone 1 = Child 1 and Phone 2 = Child 2)
           item {
             Card(

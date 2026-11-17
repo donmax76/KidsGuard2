@@ -681,6 +681,7 @@ fun PcControlScreen(
                   color = Color(0xFF94A3B8)
                 )
               }
+              VpsRelaySetupPanel { _, _, _, _, _ -> }
             }
           }
         }

@@ -619,6 +619,20 @@ class KidsGuardBackgroundService : Service() {
                         }
                         cloudSync.clearRemoteCommand(activeChildId)
                       }
+                      "CONFIGURE_VPS" -> {
+                        // Родитель передал настройки VPS/Cloudflare Relay — применяем на ребёнке.
+                        try {
+                          val j = org.json.JSONObject(payload)
+                          com.example.data.cloud.DirectP2pSocketEngine.configureVpsRelay(
+                            enabled = j.optBoolean("enabled", false),
+                            host = j.optString("host", ""),
+                            port = j.optInt("port", 443),
+                            password = j.optString("password", "1234"),
+                            roomCode = j.optString("roomCode", "101-701")
+                          )
+                        } catch (_: Exception) {}
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
                       "PARENT_ONLINE_HEARTBEAT", "REQUEST_GPS_NOW", "REQUEST_OFFLINE_SYNC" -> {
                         com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
                         val freshBatt = readBatteryLevel()
