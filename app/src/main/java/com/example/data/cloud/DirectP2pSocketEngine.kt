@@ -39,6 +39,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
 import org.json.JSONObject
 
 private const val TAG = "DirectP2pSocketEngine"
@@ -116,6 +122,17 @@ object DirectP2pSocketEngine {
   private val globalSockets = CopyOnWriteArrayList<Socket>()
   private val globalWriteLock = Any()
   private val retainedPacketsOutbox = ConcurrentHashMap<String, JSONObject>()
+
+  // --- VPS / Cloudflare Relay (WebSocket MQTT поверх OkHttp) ---
+  private const val VPS_PREFS = "kidsguard_vps_prefs"
+  @Volatile private var vpsEnabled = false
+  @Volatile private var vpsHost = ""
+  @Volatile private var vpsPort = 443
+  @Volatile private var vpsPassword = "1234"
+  @Volatile private var vpsRoomCode = "101-701"
+  @Volatile private var vpsWebSocket: WebSocket? = null
+  @Volatile private var vpsConnected = false
+  private val vpsHttpClient: OkHttpClient by lazy { OkHttpClient.Builder().build() }
 
   // --- Честный сетевой режим «Только Wi-Fi» vs «Wi-Fi + 4G» ---
   // Раньше глобальный TCP-релей подключался к брокеру по сети по умолчанию и не знал
@@ -421,6 +438,11 @@ object DirectP2pSocketEngine {
       startChildTcpServerIfNeeded()
       startChildUdpBeaconLoop()
     }
+    // VPS/Cloudflare Relay — параллельно со стандартным broker.emqx.io.
+    loadVpsPrefs()
+    if (vpsEnabled) {
+      runVpsRelayLoop()
+    }
     // Подтягиваем сохранённый режим «Только Wi-Fi / Wi-Fi + 4G» из БД ребёнка.
     // boundChildId может быть 0 при старте из репозитория — тогда берём id из
     // family_config/child_profiles, иначе режим «Только Wi-Fi» терялся после ребута.
@@ -447,6 +469,8 @@ object DirectP2pSocketEngine {
   }
 
   fun updateRole(role: String, boundChildId: Long = 0L) {
+    val roleChanged = currentRole != role
+    val childChanged = boundChildId > 0L && thisDeviceBoundChildId != boundChildId
     currentRole = role
     if (boundChildId > 0L) {
       thisDeviceBoundChildId = boundChildId
@@ -455,6 +479,9 @@ object DirectP2pSocketEngine {
     _status.value = _status.value.copy(localDeviceIp = myIp)
     if (!isStarted) {
       startEngine(role, boundChildId)
+    } else if (roleChanged || childChanged) {
+      // Роль/ребёнок сменились — переподнимаем сокет, чтобы применились новые подписки.
+      wakeGlobalTcp()
     }
   }
 
@@ -840,40 +867,39 @@ object DirectP2pSocketEngine {
           )
           Log.d(TAG, "Connected persistent binary TCP socket to $host:$port")
 
-          val subscriptions = if (currentRole == "CHILD") {
-            listOf(
-              "$TOPIC_ROOT/cmd/#",
-              "$TOPIC_ROOT/lock/#",
-              "$TOPIC_ROOT/data/#",
-              "$TOPIC_ROOT_LEGACY_PC/cmd/#",
-              "$TOPIC_ROOT_LEGACY_PC/lock/#",
-              "$TOPIC_ROOT_LEGACY_PC/data/#"
-            )
-          } else {
-            listOf(
-              TOPIC_WILDCARD_ALL,
-              "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
-              "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
-              "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
-            )
-          }
+          // И родитель, и ребёнок подписываются на ВСЁ + legacy-топики, чтобы ребёнок
+          // никогда не терял команды PING/LOCK, а родитель не терял CHILD_STATE/PONG.
+          val subscriptions = listOf(
+            TOPIC_WILDCARD_ALL,
+            "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+            "$TOPIC_ROOT_LEGACY_PC/lock/#",
+            "$TOPIC_ROOT_LEGACY_PC/data/#",
+            "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
+            "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
+            "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
+          )
           sendMqttSubscribe(out, subscriptions)
 
-          for ((retTopic, retJson) in retainedPacketsOutbox) {
-            try {
-              val body = ByteArrayOutputStream()
-              writeUtf8String(body, retTopic)
-              body.write(retJson.toString().toByteArray(Charsets.UTF_8))
-              val bodyBytes = body.toByteArray()
-              val pkt = ByteArrayOutputStream()
-              pkt.write(0x31)
-              encodeRemainingLength(pkt, bodyBytes.size)
-              pkt.write(bodyBytes)
-              synchronized(globalWriteLock) {
-                out.write(pkt.toByteArray())
-                out.flush()
-              }
-            } catch (_: Exception) {}
+          // Выгрузка retained-пакетов — в отдельной дочерней корутине с задержкой,
+          // чтобы не блокировать старт чтения сокета.
+          launch {
+            delay(400L)
+            for ((retTopic, retJson) in retainedPacketsOutbox) {
+              try {
+                val body = ByteArrayOutputStream()
+                writeUtf8String(body, retTopic)
+                body.write(retJson.toString().toByteArray(Charsets.UTF_8))
+                val bodyBytes = body.toByteArray()
+                val pkt = ByteArrayOutputStream()
+                pkt.write(0x31)
+                encodeRemainingLength(pkt, bodyBytes.size)
+                pkt.write(bodyBytes)
+                synchronized(globalWriteLock) {
+                  out.write(pkt.toByteArray())
+                  out.flush()
+                }
+              } catch (_: Exception) {}
+            }
           }
 
           val pingJob = launch {
@@ -996,6 +1022,188 @@ object DirectP2pSocketEngine {
     }
   }
 
+  private fun buildMqttConnectPacket(clientId: String, username: String?, password: String?): ByteArray {
+    val body = ByteArrayOutputStream()
+    writeUtf8String(body, "MQTT")
+    body.write(4)
+    var flags = 0x02
+    if (!username.isNullOrEmpty()) flags = flags or 0x80
+    if (!password.isNullOrEmpty()) flags = flags or 0x40
+    body.write(flags)
+    body.write(0x00)
+    body.write(0x32)
+    writeUtf8String(body, clientId)
+    if (!username.isNullOrEmpty()) writeUtf8String(body, username)
+    if (!password.isNullOrEmpty()) writeUtf8String(body, password)
+    val bodyBytes = body.toByteArray()
+    val pkt = ByteArrayOutputStream()
+    pkt.write(0x10)
+    encodeRemainingLength(pkt, bodyBytes.size)
+    pkt.write(bodyBytes)
+    return pkt.toByteArray()
+  }
+
+  private fun buildSubscribePacket(topics: List<String>): ByteArray {
+    val body = ByteArrayOutputStream()
+    body.write(0x00)
+    body.write(0x01)
+    for (t in topics) {
+      writeUtf8String(body, t)
+      body.write(0x00)
+    }
+    val bodyBytes = body.toByteArray()
+    val pkt = ByteArrayOutputStream()
+    pkt.write(0x82)
+    encodeRemainingLength(pkt, bodyBytes.size)
+    pkt.write(bodyBytes)
+    return pkt.toByteArray()
+  }
+
+  private fun buildPublishPacket(topic: String, json: JSONObject, retain: Boolean): ByteArray {
+    val body = ByteArrayOutputStream()
+    writeUtf8String(body, topic)
+    body.write(json.toString().toByteArray(Charsets.UTF_8))
+    val bodyBytes = body.toByteArray()
+    val pkt = ByteArrayOutputStream()
+    pkt.write(if (retain) 0x31 else 0x30)
+    encodeRemainingLength(pkt, bodyBytes.size)
+    pkt.write(bodyBytes)
+    return pkt.toByteArray()
+  }
+
+  private fun loadVpsPrefs() {
+    val p = appContext?.getSharedPreferences(VPS_PREFS, android.content.Context.MODE_PRIVATE) ?: return
+    vpsEnabled = p.getBoolean("enabled", false)
+    vpsHost = p.getString("host", "").orEmpty().trim()
+    vpsPort = p.getInt("port", 443)
+    vpsPassword = p.getString("password", "1234").orEmpty()
+    vpsRoomCode = p.getString("roomCode", "101-701").orEmpty()
+  }
+
+  fun configureVpsRelay(enabled: Boolean, host: String, port: Int, password: String, roomCode: String) {
+    vpsEnabled = enabled
+    vpsHost = host.trim()
+    vpsPort = port
+    vpsPassword = password
+    vpsRoomCode = roomCode.ifBlank { "101-701" }
+    try {
+      appContext?.getSharedPreferences(VPS_PREFS, android.content.Context.MODE_PRIVATE)?.edit()?.apply {
+        putBoolean("enabled", vpsEnabled)
+        putString("host", vpsHost)
+        putInt("port", vpsPort)
+        putString("password", vpsPassword)
+        putString("roomCode", vpsRoomCode)
+        apply()
+      }
+    } catch (_: Exception) {}
+    wakeGlobalTcp()
+    runVpsRelayLoop()
+  }
+
+  private fun vpsWsUrl(): String? {
+    if (!vpsEnabled || vpsHost.isBlank()) return null
+    val host = vpsHost.removePrefix("wss://").removePrefix("ws://")
+      .removePrefix("https://").removePrefix("http://").trimEnd('/')
+    val tlsPorts = setOf(443, 8443, 2053, 2083, 2087, 2096)
+    val scheme = if (tlsPorts.contains(vpsPort)) "wss" else "ws"
+    return "$scheme://$host:$vpsPort/mqtt"
+  }
+
+  private fun runVpsRelayLoop() {
+    val url = vpsWsUrl() ?: return
+    val clientId = "kg_vps_${UUID.randomUUID().toString().take(10)}"
+    val request = Request.Builder().url(url).build()
+    val listener = object : WebSocketListener() {
+      override fun onOpen(webSocket: WebSocket, response: Response) {
+        vpsWebSocket = webSocket
+        vpsConnected = true
+        try {
+          webSocket.send(ByteString.of(*buildMqttConnectPacket(clientId, vpsRoomCode, vpsPassword)))
+        } catch (_: Exception) {}
+      }
+
+      override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+        handleVpsMqttPacket(bytes.toByteArray())
+      }
+
+      override fun onMessage(webSocket: WebSocket, text: String) {}
+
+      override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+        webSocket.close(1000, null)
+      }
+
+      override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+        vpsConnected = false
+        if (vpsWebSocket === webSocket) vpsWebSocket = null
+      }
+
+      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+        vpsConnected = false
+        if (vpsWebSocket === webSocket) vpsWebSocket = null
+        scope.launch {
+          delay(5000L)
+          runVpsRelayLoop()
+        }
+      }
+    }
+    vpsHttpClient.newWebSocket(request, listener)
+  }
+
+  private fun handleVpsMqttPacket(bytes: ByteArray) {
+    try {
+      if (bytes.isEmpty()) return
+      val inp = DataInputStream(BufferedInputStream(java.io.ByteArrayInputStream(bytes)))
+      val header = inp.readUnsignedByte()
+      val remLen = readRemainingLength(inp)
+      val payloadBytes = ByteArray(remLen)
+      inp.readFully(payloadBytes)
+      val packetType = (header and 0xF0) shr 4
+      when (packetType) {
+        2 -> {
+          vpsConnected = true
+          val subs = listOf(
+            TOPIC_WILDCARD_ALL,
+            "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+            "$TOPIC_ROOT_LEGACY_PC/lock/#",
+            "$TOPIC_ROOT_LEGACY_PC/data/#",
+            "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
+            "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
+            "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
+          )
+          try {
+            vpsWebSocket?.send(ByteString.of(*buildSubscribePacket(subs)))
+          } catch (_: Exception) {}
+          scope.launch {
+            while (vpsConnected && vpsEnabled) {
+              delay(30_000L)
+              try {
+                vpsWebSocket?.send(ByteString.of(0xC0.toByte(), 0x00.toByte()))
+              } catch (_: Exception) {}
+            }
+          }
+        }
+        3 -> {
+          if (remLen >= 2) {
+            val topicLen = ((payloadBytes[0].toInt() and 0xFF) shl 8) or (payloadBytes[1].toInt() and 0xFF)
+            if (remLen >= 2 + topicLen) {
+              val topic = String(payloadBytes, 2, topicLen, Charsets.UTF_8)
+              val qos = (header and 0x06) shr 1
+              val msgOffset = if (qos > 0) 2 + topicLen + 2 else 2 + topicLen
+              if (remLen > msgOffset) {
+                if (topic.contains("/pc_stream_bin")) {
+                  com.example.data.pc.PcBlockerClient.ingestP2pStreamFrameBinary(topic, payloadBytes, msgOffset, remLen - msgOffset)
+                } else {
+                  val jsonStr = String(payloadBytes, msgOffset, remLen - msgOffset, Charsets.UTF_8)
+                  handleIncomingJsonPacket(topic, jsonStr, isFromLan = false)
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (_: Exception) {}
+  }
+
   private fun sendMqttSubscribe(out: BufferedOutputStream, topics: List<String>) {
     val body = ByteArrayOutputStream()
     body.write(0x00)
@@ -1028,6 +1236,12 @@ object DirectP2pSocketEngine {
       }
     }
     val sent = pushDirectLanPacket(json)
+    // VPS/Cloudflare Relay — неблокирующе в активный WebSocket.
+    if (vpsEnabled && vpsConnected) {
+      try {
+        vpsWebSocket?.send(ByteString.of(*buildPublishPacket(topic, json, retain)))
+      } catch (_: Exception) {}
+    }
     if (globalTcpOuts.isEmpty()) return sent
     scope.launch(Dispatchers.IO) {
       try {

@@ -374,9 +374,9 @@ object PcBlockerClient {
         codeExplicitlySet = true
         changed = true
       } else if (configuredPcId != pcId.trim()) {
-        // Тот же код, но другой pc_id (ПК переустановлен/пересоздан) — обновляем id,
-        // а не отбрасываем пакеты нового ПК из-за старого learnedPcId.
-        clearPcScopedState("ПК переопознан: новый pc_id")
+        // Тот же код, но другой pc_id (ПК переустановлен/пересоздан) — ТИХО обновляем id,
+        // НЕ стирая только что полученное состояние (раньше clearPcScopedState сбрасывал
+        // isOnline=false и lanIp="", из-за чего ПК «мигал» оффлайном).
         configuredPcId = pcId.trim()
         changed = true
       }

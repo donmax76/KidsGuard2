@@ -34,6 +34,7 @@ import secrets
 import select
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -753,6 +754,10 @@ class App(tk.Tk):
         self.cfg["web"].setdefault("enabled", True)
         self.cfg["web"].setdefault("port", 8765)
         self.cfg["web"].setdefault("pairing_code", "101-701")
+        self.cfg["web"].setdefault("vps_enabled", False)
+        self.cfg["web"].setdefault("vps_host", "")
+        self.cfg["web"].setdefault("vps_port", 443)
+        self.cfg["web"].setdefault("vps_password", "1234")
         normalize(self.cfg["entries"])
         if self.cfg.get("seed", 1) < SEED_VERSION:
             have = {e["name"] for e in self.cfg["entries"]}
@@ -3701,8 +3706,17 @@ def _mqtt_utf8(s):
     return bytes([(len(b) >> 8) & 0xFF, len(b) & 0xFF]) + b
 
 
-def _mqtt_connect_pkt(cid):
-    var = _mqtt_utf8("MQTT") + bytes([0x04, 0x02, 0x00, 0x1E]) + _mqtt_utf8(cid)
+def _mqtt_connect_pkt(cid, username=None, password=None):
+    flags = 0x02
+    if username:
+        flags |= 0x80
+    if password:
+        flags |= 0x40
+    var = _mqtt_utf8("MQTT") + bytes([0x04, flags, 0x00, 0x1E]) + _mqtt_utf8(cid)
+    if username:
+        var += _mqtt_utf8(username)
+    if password:
+        var += _mqtt_utf8(password)
     return bytes([0x10]) + _mqtt_rem_len(len(var)) + var
 
 
@@ -3745,9 +3759,190 @@ def _mqtt_read_rem_len(sock):
 
 
 def p2p_bridge_loop(st):
-    """Поднимает по одному P2P-мосту на каждый публичный брокер (hivemq + emqx)."""
+    """Поднимает по одному P2P-мосту на каждый публичный брокер (hivemq + emqx) + VPS."""
     for host, port in P2P_BROKERS:
         threading.Thread(target=p2p_bridge_worker, args=(st, host, port), daemon=True).start()
+    threading.Thread(target=p2p_vps_bridge_worker, args=(st,), daemon=True).start()
+
+
+def _ws_mask_key():
+    return os.urandom(4)
+
+
+def _ws_send(sock, payload, opcode=2):
+    key = _ws_mask_key()
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    n = len(payload)
+    if n < 126:
+        hdr = bytes([0x80 | opcode, 0x80 | n])
+    elif n < 65536:
+        hdr = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", n)
+    else:
+        hdr = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack(">Q", n)
+    masked = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+    sock.sendall(hdr + key + masked)
+
+
+def _ws_recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        c = sock.recv(n - len(buf))
+        if not c:
+            raise EOFError("ws closed")
+        buf += c
+    return buf
+
+
+def _ws_recv_frame(sock):
+    b1, b2 = _ws_recv_exact(sock, 2)
+    opcode = b1 & 0x0F
+    masked = (b2 & 0x80) != 0
+    n = b2 & 0x7F
+    if n == 126:
+        n = struct.unpack(">H", _ws_recv_exact(sock, 2))[0]
+    elif n == 127:
+        n = struct.unpack(">Q", _ws_recv_exact(sock, 8))[0]
+    key = _ws_recv_exact(sock, 4) if masked else b""
+    payload = _ws_recv_exact(sock, n)
+    if masked:
+        payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+
+def _ws_handshake(sock, host, path):
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n"
+           "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+           "Sec-WebSocket-Version: 13\r\n\r\n") % (path, host, key)
+    sock.sendall(req.encode("latin-1"))
+    data = b""
+    while b"\r\n\r\n" not in data:
+        c = sock.recv(1)
+        if not c:
+            raise EOFError("no ws handshake")
+        data += c
+    if b" 101 " not in data:
+        raise RuntimeError("ws handshake failed")
+
+
+def p2p_vps_bridge_worker(st):
+    """Мост на свой VPS / Cloudflare Relay (WebSocket MQTT), параллельно публичным брокерам."""
+    while True:
+        try:
+            cfg = st.get("cfg") or load_config() or {}
+            web = cfg.get("web") or {}
+            if not web.get("vps_enabled"):
+                time.sleep(10)
+                continue
+            host = str(web.get("vps_host") or "").strip()
+            port = int(web.get("vps_port") or 443)
+            code = str(web.get("pairing_code") or "101-701").strip() or "101-701"
+            pwd = str(web.get("vps_password") or "1234")
+            if not host:
+                time.sleep(10)
+                continue
+            tls = port in (443, 8443, 2053, 2083, 2087, 2096) or host.startswith(("wss://", "https://"))
+            host = host.replace("wss://", "").replace("ws://", "").replace("https://", "").replace("http://", "").strip("/")
+            sock = None
+            try:
+                raw = socket.create_connection((host, port), timeout=10)
+                if tls:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    sock = ctx.wrap_socket(raw, server_hostname=host)
+                else:
+                    sock = raw
+                sock.settimeout(30)
+                _ws_handshake(sock, host, "/mqtt")
+                cid = "hb_vps_%s" % secrets.token_hex(4)
+                _ws_send(sock, _mqtt_connect_pkt(cid, username=code, password=pwd))
+                for idx, r in enumerate((P2P_TOPIC_ROOT, P2P_TOPIC_ROOT_V34), 1):
+                    _ws_send(sock, _mqtt_sub_pkt(idx, "%s/pc_cmd/%s" % (r, code)))
+                last_ping = time.time()
+                while True:
+                    now = time.time()
+                    if now - last_ping >= 30:
+                        last_ping = now
+                        _ws_send(sock, bytes([0xC0, 0x00]))
+                    try:
+                        sock.settimeout(0.5)
+                        opcode, payload = _ws_recv_frame(sock)
+                    except socket.timeout:
+                        continue
+                    if opcode == 0x8:
+                        break
+                    if opcode == 0x9:
+                        _ws_send(sock, payload, opcode=0xA)
+                        continue
+                    if opcode != 0x2 or len(payload) < 2:
+                        continue
+                    hdr = payload[0]
+                    if (hdr & 0xF0) != 0x30:
+                        continue
+                    # разбор MQTT PUBLISH
+                    pos, rem = 1, 0
+                    mult = 1
+                    while pos < len(payload):
+                        b = payload[pos]; pos += 1
+                        rem += (b & 127) * mult
+                        mult *= 128
+                        if (b & 128) == 0:
+                            break
+                    if pos + 2 > len(payload):
+                        continue
+                    tlen = (payload[pos] << 8) | payload[pos + 1]
+                    pos += 2
+                    if pos + tlen > len(payload):
+                        continue
+                    topic = payload[pos:pos + tlen].decode("utf-8", "ignore")
+                    pos += tlen
+                    if (hdr & 0x06) != 0:
+                        pos += 2
+                    raw_msg = payload[pos:].decode("utf-8", "ignore")
+                    if not raw_msg.startswith("{"):
+                        continue
+                    try:
+                        cmd_json = json.loads(raw_msg)
+                    except Exception:
+                        continue
+                    action = str(cmd_json.get("action", ""))
+                    data = cmd_json.get("data") or {}
+                    pwd_in = str(cmd_json.get("password", ""))
+                    auth_error = ""
+                    cur_cfg = st.get("cfg") or load_config() or {}
+                    if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
+                                  "/api/fulllock_schedule", "/api/add", "/api/delete"):
+                        if cur_cfg.get("hash") and not (pwd_in and check_password(pwd_in, cur_cfg["salt"], cur_cfg["hash"])):
+                            auth_error = "ПК защищён паролем: укажите пароль панели в настройках ПК"
+                        else:
+                            res = panel_mutate(action, data)
+                            if not res.get("ok", False):
+                                auth_error = str(res.get("error", "Ошибка выполнения команды"))
+                        st["mtime"] = 0
+                        st["sig"] = None
+                    if action == "/api/sync":
+                        state_payload = panel_state("p2p", full=True)
+                    else:
+                        state_payload = panel_state("p2p", full=False)
+                    state_payload["type"] = "PC_STATE"
+                    if auth_error:
+                        state_payload["auth_error"] = auth_error
+                    for r in (P2P_TOPIC_ROOT, P2P_TOPIC_ROOT_V34):
+                        try:
+                            _ws_send(sock, _mqtt_pub_pkt("%s/pc_state/%s" % (r, code), json.dumps(state_payload, ensure_ascii=False), retain=True))
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(5)
 
 
 def p2p_bridge_worker(st, host, port):
