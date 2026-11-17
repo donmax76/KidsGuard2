@@ -1,5 +1,20 @@
 # KidsGuard2 — HANDOFF
 
+## Сборка run #53 (2026-11-17)
+
+- Финальный коммит: `e328d19` (VPS/Cloudflare relay UI на всех экранах + обработчик CONFIGURE_VPS)
+- Успешный CI-run: **#53** — https://github.com/donmax76/KidsGuard2/actions/runs/44068782404
+- Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
+
+### Артефакты run #53
+
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14321976604/zip
+  (~20,87 МБ, внутри `app-debug.apk`)
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14321393316/zip
+  (~19,0 МБ, внутри `hosts_blocker.exe` + `hosts_blocker.py`)
+
+---
+
 ## Сборка run #52 (2026-11-17)
 
 - Финальный коммит: `ab52656` (VPS/Cloudflare WebSocket relay + 3 багфикса)
