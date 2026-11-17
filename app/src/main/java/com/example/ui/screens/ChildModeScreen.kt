@@ -121,6 +121,10 @@ fun ChildModeScreen(
   var uninstallPinError by remember { mutableStateOf(false) }
   var urlInput by remember { mutableStateOf(browserUrl) }
   var showSecurityPermissionsDialog by remember { mutableStateOf(false) }
+  var isVpsPanelExpanded by remember { mutableStateOf(false) }
+  var showVpsPinDialog by remember { mutableStateOf(false) }
+  var vpsPinInput by remember { mutableStateOf("") }
+  var vpsPinError by remember { mutableStateOf(false) }
 
   val childName = activeChild?.name ?: "Мой смартфон"
   val dailyLimit = activeChild?.dailyScreenLimitMinutes ?: 120
@@ -435,9 +439,24 @@ fun ChildModeScreen(
             }
           }
 
-          // VPS / Cloudflare Relay — настройка прямо на телефоне ребёнка.
+          // VPS / Cloudflare Relay — скрыто по умолчанию, доступ по PIN родителя.
           item {
-            VpsRelaySetupPanel { _, _, _, _, _ -> }
+            if (isVpsPanelExpanded) {
+              VpsRelaySetupPanel { _, _, _, _, _ ->
+                isVpsPanelExpanded = false
+              }
+            } else {
+              androidx.compose.material3.OutlinedButton(
+                onClick = {
+                  vpsPinInput = ""
+                  vpsPinError = false
+                  showVpsPinDialog = true
+                },
+                modifier = Modifier.fillMaxWidth()
+              ) {
+                Text("☁️ Настройки VPS сервера", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+              }
+            }
           }
 
           // Multi-Child Device Binding Selector (Ensures Phone 1 = Child 1 and Phone 2 = Child 2)
@@ -879,6 +898,56 @@ fun ChildModeScreen(
   if (showSecurityPermissionsDialog) {
     ChildPermissionsSetupDialog(
       onDismiss = { showSecurityPermissionsDialog = false }
+    )
+  }
+
+  if (showVpsPinDialog) {
+    AlertDialog(
+      onDismissRequest = { showVpsPinDialog = false },
+      containerColor = Slate900,
+      title = { Text("🔒 Доступ только для родителей", color = CyanLight, fontWeight = FontWeight.Bold) },
+      text = {
+        Column {
+          Text("Введите PIN родителя, чтобы открыть настройки VPS сервера.", color = Slate200, fontSize = 13.sp)
+          Spacer(Modifier.height(10.dp))
+          OutlinedTextField(
+            value = vpsPinInput,
+            onValueChange = { vpsPinInput = it; vpsPinError = false },
+            label = { Text("PIN родителя") },
+            visualTransformation = PasswordVisualTransformation(),
+            singleLine = true,
+            isError = vpsPinError,
+            modifier = Modifier.fillMaxWidth()
+          )
+          if (vpsPinError) {
+            Text("Неверный PIN-код родителя", color = RoseLock, fontSize = 12.sp)
+          }
+        }
+      },
+      confirmButton = {
+        Button(
+          onClick = {
+            onVerifyUninstallPin(
+              vpsPinInput,
+              onSuccess = {
+                isVpsPanelExpanded = true
+                showVpsPinDialog = false
+                vpsPinInput = ""
+                vpsPinError = false
+              },
+              onError = { vpsPinError = true }
+            )
+          },
+          colors = ButtonDefaults.buttonColors(containerColor = CyanLight, contentColor = Color.Black)
+        ) {
+          Text("Разблокировать")
+        }
+      },
+      dismissButton = {
+        TextButton(onClick = { showVpsPinDialog = false }) {
+          Text("Отмена", color = Slate400)
+        }
+      }
     )
   }
 

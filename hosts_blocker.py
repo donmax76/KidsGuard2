@@ -2397,19 +2397,27 @@ def _clear_stream_flag():
         pass
 
 
-def agent_screen_frame(max_age=2.0):
+def agent_screen_frame(max_age=5.0):
     """Свежий кадр от агента (сеанс пользователя). Для потока из SYSTEM-движка:
     прямой GDI-захват в сессии 0 даёт чёрный экран, а агент видит рабочий стол."""
     path = os.path.join(PUB_DIR, "screen.png")
     try:
-        if time.time() - os.path.getmtime(path) > max_age:
-            return None
-        with open(path, "rb") as f:
-            data = f.read()
-        if data.startswith(b"\xff\xd8"):
-            return data, "image/jpeg"
-        if data.startswith(b"\x89PNG\r\n\x1a\n"):
-            return data, "image/png"
+        if time.time() - os.path.getmtime(path) <= max_age:
+            with open(path, "rb") as f:
+                data = f.read()
+            if data.startswith(b"\xff\xd8"):
+                return data, "image/jpeg"
+            if data.startswith(b"\x89PNG\r\n\x1a\n"):
+                return data, "image/png"
+    except Exception:
+        pass
+    # Fallback: если агент сеанса не пишет screen.png (или кадр устарел) — пробуем
+    # снять напрямую GDI. Работает, когда процесс запущен не в сессии 0 (SYSTEM).
+    try:
+        if _process_session_id() not in (0, None):
+            frame = capture_screen_frame(800, 450, 60)
+            if frame and frame[1] == "image/jpeg":
+                return frame
     except Exception:
         pass
     return None

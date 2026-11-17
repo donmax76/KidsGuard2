@@ -639,16 +639,31 @@ fun ParentDashboardScreen(
 
     // VPS / Cloudflare Relay настройка (родитель задаёт и шлёт ребёнку CONFIGURE_VPS)
     item {
-      VpsRelaySetupPanel { enabled, host, port, password, roomCode ->
-        currentChild?.let { child ->
-          val payload = org.json.JSONObject().apply {
-            put("enabled", enabled)
-            put("host", host)
-            put("port", port)
-            put("password", password)
-            put("roomCode", roomCode)
-          }.toString()
-          onSendCloudCommand(child.id, "CONFIGURE_VPS", payload)
+      var showVpsSetupPanel by remember { mutableStateOf(false) }
+      Button(
+        onClick = { showVpsSetupPanel = !showVpsSetupPanel },
+        colors = ButtonDefaults.buttonColors(containerColor = Slate800, contentColor = CyanLight),
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.fillMaxWidth()
+      ) {
+        Text(
+          if (showVpsSetupPanel) "Скрыть VPS" else "☁️ Настроить VPS / Cloudflare Релей",
+          fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis
+        )
+      }
+      if (showVpsSetupPanel) {
+        VpsRelaySetupPanel { enabled, host, port, password, roomCode ->
+          currentChild?.let { child ->
+            val payload = org.json.JSONObject().apply {
+              put("enabled", enabled)
+              put("host", host)
+              put("port", port)
+              put("password", password)
+              put("roomCode", roomCode)
+            }.toString()
+            onSendCloudCommand(child.id, "CONFIGURE_VPS", payload)
+          }
+          showVpsSetupPanel = false
         }
       }
     }

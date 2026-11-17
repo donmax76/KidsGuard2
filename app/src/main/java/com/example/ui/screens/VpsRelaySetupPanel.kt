@@ -20,6 +20,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.cloud.DirectP2pSocketEngine
@@ -66,6 +67,7 @@ fun VpsRelaySetupPanel(onSave: (enabled: Boolean, host: String, port: Int, passw
       OutlinedTextField(
         value = password, onValueChange = { password = it },
         label = { Text("Пароль VPS") },
+        visualTransformation = PasswordVisualTransformation(),
         singleLine = true, modifier = Modifier.fillMaxWidth()
       )
       OutlinedTextField(

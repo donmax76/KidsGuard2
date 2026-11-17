@@ -813,7 +813,7 @@ object PcBlockerClient {
     put("w", quality.width)
     put("h", quality.height)
     put("quality", quality.jpegQuality)
-    put("binary", true) // JPEG без Base64 — в 1.33 раза меньше трафика и без лишнего парсинга
+    put("binary", false) // надёжные JSON-пакеты PC_STREAM_FRAME (с полем b64) через /pc_stream
     put("duration", 25)
   }
 

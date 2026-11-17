@@ -82,7 +82,8 @@ object DirectP2pSocketEngine {
   const val TOPIC_LOCK = "kidsguard/eb6ecfcf/v34_p2p/lock"
 
   private val TCP_RELAY_HOSTS = listOf(
-    "broker.emqx.io" to 1883
+    "broker.emqx.io" to 1883,
+    "broker.hivemq.com" to 1883
   )
 
   /**
@@ -828,6 +829,14 @@ object DirectP2pSocketEngine {
   private suspend fun CoroutineScope.runBinaryTcpSocketLoop(host: String, port: Int) {
     var retryDelayMs = 2_000L
     while (isActive) {
+      // VPS включён — старый публичный брокер (emqx/hivemq) не используем,
+      // работаем только через VPS. Корутина остаётся живой и возобновится,
+      // когда VPS выключат.
+      if (vpsEnabled) {
+        retryDelayMs = 2_000L
+        delay(5_000L)
+        continue
+      }
       if (!childNetworkAllowed()) {
         retryDelayMs = 2_000L
         delay(3_000L)
@@ -1096,8 +1105,21 @@ object DirectP2pSocketEngine {
         apply()
       }
     } catch (_: Exception) {}
+    // Выключили VPS — немедленно закрываем WebSocket и переключаемся на старый режим.
+    if (!vpsEnabled) {
+      try { vpsWebSocket?.close(1000, null) } catch (_: Exception) {}
+      vpsWebSocket = null
+      vpsConnected = false
+    }
     wakeGlobalTcp()
-    runVpsRelayLoop()
+    if (vpsEnabled) {
+      runVpsRelayLoop()
+    }
+    // Мгновенно перепривязываем ПК к новому каналу без перезапуска приложения.
+    try {
+      com.example.data.pc.PcBlockerClient.requestSync()
+      com.example.data.pc.PcBlockerClient.requestPcScreenshot()
+    } catch (_: Exception) {}
   }
 
   private fun vpsWsUrl(): String? {

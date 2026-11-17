@@ -548,8 +548,19 @@ fun ChildPairingScreen(
         Text("Назад к выбору роли", color = Slate400)
       }
       Spacer(modifier = Modifier.height(20.dp))
-      // VPS / Cloudflare Relay — можно прописать сразу при сопряжении.
-      VpsRelaySetupPanel { _, _, _, _, _ -> }
+      // VPS / Cloudflare Relay — скрыто по умолчанию, раскрывается по кнопке.
+      var showVps by remember { mutableStateOf(false) }
+      if (showVps) {
+        VpsRelaySetupPanel { _, _, _, _, _ -> showVps = false }
+      } else {
+        OutlinedButton(
+          onClick = { showVps = true },
+          shape = RoundedCornerShape(14.dp),
+          modifier = Modifier.fillMaxWidth()
+        ) {
+          Text("☁️ Настройки VPS сервера", color = CyanLight)
+        }
+      }
     }
   }
 }
