@@ -1,5 +1,20 @@
 # KidsGuard2 — HANDOFF
 
+## Сборка run #57 (2026-11-17)
+
+- Финальный коммит: `88f1517` (фикс 1-мин таймаута, живой стрим ПК, legacy P2P fallback, VPS UI с PIN)
+- Успешный CI-run: **#57** — https://github.com/donmax76/KidsGuard2/actions/runs/44110401580
+- Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
+
+### Артефакты run #57
+
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14340302108/zip
+  (~20,88 МБ, внутри `app-debug.apk`)
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14341830637/zip
+  (~19,0 МБ, внутри `hosts_blocker.exe` + `hosts_blocker.py`)
+
+---
+
 ## Сборка run #56 (2026-11-17)
 
 - Финальный коммит: `2b1f378` (VPS UI stream + legacy P2P fallback + PIN lock; фикс `onVerifyUninstallPin`)
