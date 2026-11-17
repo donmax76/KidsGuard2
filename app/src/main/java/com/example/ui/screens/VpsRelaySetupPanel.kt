@@ -79,8 +79,8 @@ fun VpsRelaySetupPanel(onSave: (enabled: Boolean, host: String, port: Int, passw
       Spacer(Modifier.height(8.dp))
       Button(onClick = {
         val p = port.toIntOrNull() ?: 443
-        DirectP2pSocketEngine.configureVpsRelay(enabled, host.trim(), p, password, roomCode.trim())
         onSave(enabled, host.trim(), p, password, roomCode.trim())
+        DirectP2pSocketEngine.configureVpsRelay(enabled, host.trim(), p, password, roomCode.trim())
         saved = true
       }, modifier = Modifier.fillMaxWidth()) {
         Text(if (saved) "✓ Сохранено" else "Сохранить и подключить VPS")

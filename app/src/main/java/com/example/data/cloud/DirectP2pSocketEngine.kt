@@ -133,8 +133,12 @@ object DirectP2pSocketEngine {
   @Volatile private var vpsRoomCode = "101-701"
   @Volatile private var vpsWebSocket: WebSocket? = null
   @Volatile private var vpsConnected = false
+  @Volatile private var vpsConnecting = false
+  @Volatile private var vpsPingJob: kotlinx.coroutines.Job? = null
   private val vpsHttpClient: OkHttpClient by lazy {
     OkHttpClient.Builder()
+      .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+      .readTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
       .pingInterval(20, java.util.concurrent.TimeUnit.SECONDS)
       .build()
   }
@@ -381,12 +385,17 @@ object DirectP2pSocketEngine {
     val cb = object : ConnectivityManager.NetworkCallback() {
       override fun onAvailable(network: Network) {
         refreshNetworkState()
-        wakeGlobalTcp()
+        ensureConnectedAndWake()
+        if (vpsEnabled && !vpsConnected && !vpsConnecting) {
+          runVpsRelayLoop()
+        }
       }
 
       override fun onLost(network: Network) {
         refreshNetworkState()
-        wakeGlobalTcp()
+        if (!hasAnyNetwork) {
+          wakeGlobalTcp()
+        }
       }
 
       override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
@@ -447,7 +456,7 @@ object DirectP2pSocketEngine {
     }
     // VPS/Cloudflare Relay — параллельно со стандартным broker.emqx.io.
     loadVpsPrefs()
-    if (vpsEnabled) {
+    if (vpsEnabled && !vpsConnected && !vpsConnecting) {
       runVpsRelayLoop()
     }
     // Подтягиваем сохранённый режим «Только Wi-Fi / Wi-Fi + 4G» из БД ребёнка.
@@ -835,14 +844,8 @@ object DirectP2pSocketEngine {
   private suspend fun CoroutineScope.runBinaryTcpSocketLoop(host: String, port: Int) {
     var retryDelayMs = 2_000L
     while (isActive) {
-      // VPS включён — старый публичный брокер (emqx/hivemq) не используем,
-      // работаем только через VPS. Корутина остаётся живой и возобновится,
-      // когда VPS выключат.
-      if (vpsEnabled) {
-        retryDelayMs = 2_000L
-        delay(5_000L)
-        continue
-      }
+      // P2P Connect (emqx/hivemq) работает параллельно с VPS Relay (как в ПК-агенте),
+      // чтобы и VPS, и P2P Connect гарантированно работали в любых сетях и со старым ПК-агентом.
       if (!childNetworkAllowed()) {
         retryDelayMs = 2_000L
         delay(3_000L)
@@ -1024,8 +1027,7 @@ object DirectP2pSocketEngine {
     body.write(4) // Protocol level 4 (MQTT 3.1.1)
     body.write(0x02) // Clean session
     body.write(0x00)
-    body.write(0x00)
-    body.write(0x32) // Keepalive 50s (0x0032)
+    body.write(0x32) // Keepalive 50s (strictly 2 bytes: 0x0032)
     writeUtf8String(body, clientId)
     val bodyBytes = body.toByteArray()
 
@@ -1098,6 +1100,8 @@ object DirectP2pSocketEngine {
   }
 
   fun configureVpsRelay(enabled: Boolean, host: String, port: Int, password: String, roomCode: String) {
+    val changed = (vpsEnabled != enabled) || (vpsHost != host.trim()) || (vpsPort != port) ||
+      (vpsPassword != password) || (vpsRoomCode != roomCode.ifBlank { "101-701" })
     vpsEnabled = enabled
     vpsHost = host.trim()
     vpsPort = port
@@ -1113,14 +1117,16 @@ object DirectP2pSocketEngine {
         apply()
       }
     } catch (_: Exception) {}
-    // Выключили VPS — немедленно закрываем WebSocket и переключаемся на старый режим.
-    if (!vpsEnabled) {
+    if (!vpsEnabled || changed) {
+      vpsPingJob?.cancel()
+      vpsPingJob = null
       try { vpsWebSocket?.close(1000, null) } catch (_: Exception) {}
       vpsWebSocket = null
       vpsConnected = false
+      vpsConnecting = false
     }
-    wakeGlobalTcp()
-    if (vpsEnabled) {
+    ensureConnectedAndWake()
+    if (vpsEnabled && !vpsConnected && !vpsConnecting) {
       runVpsRelayLoop()
     }
     // Мгновенно перепривязываем ПК к новому каналу без перезапуска приложения.
@@ -1132,19 +1138,44 @@ object DirectP2pSocketEngine {
 
   private fun vpsWsUrl(): String? {
     if (!vpsEnabled || vpsHost.isBlank()) return null
-    val host = vpsHost.removePrefix("wss://").removePrefix("ws://")
-      .removePrefix("https://").removePrefix("http://").trimEnd('/')
+    val raw = vpsHost.trim()
+    val explicitWss = raw.startsWith("wss://", ignoreCase = true) || raw.startsWith("https://", ignoreCase = true)
+    val explicitWs = raw.startsWith("ws://", ignoreCase = true) || raw.startsWith("http://", ignoreCase = true)
+    val stripped = raw
+      .removePrefix("wss://").removePrefix("WSS://")
+      .removePrefix("ws://").removePrefix("WS://")
+      .removePrefix("https://").removePrefix("HTTPS://")
+      .removePrefix("http://").removePrefix("HTTP://")
+      .trimEnd('/')
+    val hostPart = stripped.substringBefore('/')
+    val customPath = if ('/' in stripped) "/" + stripped.substringAfter('/') else "/mqtt"
     val tlsPorts = setOf(443, 8443, 2053, 2083, 2087, 2096)
-    val scheme = if (tlsPorts.contains(vpsPort)) "wss" else "ws"
-    return "$scheme://$host:$vpsPort/mqtt"
+    val scheme = when {
+      explicitWss -> "wss"
+      explicitWs -> "ws"
+      tlsPorts.contains(vpsPort) -> "wss"
+      else -> "ws"
+    }
+    val portSuffix = if (
+      ':' in hostPart ||
+      (scheme == "wss" && vpsPort == 443) ||
+      (scheme == "ws" && vpsPort == 80)
+    ) "" else ":$vpsPort"
+    return "$scheme://$hostPart$portSuffix$customPath"
   }
 
   private fun runVpsRelayLoop() {
     val url = vpsWsUrl() ?: return
+    if (!vpsEnabled) return
+    vpsConnecting = true
     val clientId = "kg_vps_${UUID.randomUUID().toString().take(10)}"
-    val request = Request.Builder().url(url).build()
+    val request = Request.Builder()
+      .url(url)
+      .header("Sec-WebSocket-Protocol", "mqtt")
+      .build()
     val listener = object : WebSocketListener() {
       override fun onOpen(webSocket: WebSocket, response: Response) {
+        vpsConnecting = false
         vpsWebSocket = webSocket
         vpsConnected = true
         try {
@@ -1163,68 +1194,113 @@ object DirectP2pSocketEngine {
       }
 
       override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-        vpsConnected = false
-        if (vpsWebSocket === webSocket) vpsWebSocket = null
+        vpsConnecting = false
+        if (vpsWebSocket === webSocket) {
+          vpsConnected = false
+          vpsWebSocket = null
+          vpsPingJob?.cancel()
+          vpsPingJob = null
+        }
       }
 
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-        vpsConnected = false
-        if (vpsWebSocket === webSocket) vpsWebSocket = null
-        scope.launch {
-          delay(5000L)
-          runVpsRelayLoop()
+        vpsConnecting = false
+        if (vpsWebSocket === webSocket || vpsWebSocket == null) {
+          vpsConnected = false
+          vpsWebSocket = null
+          vpsPingJob?.cancel()
+          vpsPingJob = null
+        }
+        if (vpsEnabled) {
+          scope.launch {
+            delay(4000L)
+            if (vpsEnabled && !vpsConnected && !vpsConnecting) {
+              runVpsRelayLoop()
+            }
+          }
         }
       }
     }
+    try {
+      vpsWebSocket?.close(1000, null)
+    } catch (_: Exception) {}
     vpsHttpClient.newWebSocket(request, listener)
   }
 
   private fun handleVpsMqttPacket(bytes: ByteArray) {
     try {
       if (bytes.isEmpty()) return
-      val inp = DataInputStream(BufferedInputStream(java.io.ByteArrayInputStream(bytes)))
-      val header = inp.readUnsignedByte()
-      val remLen = readRemainingLength(inp)
-      val payloadBytes = ByteArray(remLen)
-      inp.readFully(payloadBytes)
-      val packetType = (header and 0xF0) shr 4
-      when (packetType) {
-        2 -> {
-          vpsConnected = true
-          val subs = listOf(
-            TOPIC_WILDCARD_ALL,
-            "$TOPIC_ROOT_LEGACY_PC/cmd/#",
-            "$TOPIC_ROOT_LEGACY_PC/lock/#",
-            "$TOPIC_ROOT_LEGACY_PC/data/#",
-            "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
-            "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
-            "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
-          )
-          try {
-            vpsWebSocket?.send(ByteString.of(*buildSubscribePacket(subs)))
-          } catch (_: Exception) {}
-          scope.launch {
-            while (vpsConnected && vpsEnabled) {
-              delay(30_000L)
-              try {
-                vpsWebSocket?.send(ByteString.of(0xC0.toByte(), 0x00.toByte()))
-              } catch (_: Exception) {}
+      val bais = java.io.ByteArrayInputStream(bytes)
+      val inp = DataInputStream(bais)
+      while (bais.available() > 0) {
+        val header = inp.readUnsignedByte()
+        val remLen = readRemainingLength(inp)
+        if (remLen < 0 || remLen > bais.available() + 65536) break
+        val payloadBytes = ByteArray(remLen)
+        inp.readFully(payloadBytes)
+        val packetType = (header and 0xF0) shr 4
+        when (packetType) {
+          2 -> {
+            // CONNACK: check return code (byte 1 == 0 means accepted)
+            val rc = if (payloadBytes.size >= 2) (payloadBytes[1].toInt() and 0xFF) else 0
+            if (rc != 0) {
+              Log.w(TAG, "VPS MQTT CONNACK rejected with code $rc")
+              vpsConnected = false
+              try { vpsWebSocket?.close(1000, "CONNACK_$rc") } catch (_: Exception) {}
+              return
+            }
+            vpsConnected = true
+            _status.value = _status.value.copy(
+              isGlobalTcpSocketConnected = true,
+              activeTransportLabel = "☁️ VPS / Cloudflare Релей ($vpsHost)"
+            )
+            val subs = listOf(
+              TOPIC_WILDCARD_ALL,
+              "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+              "$TOPIC_ROOT_LEGACY_PC/lock/#",
+              "$TOPIC_ROOT_LEGACY_PC/data/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_stream/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
+            )
+            try {
+              vpsWebSocket?.send(ByteString.of(*buildSubscribePacket(subs)))
+            } catch (_: Exception) {}
+            // Выгружаем retained-пакеты в VPS брокер сразу после подключения
+            scope.launch {
+              delay(300L)
+              val ws = vpsWebSocket ?: return@launch
+              for ((retTopic, retJson) in retainedPacketsOutbox) {
+                try {
+                  ws.send(ByteString.of(*buildPublishPacket(retTopic, retJson, retain = true)))
+                } catch (_: Exception) {}
+              }
+            }
+            vpsPingJob?.cancel()
+            vpsPingJob = scope.launch {
+              while (isActive && vpsConnected && vpsEnabled) {
+                delay(25_000L)
+                try {
+                  vpsWebSocket?.send(ByteString.of(0xC0.toByte(), 0x00.toByte()))
+                } catch (_: Exception) {}
+              }
             }
           }
-        }
-        3 -> {
-          if (remLen >= 2) {
-            val topicLen = ((payloadBytes[0].toInt() and 0xFF) shl 8) or (payloadBytes[1].toInt() and 0xFF)
-            if (remLen >= 2 + topicLen) {
-              val topic = String(payloadBytes, 2, topicLen, Charsets.UTF_8)
-              val qos = (header and 0x06) shr 1
-              val msgOffset = if (qos > 0) 2 + topicLen + 2 else 2 + topicLen
-              if (remLen > msgOffset) {
-                if (topic.contains("/pc_stream_bin")) {
-                  com.example.data.pc.PcBlockerClient.ingestP2pStreamFrameBinary(topic, payloadBytes, msgOffset, remLen - msgOffset)
-                } else {
-                  val jsonStr = String(payloadBytes, msgOffset, remLen - msgOffset, Charsets.UTF_8)
-                  handleIncomingJsonPacket(topic, jsonStr, isFromLan = false)
+          3 -> {
+            if (remLen >= 2) {
+              val topicLen = ((payloadBytes[0].toInt() and 0xFF) shl 8) or (payloadBytes[1].toInt() and 0xFF)
+              if (remLen >= 2 + topicLen) {
+                val topic = String(payloadBytes, 2, topicLen, Charsets.UTF_8)
+                val qos = (header and 0x06) shr 1
+                val msgOffset = if (qos > 0) 2 + topicLen + 2 else 2 + topicLen
+                if (remLen > msgOffset) {
+                  if (topic.contains("/pc_stream_bin")) {
+                    com.example.data.pc.PcBlockerClient.ingestP2pStreamFrameBinary(topic, payloadBytes, msgOffset, remLen - msgOffset)
+                  } else {
+                    val jsonStr = String(payloadBytes, msgOffset, remLen - msgOffset, Charsets.UTF_8)
+                    handleIncomingJsonPacket(topic, jsonStr, isFromLan = false)
+                  }
                 }
               }
             }
@@ -1255,7 +1331,7 @@ object DirectP2pSocketEngine {
   }
 
   /**
-   * Publishes a JSON packet over BOTH the Direct LAN P2P TCP Socket AND the Global Binary TCP Socket.
+   * Publishes a JSON packet over Direct LAN P2P TCP Socket, VPS/Cloudflare WebSocket Relay, AND Global Binary TCP Socket.
    */
   fun publishTcpSocketPacket(topic: String, json: JSONObject, retain: Boolean = false): Boolean {
     if (retain) {
@@ -1264,15 +1340,18 @@ object DirectP2pSocketEngine {
       } else {
         retainedPacketsOutbox[topic] = json
       }
+    } else if (topic.startsWith(TOPIC_LOCK)) {
+      retainedPacketsOutbox.remove(topic)
     }
     val sent = pushDirectLanPacket(json)
+    var vpsSent = false
     // VPS/Cloudflare Relay — неблокирующе в активный WebSocket.
     if (vpsEnabled && vpsConnected) {
       try {
-        vpsWebSocket?.send(ByteString.of(*buildPublishPacket(topic, json, retain)))
+        vpsSent = vpsWebSocket?.send(ByteString.of(*buildPublishPacket(topic, json, retain))) == true
       } catch (_: Exception) {}
     }
-    if (globalTcpOuts.isEmpty()) return sent
+    if (globalTcpOuts.isEmpty()) return sent || vpsSent
     scope.launch(Dispatchers.IO) {
       try {
         val body = ByteArrayOutputStream()
@@ -1372,13 +1451,15 @@ object DirectP2pSocketEngine {
             }
           }
           type == "LOCK_STATE" || topic.startsWith(TOPIC_LOCK) -> {
-            RealtimeCloudRelay.ingestAuthoritativeLockJson(msg)
             val rawCid = msg.optLong("childId", msg.optLong("id", 0L))
             val cid = RealtimeCloudRelay.resolveCanonicalChildId(rawCid, pktPairingCode)
             val locked = msg.optBoolean("isDeviceLocked", false)
-            val ts = msg.optLong("ts", now)
-            // Only emit LOCK if it is a fresh live command within the last 15 seconds (never from retained history)
-            if (cid > 0L && (!locked || kotlin.math.abs(now - ts) <= 15_000L)) {
+            val ts = msg.optLong("timestamp", msg.optLong("ts", now))
+            val existingAuth = RealtimeCloudRelay.getAuthoritativeLock(cid)
+            val isFreshAndNewer = kotlin.math.abs(now - ts) <= 90_000L &&
+              (existingAuth == null || ts >= existingAuth.second)
+            RealtimeCloudRelay.ingestAuthoritativeLockJson(msg)
+            if (cid > 0L && isFreshAndNewer && currentRole == "CHILD") {
               _incomingCommandsFlow.tryEmit(Triple(cid, if (locked) "LOCK" else "UNLOCK", ""))
               applyImmediateLockOrUnlockIfChild(cid, locked)
             }
@@ -1389,7 +1470,7 @@ object DirectP2pSocketEngine {
             val cmd = msg.optString("command", "")
             val payload = msg.optString("payload", "")
             val ts = msg.optLong("timestamp", now)
-            val maxAgeMs = if (cmd == "LOCK") 20_000L else 180_000L
+            val maxAgeMs = if (cmd == "LOCK" || cmd == "UNLOCK") 300_000L else 180_000L
             if (cmd.isNotBlank() && kotlin.math.abs(now - ts) < maxAgeMs) {
               if (currentRole == "CHILD") {
                 markParentPresenceActive(cid)
@@ -1397,13 +1478,15 @@ object DirectP2pSocketEngine {
                   lastParentMapViewMs = now
                 }
               }
-              _incomingCommandsFlow.tryEmit(Triple(cid, cmd, payload))
               if (cmd == "UNLOCK") {
-                RealtimeCloudRelay.publishAuthoritativeLock(cid, false)
-                applyImmediateLockOrUnlockIfChild(cid, false)
+                RealtimeCloudRelay.setLocalAuthoritativeLock(cid, false, ts)
+                if (currentRole == "CHILD") applyImmediateLockOrUnlockIfChild(cid, false)
               } else if (cmd == "LOCK") {
-                RealtimeCloudRelay.publishAuthoritativeLock(cid, true)
-                applyImmediateLockOrUnlockIfChild(cid, true)
+                RealtimeCloudRelay.setLocalAuthoritativeLock(cid, true, ts)
+                if (currentRole == "CHILD") applyImmediateLockOrUnlockIfChild(cid, true)
+              }
+              if (currentRole == "CHILD" || (cmd != "LOCK" && cmd != "UNLOCK")) {
+                _incomingCommandsFlow.tryEmit(Triple(cid, cmd, payload))
               }
             }
           }

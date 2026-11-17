@@ -513,7 +513,7 @@ class KidsGuardBackgroundService : Service() {
                     Log.d(TAG, "Background received remote command for child $activeChildId: $cmd")
                     when (cmd) {
                       "LOCK" -> {
-                        com.example.data.cloud.RealtimeCloudRelay.publishAuthoritativeLock(activeChildId, true)
+                        com.example.data.cloud.RealtimeCloudRelay.setLocalAuthoritativeLock(activeChildId, true)
                         dao.setChildDeviceLocked(activeChildId, true)
                         com.example.util.DeviceTotalLockManager.enforceTotalLock(
                           applicationContext,
@@ -521,7 +521,7 @@ class KidsGuardBackgroundService : Service() {
                         )
                       }
                       "UNLOCK" -> {
-                        com.example.data.cloud.RealtimeCloudRelay.publishAuthoritativeLock(activeChildId, false)
+                        com.example.data.cloud.RealtimeCloudRelay.setLocalAuthoritativeLock(activeChildId, false)
                         dao.setChildDeviceLocked(activeChildId, false)
                         com.example.util.DeviceTotalLockManager.releaseTotalLock(applicationContext)
                       }

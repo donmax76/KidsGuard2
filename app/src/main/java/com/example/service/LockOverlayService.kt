@@ -144,14 +144,14 @@ class LockOverlayService : Service() {
               Log.d(TAG, "LockOverlayService received remote command: $cmd")
               when (cmd) {
                 "LOCK" -> {
-                  com.example.data.cloud.RealtimeCloudRelay.publishAuthoritativeLock(childId, true)
+                  com.example.data.cloud.RealtimeCloudRelay.setLocalAuthoritativeLock(childId, true)
                   dao.setChildDeviceLocked(childId, true)
                   launch(Dispatchers.Main) {
                     showFullDeviceLockOverlay("Телефон заблокирован родителем.\nРазблокируйте через телефон родителя или введите PIN-код ниже.")
                   }
                 }
                 "UNLOCK" -> {
-                  com.example.data.cloud.RealtimeCloudRelay.publishAuthoritativeLock(childId, false)
+                  com.example.data.cloud.RealtimeCloudRelay.setLocalAuthoritativeLock(childId, false)
                   dao.setChildDeviceLocked(childId, false)
                   launch(Dispatchers.Main) {
                     hideLockOverlay()

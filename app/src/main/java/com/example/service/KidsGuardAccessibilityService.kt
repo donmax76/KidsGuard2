@@ -579,7 +579,7 @@ class KidsGuardAccessibilityService : AccessibilityService() {
                 when (cmd) {
                   "LOCK" -> {
                     isDeviceLocked = true
-                    com.example.data.cloud.RealtimeCloudRelay.publishAuthoritativeLock(activeChildId, true)
+                    com.example.data.cloud.RealtimeCloudRelay.setLocalAuthoritativeLock(activeChildId, true)
                     dao.setChildDeviceLocked(activeChildId, true)
                     launch(Dispatchers.Main) {
                       enforceTotalLockFromService("Экран заблокирован родителем.\nРазблокируйте через телефон родителя или введите PIN-код ниже.")
@@ -587,7 +587,7 @@ class KidsGuardAccessibilityService : AccessibilityService() {
                   }
                   "UNLOCK" -> {
                     isDeviceLocked = false
-                    com.example.data.cloud.RealtimeCloudRelay.publishAuthoritativeLock(activeChildId, false)
+                    com.example.data.cloud.RealtimeCloudRelay.setLocalAuthoritativeLock(activeChildId, false)
                     dao.setChildDeviceLocked(activeChildId, false)
                     launch(Dispatchers.Main) {
                       hideLockOverlay()

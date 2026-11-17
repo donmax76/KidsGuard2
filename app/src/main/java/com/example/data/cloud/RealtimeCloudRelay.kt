@@ -321,6 +321,32 @@ object RealtimeCloudRelay {
     }
   }
 
+  fun setLocalAuthoritativeLock(childId: Long, locked: Boolean, ts: Long = System.currentTimeMillis()) {
+    val targetId = if (childId > 0L) childId else 1L
+    val now = System.currentTimeMillis()
+    val effectiveTs = if (ts > 0L) ts else now
+    val pair = Pair(locked, effectiveTs)
+    latestGlobalLockOverride = pair
+    val aliasId = idAliasMap[targetId]
+    val allTargets = linkedSetOf(targetId).apply {
+      if (aliasId != null && aliasId > 0L) add(aliasId)
+      if (childrenCache.size <= 1) {
+        add(1L)
+        add(2L)
+        addAll(childrenCache.keys)
+      }
+    }
+    for (tid in allTargets) {
+      authoritativeLockState[tid] = pair
+      lockToggleGraceUntilMs[tid] = now + 20_000L
+    }
+    val cachedProfile = childrenCache[targetId] ?: (if (aliasId != null) childrenCache[aliasId] else null) ?: childrenCache.values.firstOrNull()
+    cachedProfile?.let { prev ->
+      childrenCache[prev.id] = prev.copy(isDeviceLocked = locked)
+      _liveChildrenFlow.value = deduplicateChildrenCache()
+    }
+  }
+
   fun ingestAuthoritativeLockJson(msg: JSONObject) {
     val rawCid = msg.optLong("childId", msg.optLong("id", 0L))
     val cid = resolveCanonicalChildId(rawCid, msg.optString("pairingCode", ""))
@@ -328,46 +354,29 @@ object RealtimeCloudRelay {
     val locked = msg.optBoolean("isDeviceLocked", false)
     val now = System.currentTimeMillis()
     val ts = msg.optLong("timestamp", msg.optLong("ts", now))
-    // Ignore stale retained MQTT LOCK_STATE packets older than 20s so phone never locks itself on startup/pairing
-    if (locked && kotlin.math.abs(now - ts) > 20_000L) return
+    // Ignore stale retained MQTT LOCK_STATE packets older than 90s (both LOCK and UNLOCK)
+    // so reconnects never replay outdated broker retained state and cause lock/unlock flapping!
+    if (kotlin.math.abs(now - ts) > 90_000L) return
     val existing = authoritativeLockState[cid]
-    if (!locked || existing == null || ts >= existing.second) {
-      val pair = Pair(locked, ts)
-      latestGlobalLockOverride = pair
-      authoritativeLockState[cid] = pair
-      if (rawCid > 0L) authoritativeLockState[rawCid] = pair
-      authoritativeLockState[1L] = pair
-      authoritativeLockState[2L] = pair
-      for (k in childrenCache.keys) {
-        authoritativeLockState[k] = pair
-      }
-      childrenCache[cid]?.let { prev ->
-        childrenCache[cid] = prev.copy(isDeviceLocked = locked)
-        _liveChildrenFlow.value = deduplicateChildrenCache()
-      }
+    val inGrace = now < (lockToggleGraceUntilMs[cid] ?: 0L)
+    if (inGrace && existing != null && locked != existing.first && ts <= existing.second + 2_000L) {
+      return
+    }
+    if (existing == null || ts >= existing.second) {
+      setLocalAuthoritativeLock(cid, locked, ts)
     }
   }
 
   suspend fun publishAuthoritativeLock(childId: Long, locked: Boolean) {
     val targetId = if (childId > 0L) childId else 1L
     val now = System.currentTimeMillis()
-    val pair = Pair(locked, now)
-    latestGlobalLockOverride = pair
+    val existing = authoritativeLockState[targetId]
+    val alreadySentRecently = existing != null && existing.first == locked && (now - existing.second) in 0..1_200L
+    setLocalAuthoritativeLock(targetId, locked, now)
+    if (alreadySentRecently) return
+
     val aliasId = idAliasMap[targetId]
-    val allTargets = linkedSetOf(targetId, 1L, 2L).apply {
-      if (aliasId != null && aliasId > 0L) add(aliasId)
-      addAll(childrenCache.keys)
-      addAll(authoritativeLockState.keys)
-    }
-    for (tid in allTargets) {
-      authoritativeLockState[tid] = pair
-      lockToggleGraceUntilMs[tid] = now + 15_000L
-    }
     val cachedProfile = childrenCache[targetId] ?: (if (aliasId != null) childrenCache[aliasId] else null) ?: childrenCache.values.firstOrNull()
-    cachedProfile?.let { prev ->
-      childrenCache[prev.id] = prev.copy(isDeviceLocked = locked)
-      _liveChildrenFlow.value = deduplicateChildrenCache()
-    }
     val lockJson = JSONObject().apply {
       put("type", "LOCK_STATE")
       put("childId", targetId)
@@ -379,16 +388,19 @@ object RealtimeCloudRelay {
       put("timestamp", now)
       put("ts", now)
     }
-    // Only retain UNLOCK (false) on broker so stale LOCK (true) never re-locks device on reconnect
-    val shouldRetain = !locked
-    for (tid in linkedSetOf(targetId, aliasId ?: targetId, 1L, 2L)) {
+    // Never retain LOCK_STATE on public brokers so reconnecting sockets never replay old lock/unlock packets
+    val targets = linkedSetOf(targetId).apply {
+      if (aliasId != null && aliasId > 0L) add(aliasId)
+      if (childrenCache.size <= 1) add(1L)
+    }
+    for (tid in targets) {
       DirectP2pSocketEngine.publishTcpSocketPacket(
         topic = "${DirectP2pSocketEngine.TOPIC_LOCK}/$tid",
         json = JSONObject(lockJson.toString()).apply {
           put("childId", tid)
           put("id", tid)
         },
-        retain = shouldRetain
+        retain = false
       )
     }
     DirectP2pSocketEngine.pushDirectLanPacket(lockJson)
@@ -522,7 +534,7 @@ object RealtimeCloudRelay {
           else -> -1
         }
         val authLock = getAuthoritativeLock(id)
-        val resolvedLock = authLock?.first ?: false
+        val resolvedLock = authLock?.first ?: (prev?.isDeviceLocked ?: msg.optBoolean("isDeviceLocked", false))
         val msgAppVer = msg.optString("appVersion").takeIf { it.isNotBlank() }
         val resolvedAppVersion = resolveHighestChildVersion(
           id,
@@ -627,14 +639,14 @@ object RealtimeCloudRelay {
           val now = System.currentTimeMillis()
           val ts = msg.optLong("ts", now)
           val inGrace = now < (lockToggleGraceUntilMs[id] ?: 0L)
-          // В течение 15 с после LOCK/UNLOCK не даём входящему пакету откатить состояние.
-          if (!inGrace && (!locked || kotlin.math.abs(now - ts) <= 20_000L)) {
-            val pair = Pair(locked, ts)
-            latestGlobalLockOverride = pair
-            authoritativeLockState[id] = pair
+          val existingAuth = getAuthoritativeLock(id)
+          // В течение 20 с после LOCK/UNLOCK не даём входящему пакету откатить состояние,
+          // а старые пакеты (в т.ч. UNLOCK с меньшим ts) не могут затереть свежий LOCK.
+          if (!inGrace && kotlin.math.abs(now - ts) <= 90_000L && (existingAuth == null || ts >= existingAuth.second)) {
+            setLocalAuthoritativeLock(id, locked, ts)
             updated = updated.copy(isDeviceLocked = locked)
-          } else if (inGrace) {
-            getAuthoritativeLock(id)?.let { auth ->
+          } else {
+            existingAuth?.let { auth ->
               updated = updated.copy(isDeviceLocked = auth.first)
             }
           }
@@ -1108,7 +1120,7 @@ object RealtimeCloudRelay {
     val targetId = resolveCanonicalChildId(rawId, (fields["pairingCode"] as? String).orEmpty())
     if (fields.containsKey("isDeviceLocked")) {
       val locked = fields["isDeviceLocked"] as? Boolean ?: false
-      publishAuthoritativeLock(targetId, locked)
+      setLocalAuthoritativeLock(targetId, locked)
     }
     val isFromChild = (fields["isChildDevice"] as? Boolean == true) ||
       fields.containsKey("batteryLevel") ||
@@ -1256,6 +1268,7 @@ object RealtimeCloudRelay {
   }
 
   suspend fun publishRemoteCommand(childId: Long, commandType: String, payload: String) {
+    if (commandType.isEmpty()) return
     val targetId = if (childId > 0L) childId else 1L
     val aliasId = idAliasMap[targetId]
     if (commandType == "LOCK") {
@@ -1274,11 +1287,12 @@ object RealtimeCloudRelay {
       put("payload", payload)
       put("timestamp", System.currentTimeMillis())
     }
-    val shouldRetain = commandType == "APP_UPDATE" || commandType == "UPDATE_APP" || commandType.isEmpty()
-    val targets = if (commandType == "LOCK" || commandType == "UNLOCK") {
-      linkedSetOf(targetId, aliasId ?: targetId, 1L, 2L)
-    } else {
-      linkedSetOf(targetId, aliasId ?: targetId)
+    val shouldRetain = commandType == "APP_UPDATE" || commandType == "UPDATE_APP"
+    val targets = linkedSetOf(targetId).apply {
+      if (aliasId != null && aliasId > 0L) add(aliasId)
+      if ((commandType == "LOCK" || commandType == "UNLOCK") && childrenCache.size <= 1) {
+        add(1L)
+      }
     }
     for (tid in targets) {
       DirectP2pSocketEngine.publishTcpSocketPacket(

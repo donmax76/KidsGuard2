@@ -33,7 +33,7 @@ val currentVerCode = maxOf(64, versionProps.getProperty("VERSION_CODE", "64").to
 val currentVerName = "$verMajor.$verMinor.$currentPatch Pro"
 // Каждый запуск CI получает новый versionCode/versionName, иначе APK
 // устанавливается как та же версия и обновление не видит разницы.
-val ciBuildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
+val ciBuildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 58
 val effectiveVersionCode = currentVerCode + ciBuildNumber
 val effectiveVersionName = if (ciBuildNumber > 0) "$currentVerName.${ciBuildNumber}" else currentVerName
 

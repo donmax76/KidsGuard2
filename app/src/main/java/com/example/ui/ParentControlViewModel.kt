@@ -895,9 +895,8 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
         com.example.service.KidsGuardBackgroundService.stop(getApplication())
       }
       val newStatus = !child.isDeviceLocked
+      // setChildDeviceLocked already updates authoritative lock, child state, and sends LOCK/UNLOCK command
       repository.setChildDeviceLocked(child.id, newStatus)
-      // Send remote cloud command to lock/unlock ONLY the Child's device!
-      repository.sendRemoteCloudCommand(child.id, if (newStatus) "LOCK" else "UNLOCK")
       com.example.util.DeviceControlDebugger.logEvent(
         if (newStatus) "БЛОКИРОВКА_ТЕЛЕФОНА" else "РАЗБЛОКИРОВКА_ТЕЛЕФОНА",
         "Команда отправлена на телефон ребенка ${child.name} (ID: ${child.id})",

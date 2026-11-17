@@ -242,11 +242,11 @@ class ParentalControlRepository(private val context: Context) {
               else -> "Ожидание точного GPS-сигнала с телефона ребёнка..."
             }
 
-            // On the Child phone, only lock when an authoritative lock is active so stale P2P state never locks the phone unexpectedly!
+            // On the Child phone, preserve active lock state when authoritative lock is set or locally locked!
             val authLock = com.example.data.cloud.RealtimeCloudRelay.getAuthoritativeLock(resolvedId)
             val resolvedLocked = when {
               authLock != null -> authLock.first
-              isThisChildDevice -> false
+              isThisChildDevice -> localExisting?.isDeviceLocked ?: com.example.util.DeviceTotalLockManager.isCurrentlyLocked
               else -> cloudChild.isDeviceLocked
             }
 
@@ -532,12 +532,12 @@ class ParentalControlRepository(private val context: Context) {
                   android.util.Log.d("Repo", "Received Cloud Command: $cmd for child $thisChildId")
                   when (cmd) {
                     "LOCK" -> {
-                      com.example.data.cloud.RealtimeCloudRelay.publishAuthoritativeLock(thisChildId, true)
+                      com.example.data.cloud.RealtimeCloudRelay.setLocalAuthoritativeLock(thisChildId, true)
                       dao.setChildDeviceLocked(thisChildId, true)
                       com.example.util.DeviceTotalLockManager.enforceTotalLock(context, "Экран заблокирован родителем")
                     }
                     "UNLOCK" -> {
-                      com.example.data.cloud.RealtimeCloudRelay.publishAuthoritativeLock(thisChildId, false)
+                      com.example.data.cloud.RealtimeCloudRelay.setLocalAuthoritativeLock(thisChildId, false)
                       dao.setChildDeviceLocked(thisChildId, false)
                       com.example.util.DeviceTotalLockManager.releaseTotalLock(context)
                     }
@@ -648,6 +648,18 @@ class ParentalControlRepository(private val context: Context) {
                       cloudSync.upsertBatteryLevel(thisChildId, batt)
                       com.example.data.cloud.RealtimeCloudRelay.publishChildPong(thisChildId)
                       cloudSync.clearRemoteCommand(thisChildId)
+                    }
+                    "CONFIGURE_VPS" -> {
+                      try {
+                        val j = org.json.JSONObject(payload)
+                        com.example.data.cloud.DirectP2pSocketEngine.configureVpsRelay(
+                          enabled = j.optBoolean("enabled", false),
+                          host = j.optString("host", ""),
+                          port = j.optInt("port", 443),
+                          password = j.optString("password", "1234"),
+                          roomCode = j.optString("roomCode", "101-701")
+                        )
+                      } catch (_: Exception) {}
                     }
                     "REQUEST_POWER_STATS" -> {
                       // Мгновенный ответ на запрос расхода энергии (HealthStats) от родителя.

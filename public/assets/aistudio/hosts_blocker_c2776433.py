@@ -3852,6 +3852,7 @@ def _ws_handshake(sock, host, path):
     key = base64.b64encode(os.urandom(16)).decode()
     req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n"
            "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+           "Sec-WebSocket-Protocol: mqtt\r\n"
            "Sec-WebSocket-Version: 13\r\n\r\n") % (path, host, key)
     sock.sendall(req.encode("latin-1"))
     data = b""
@@ -3866,22 +3867,36 @@ def _ws_handshake(sock, host, path):
 
 def p2p_vps_bridge_worker(st):
     """Мост на свой VPS / Cloudflare Relay (WebSocket MQTT), параллельно публичным брокерам."""
+    roots = (P2P_TOPIC_ROOT, P2P_TOPIC_ROOT_V34)
     while True:
         try:
             cfg = st.get("cfg") or load_config() or {}
             web = cfg.get("web") or {}
             if not web.get("vps_enabled"):
-                time.sleep(10)
+                time.sleep(5)
                 continue
-            host = str(web.get("vps_host") or "").strip()
+            raw_host = str(web.get("vps_host") or "").strip()
             port = int(web.get("vps_port") or 443)
             code = str(web.get("pairing_code") or "101-701").strip() or "101-701"
+            clean_code = code.replace("-", "").replace(" ", "")
             pwd = str(web.get("vps_password") or "1234")
-            if not host:
-                time.sleep(10)
+            if not raw_host:
+                time.sleep(5)
                 continue
-            tls = port in (443, 8443, 2053, 2083, 2087, 2096) or host.startswith(("wss://", "https://"))
-            host = host.replace("wss://", "").replace("ws://", "").replace("https://", "").replace("http://", "").strip("/")
+            tls = port in (443, 8443, 2053, 2083, 2087, 2096) or raw_host.lower().startswith(("wss://", "https://"))
+            stripped = (raw_host
+                        .replace("wss://", "").replace("WSS://", "")
+                        .replace("ws://", "").replace("WS://", "")
+                        .replace("https://", "").replace("HTTPS://", "")
+                        .replace("http://", "").replace("HTTP://", "")
+                        .strip("/"))
+            host = stripped.split("/")[0]
+            ws_path = "/" + stripped.split("/", 1)[1] if "/" in stripped else "/mqtt"
+            if ":" in host:
+                host_only, port_str = host.rsplit(":", 1)
+                if port_str.isdigit():
+                    host = host_only
+                    port = int(port_str)
             sock = None
             try:
                 raw = socket.create_connection((host, port), timeout=10)
@@ -3892,19 +3907,61 @@ def p2p_vps_bridge_worker(st):
                     sock = ctx.wrap_socket(raw, server_hostname=host)
                 else:
                     sock = raw
-                sock.settimeout(30)
-                _ws_handshake(sock, host, "/mqtt")
+                sock.settimeout(15)
+                _ws_handshake(sock, host, ws_path)
                 cid = "hb_vps_%s" % secrets.token_hex(4)
                 _ws_send(sock, _mqtt_connect_pkt(cid, username=code, password=pwd))
-                for idx, r in enumerate((P2P_TOPIC_ROOT, P2P_TOPIC_ROOT_V34), 1):
-                    _ws_send(sock, _mqtt_sub_pkt(idx, "%s/pc_cmd/%s" % (r, code)))
+                sub_id = 1
+                codes_to_sub = [code] if clean_code == code or not clean_code else [code, clean_code]
+                for r in roots:
+                    for c_sub in codes_to_sub:
+                        _ws_send(sock, _mqtt_sub_pkt(sub_id, "%s/pc_cmd/%s" % (r, c_sub)))
+                        sub_id += 1
                 last_ping = time.time()
+                last_pub = 0.0
+                last_full_pub = 0.0
+                last_screen_pub = 0.0
                 last_stream_send = 0.0
                 while True:
                     now = time.time()
-                    if now - last_ping >= 30:
+                    cur_cfg = st.get("cfg") or load_config() or {}
+                    cur_web = cur_cfg.get("web") or {}
+                    if not cur_web.get("vps_enabled"):
+                        break
+                    cur_code = str(cur_web.get("pairing_code") or "101-701").strip() or "101-701"
+                    if cur_code != code:
+                        break
+
+                    if now - last_ping >= 25:
                         last_ping = now
                         _ws_send(sock, bytes([0xC0, 0x00]))
+
+                    # Периодическая публикация состояния и превью экрана ПК через VPS Relay
+                    if now - last_pub >= 4.0:
+                        last_pub = now
+                        want_full = (now - last_full_pub) >= 60.0
+                        if want_full:
+                            last_full_pub = now
+                        state_payload = panel_state("p2p", full=want_full)
+                        state_payload["type"] = "PC_STATE"
+                        state_json_str = json.dumps(state_payload, ensure_ascii=False)
+                        for r in roots:
+                            _ws_send(sock, _mqtt_pub_pkt("%s/pc_state/%s" % (r, code), state_json_str, retain=not want_full))
+                        if not stream_is_active() and (now - last_screen_pub) >= 30.0:
+                            last_screen_pub = now
+                            scr_auto = panel_screen(force=False)
+                            if scr_auto.get("ok"):
+                                scr_json_str = json.dumps({
+                                    "type": "PC_SCREEN",
+                                    "pairing_code": code,
+                                    "pc_id": pc_id(),
+                                    "screen_b64": scr_auto["screen_b64"],
+                                    "fmt": scr_auto.get("fmt", "image/png"),
+                                    "ts": scr_auto.get("ts", int(time.time() * 1000))
+                                }, ensure_ascii=False)
+                                for r in roots:
+                                    _ws_send(sock, _mqtt_pub_pkt("%s/pc_screen/%s" % (r, code), scr_json_str, retain=True))
+
                     # Живой стрим экрана ПК через уже открытый WS-сокет (без второго сокета).
                     if stream_p2p_active() and (now - last_stream_send) >= 0.35:
                         last_stream_send = now
@@ -3918,7 +3975,7 @@ def p2p_vps_bridge_worker(st):
                                     "ts": int(time.time() * 1000),
                                     "b64": base64.b64encode(fr[0]).decode("ascii")
                                 })
-                                for r in (P2P_TOPIC_ROOT, P2P_TOPIC_ROOT_V34):
+                                for r in roots:
                                     _ws_send(sock, _mqtt_pub_pkt("%s/pc_stream/%s" % (r, code), fj))
                         except Exception:
                             pass
@@ -3934,62 +3991,125 @@ def p2p_vps_bridge_worker(st):
                         continue
                     if opcode != 0x2 or len(payload) < 2:
                         continue
-                    hdr = payload[0]
-                    if (hdr & 0xF0) != 0x30:
-                        continue
-                    # разбор MQTT PUBLISH
-                    pos, rem = 1, 0
-                    mult = 1
-                    while pos < len(payload):
-                        b = payload[pos]; pos += 1
-                        rem += (b & 127) * mult
-                        mult *= 128
-                        if (b & 128) == 0:
+
+                    offset = 0
+                    while offset + 2 <= len(payload):
+                        hdr = payload[offset]
+                        pos = offset + 1
+                        rem = 0
+                        mult = 1
+                        while pos < len(payload):
+                            b = payload[pos]
+                            pos += 1
+                            rem += (b & 127) * mult
+                            mult *= 128
+                            if (b & 128) == 0:
+                                break
+                        pkt_end = pos + rem
+                        if pkt_end > len(payload):
                             break
-                    if pos + 2 > len(payload):
-                        continue
-                    tlen = (payload[pos] << 8) | payload[pos + 1]
-                    pos += 2
-                    if pos + tlen > len(payload):
-                        continue
-                    topic = payload[pos:pos + tlen].decode("utf-8", "ignore")
-                    pos += tlen
-                    if (hdr & 0x06) != 0:
+                        offset = pkt_end
+                        if (hdr & 0xF0) != 0x30 or rem < 2:
+                            continue
+                        tlen = (payload[pos] << 8) | payload[pos + 1]
                         pos += 2
-                    raw_msg = payload[pos:].decode("utf-8", "ignore")
-                    if not raw_msg.startswith("{"):
-                        continue
-                    try:
-                        cmd_json = json.loads(raw_msg)
-                    except Exception:
-                        continue
-                    action = str(cmd_json.get("action", ""))
-                    data = cmd_json.get("data") or {}
-                    pwd_in = str(cmd_json.get("password", ""))
-                    auth_error = ""
-                    cur_cfg = st.get("cfg") or load_config() or {}
-                    if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
-                                  "/api/fulllock_schedule", "/api/add", "/api/delete"):
-                        if cur_cfg.get("hash") and not (pwd_in and check_password(pwd_in, cur_cfg["salt"], cur_cfg["hash"])):
-                            auth_error = "ПК защищён паролем: укажите пароль панели в настройках ПК"
-                        else:
-                            res = panel_mutate(action, data)
-                            if not res.get("ok", False):
-                                auth_error = str(res.get("error", "Ошибка выполнения команды"))
-                        st["mtime"] = 0
-                        st["sig"] = None
-                    if action == "/api/sync":
-                        state_payload = panel_state("p2p", full=True)
-                    else:
-                        state_payload = panel_state("p2p", full=False)
-                    state_payload["type"] = "PC_STATE"
-                    if auth_error:
-                        state_payload["auth_error"] = auth_error
-                    for r in (P2P_TOPIC_ROOT, P2P_TOPIC_ROOT_V34):
+                        if pos + tlen > pkt_end:
+                            continue
+                        pos += tlen
+                        if (hdr & 0x06) != 0:
+                            pos += 2
+                        if pos >= pkt_end:
+                            continue
+                        raw_msg = payload[pos:pkt_end].decode("utf-8", "ignore")
+                        if not raw_msg.startswith("{"):
+                            continue
                         try:
-                            _ws_send(sock, _mqtt_pub_pkt("%s/pc_state/%s" % (r, code), json.dumps(state_payload, ensure_ascii=False), retain=True))
+                            cmd_json = json.loads(raw_msg)
                         except Exception:
-                            pass
+                            continue
+                        action = str(cmd_json.get("action", ""))
+                        data = cmd_json.get("data") or {}
+                        pwd_in = str(cmd_json.get("password", ""))
+                        auth_error = ""
+                        cur_cfg = st.get("cfg") or load_config() or {}
+                        if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
+                                      "/api/fulllock_schedule", "/api/add", "/api/delete"):
+                            if cur_cfg.get("hash") and not (pwd_in and check_password(pwd_in, cur_cfg["salt"], cur_cfg["hash"])):
+                                auth_error = "ПК защищён паролем: укажите пароль панели в настройках ПК"
+                            else:
+                                res = panel_mutate(action, data)
+                                if not res.get("ok", False):
+                                    auth_error = str(res.get("error", "Ошибка выполнения команды"))
+                            st["mtime"] = 0
+                            st["sig"] = None
+                        elif action == "/api/stream_start":
+                            stream_touch(
+                                duration=data.get("duration", 25.0),
+                                fps=data.get("fps"),
+                                w=data.get("w"),
+                                h=data.get("h"),
+                                quality=data.get("quality"),
+                                binary=data.get("binary")
+                            )
+                        if action == "/api/stream_stop":
+                            stream_stop()
+                        if action == "/api/screenshot_hd":
+                            request_hd_screenshot()
+                        if action == "/api/record_start":
+                            request_record("start", data.get("fps", 10), data.get("quality", 85))
+                        if action == "/api/record_stop":
+                            request_record("stop")
+                        if action == "/api/screen":
+                            scr_res = panel_screen(force=True)
+                            if scr_res.get("ok"):
+                                scr_json_str = json.dumps({
+                                    "type": "PC_SCREEN",
+                                    "pairing_code": code,
+                                    "pc_id": pc_id(),
+                                    "screen_b64": scr_res["screen_b64"],
+                                    "fmt": scr_res.get("fmt", "image/png"),
+                                    "ts": scr_res.get("ts", int(time.time() * 1000))
+                                }, ensure_ascii=False)
+                                for r in roots:
+                                    try:
+                                        _ws_send(sock, _mqtt_pub_pkt("%s/pc_screen/%s" % (r, code), scr_json_str, retain=True))
+                                    except Exception:
+                                        pass
+                            last_screen_pub = time.time()
+                        if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
+                                      "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync",
+                                      "/api/stream_start", "/api/screen", "/api/screenshot_hd",
+                                      "/api/record_start", "/api/record_stop"):
+                            is_sync = action == "/api/sync"
+                            state_payload = panel_state("p2p", full=is_sync)
+                            state_payload["type"] = "PC_STATE"
+                            if auth_error:
+                                state_payload["auth_error"] = auth_error
+                            state_json_str = json.dumps(state_payload, ensure_ascii=False)
+                            for r in roots:
+                                try:
+                                    _ws_send(sock, _mqtt_pub_pkt("%s/pc_state/%s" % (r, code), state_json_str, retain=True))
+                                except Exception:
+                                    pass
+                            if is_sync:
+                                scr_now = panel_screen(force=True)
+                                if scr_now.get("ok"):
+                                    scr_json_str = json.dumps({
+                                        "type": "PC_SCREEN",
+                                        "pairing_code": code,
+                                        "pc_id": pc_id(),
+                                        "screen_b64": scr_now["screen_b64"],
+                                        "fmt": scr_now.get("fmt", "image/png"),
+                                        "ts": scr_now.get("ts", int(time.time() * 1000))
+                                    }, ensure_ascii=False)
+                                    for r in roots:
+                                        try:
+                                            _ws_send(sock, _mqtt_pub_pkt("%s/pc_screen/%s" % (r, code), scr_json_str, retain=True))
+                                        except Exception:
+                                            pass
+                                last_screen_pub = time.time()
+                            last_pub = time.time()
+                            last_full_pub = time.time() if is_sync else last_full_pub
             finally:
                 try:
                     if sock:
@@ -4012,6 +4132,7 @@ def p2p_bridge_worker(st, host, port):
             time.sleep(5)
             continue
         code = str(web.get("pairing_code") or "101-701").strip() or "101-701"
+        clean_code = code.replace("-", "").replace(" ", "")
         sock = None
         try:
             sock = socket.create_connection((host, port), timeout=10)
@@ -4026,8 +4147,12 @@ def p2p_bridge_worker(st, host, port):
                 raise RuntimeError("CONNACK failed")
             fails = 0
 
-            for idx, r in enumerate(roots, 1):
-                sock.sendall(_mqtt_sub_pkt(idx, f"{r}/pc_cmd/{code}"))
+            sub_id = 1
+            codes_to_sub = [code] if clean_code == code or not clean_code else [code, clean_code]
+            for r in roots:
+                for c_sub in codes_to_sub:
+                    sock.sendall(_mqtt_sub_pkt(sub_id, f"{r}/pc_cmd/{c_sub}"))
+                    sub_id += 1
 
             last_pub = 0.0
             last_full_pub = 0.0

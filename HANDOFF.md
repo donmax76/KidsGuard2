@@ -1,5 +1,24 @@
 # KidsGuard2 — HANDOFF
 
+## Сборка run #58 (2026-11-17)
+
+- Базовый коммит GitHub (`donmax76/KidsGuard2`): `88f1517` / `110fe97` (run #57, `3.3.35 Pro.57`)
+- Версия сборки: **`3.3.35 Pro.58` (`versionCode = 123`)**
+- Исправленные критические проблемы:
+  1. **Поломка P2P Connect в разных сетях (`DirectP2pSocketEngine.kt`, строки 1026–1028)**:
+     В `sendMqttConnect` поле KeepAlive записывалось **3 байтами** (`0x00, 0x00, 0x32`) вместо 2 байт по стандарту MQTT 3.1.1 (`0x00, 0x32`), из-за чего публичные брокеры (`broker.emqx.io`, `broker.hivemq.com`) отклоняли пакет `CONNECT` и работала только локальная сеть (LAN 49152/49153). Удалён лишний байт `0x00`.
+  2. **Поломка VPS / Cloudflare Relay в разных сетях (`DirectP2pSocketEngine.kt` и `hosts_blocker.py`)**:
+     - Добавлен обязательный заголовок `Sec-WebSocket-Protocol: mqtt` в WebSocket-рукопожатие (`runVpsRelayLoop` в Android и `_ws_handshake` в `hosts_blocker.py`).
+     - В `handleVpsMqttPacket` добавлен цикл чтения всех склеенных MQTT-пакетов из одного WebSocket-фрейма, выгрузка `retainedPacketsOutbox` при `CONNACK` и подписка на `$TOPIC_ROOT_LEGACY_PC/pc_stream/#`.
+     - Убрана блокировка `if (vpsEnabled) continue` в `runBinaryTcpSocketLoop`, которая отключала P2P Connect при включении VPS, а в `VpsRelaySetupPanel.kt` отправка `CONFIGURE_VPS` ребёнку перенесена ПЕРЕД переключением локального сокета. Теперь **и VPS Relay, и P2P Connect работают параллельно в любых сетях (Wi-Fi ↔ 4G/LTE)**.
+     - В `hosts_blocker.py` (`p2p_vps_bridge_worker`) добавлена периодическая отправка `PC_STATE` (каждые 4 с) и `PC_SCREEN` (каждые 30 с), а также обработка всех команд (`/api/stream_start`, `/api/stream_stop`, `/api/screen`, `/api/screenshot_hd`, `/api/record_start`, `/api/record_stop`).
+  3. **Бесконечное переподключение и «блокирует — разблокирует — блокирует — разблокирует» (`RealtimeCloudRelay.kt`, `DirectP2pSocketEngine.kt`, `ParentalControlRepository.kt`, `KidsGuardBackgroundService.kt`, `KidsGuardAccessibilityService.kt`, `LockOverlayService.kt`)**:
+     - В `RealtimeCloudRelay.publishAuthoritativeLock` ранее стояло `val shouldRetain = !locked` (retained-сообщением на брокере всегда оставался старый `UNLOCK` `isDeviceLocked = false`), а в `ingestAuthoritativeLockJson` и `DirectP2pSocketEngine` стояло условие `if (!locked || ...)`, из-за чего при любом реконнекте старый retained-пакет `UNLOCK` мгновенно затирал только что включённый `LOCK`.
+     - При получении команды `LOCK`/`UNLOCK` 5 слушателей на телефоне ребёнка вызывали `publishAuthoritativeLock` обратно в сокет (вызывая шторм из ~40 MQTT-пакетов и разрыв соединения). Заменено на локальный `setLocalAuthoritativeLock` без сетевого эха.
+     - В `ParentalControlRepository.kt` (строка 249) исправлен сброс `isThisChildDevice -> false`, который сбрасывал блокировку в SQLite на телефоне ребёнка.
+
+---
+
 ## Сборка run #57 (2026-11-17)
 
 - Финальный коммит: `88f1517` (фикс 1-мин таймаута, живой стрим ПК, legacy P2P fallback, VPS UI с PIN)
