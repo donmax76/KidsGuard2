@@ -1,5 +1,20 @@
 # KidsGuard2 — HANDOFF
 
+## Сборка run #51 (2026-11-17)
+
+- Финальный коммит: `213ce54` («single emqx broker non-blocking write & strict P2P-only mode»)
+- Успешный CI-run: **#51** — https://github.com/donmax76/KidsGuard2/actions/runs/44042653572
+- Оба job'а зелёные: `build` (APK) и `Build Windows PC agent (.exe)`.
+
+### Артефакты run #51
+
+- APK: `KidsGuard-debug-apk` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14309334492/zip
+  (~20,85 МБ, внутри `app-debug.apk`)
+- ПК-агент: `KidsGuard-PC-Agent` → https://api.github.com/repos/donmax76/KidsGuard2/actions/artifacts/14310670454/zip
+  (~19,0 МБ, внутри `hosts_blocker.exe` + `hosts_blocker.py`)
+
+---
+
 ## Сборка run #50 (2026-11-16)
 
 - Финальный коммит: `61079d5` (syntax-only фикс после падения run #49 на `:app:compileDebugKotlin`)
