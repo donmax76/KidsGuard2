@@ -929,13 +929,13 @@ fun ChildModeScreen(
           onClick = {
             onVerifyUninstallPin(
               vpsPinInput,
-              onSuccess = {
+              {
                 isVpsPanelExpanded = true
                 showVpsPinDialog = false
                 vpsPinInput = ""
                 vpsPinError = false
               },
-              onError = { vpsPinError = true }
+              { vpsPinError = true }
             )
           },
           colors = ButtonDefaults.buttonColors(containerColor = CyanLight, contentColor = Color.Black)
