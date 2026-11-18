@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DeleteForever
@@ -121,6 +122,7 @@ fun ChildModeScreen(
   var uninstallPinError by remember { mutableStateOf(false) }
   var urlInput by remember { mutableStateOf(browserUrl) }
   var showSecurityPermissionsDialog by remember { mutableStateOf(false) }
+  var showChildDebugLogsDialog by remember { mutableStateOf(false) }
   var isVpsPanelExpanded by remember { mutableStateOf(false) }
   var showVpsPinDialog by remember { mutableStateOf(false) }
   var vpsPinInput by remember { mutableStateOf("") }
@@ -164,10 +166,10 @@ fun ChildModeScreen(
     while (true) {
       val isLiveStreamActive = com.example.service.KidsGuardAccessibilityService.isLiveStreamingActiveNow() &&
         com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
-      if (!com.example.location.LiveLocationTracker.isEmulator() && isLiveStreamActive) {
-        (context as? android.app.Activity)?.let { act ->
-          com.example.util.ScreenShotManager.captureActivityDecorView(act)
-        }
+      // Если AccessibilityService запущен, он сам ведёт живой поток реального экрана.
+      if (!com.example.location.LiveLocationTracker.isEmulator() &&
+          isLiveStreamActive &&
+          com.example.service.KidsGuardAccessibilityService.instance == null) {
         val currentApp = com.example.util.DeviceUsageTracker.resolveCurrentForegroundApp(context)
         com.example.util.ScreenShotManager.triggerHardwareScreenCapture(currentApp, false) { item ->
           item.base64Bitmap?.let { b64 ->
@@ -201,20 +203,20 @@ fun ChildModeScreen(
       cmdPair?.let { (cmd, payload) ->
         when (cmd) {
           "START_LIVE_STREAM", "TAKE_SCREENSHOT" -> {
-            if (cmd == "START_LIVE_STREAM") {
-              com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
-            }
-            (context as? android.app.Activity)?.let { act ->
-              com.example.util.ScreenShotManager.captureActivityDecorView(act)
-            }
-            val currentApp = com.example.util.DeviceUsageTracker.resolveCurrentForegroundApp(context)
-            com.example.util.ScreenShotManager.triggerHardwareScreenCapture(
-              appName = currentApp,
-              saveToDeviceGallery = false
-            ) { item ->
-              item.base64Bitmap?.let { b64 ->
-                coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                  cloud.uploadScreenSnapshot(childId, currentApp, b64)
+            com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
+            val accSvc = com.example.service.KidsGuardAccessibilityService.instance
+            if (accSvc != null) {
+              accSvc.triggerImmediateCaptureNow()
+            } else {
+              val currentApp = com.example.util.DeviceUsageTracker.resolveCurrentForegroundApp(context)
+              com.example.util.ScreenShotManager.triggerHardwareScreenCapture(
+                appName = currentApp,
+                saveToDeviceGallery = false
+              ) { item ->
+                item.base64Bitmap?.let { b64 ->
+                  coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    cloud.uploadScreenSnapshot(childId, currentApp, b64)
+                  }
                 }
               }
             }
@@ -244,6 +246,18 @@ fun ChildModeScreen(
           }
           "STOP_LIVE_STREAM" -> {
             com.example.service.KidsGuardAccessibilityService.stopLiveStreamingWindow()
+            cloud.clearRemoteCommand(childId)
+          }
+          "CLEAR_DEBUG_LOGS" -> {
+            com.example.util.DeviceControlDebugger.clearLogs()
+            cloud.clearRemoteCommand(childId)
+          }
+          "REQUEST_DEBUG_LOGS" -> {
+            com.example.data.cloud.RealtimeCloudRelay.publishChildDebugLogs(
+              childId = childId,
+              fullDump = true,
+              triggerReason = "Запрос с экрана Родителя"
+            )
             cloud.clearRemoteCommand(childId)
           }
           "UPDATE_APP", "APP_UPDATE" -> {
@@ -382,6 +396,18 @@ fun ChildModeScreen(
           verticalAlignment = Alignment.CenterVertically,
           horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
+          IconButton(
+            onClick = { showChildDebugLogsDialog = true },
+            modifier = Modifier.size(34.dp)
+          ) {
+            Icon(
+              imageVector = Icons.Default.BugReport,
+              contentDescription = "Журнал диагностики ребёнка",
+              tint = CyanLight,
+              modifier = Modifier.size(19.dp)
+            )
+          }
+
           IconButton(
             onClick = { showSecurityPermissionsDialog = true },
             modifier = Modifier.size(34.dp)
@@ -771,6 +797,96 @@ fun ChildModeScreen(
               }
             }
           }
+
+          // Child Diagnostic Log Card (Offline Buffer + Clear + Send to Parent)
+          item {
+            val childLogs by com.example.util.DeviceControlDebugger.logs.collectAsState()
+            Card(
+              shape = RoundedCornerShape(16.dp),
+              colors = CardDefaults.cardColors(containerColor = Slate900),
+              border = androidx.compose.foundation.BorderStroke(1.dp, CyanLight.copy(alpha = 0.4f)),
+              modifier = Modifier.fillMaxWidth()
+            ) {
+              Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+              ) {
+                Row(
+                  modifier = Modifier.fillMaxWidth(),
+                  horizontalArrangement = Arrangement.SpaceBetween,
+                  verticalAlignment = Alignment.CenterVertically
+                ) {
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Icon(Icons.Default.BugReport, contentDescription = null, tint = CyanLight, modifier = Modifier.size(18.dp))
+                    Text(
+                      text = "Журнал диагностики Ребёнка (${childLogs.size})",
+                      color = Color.White,
+                      fontWeight = FontWeight.Bold,
+                      fontSize = 12.5.sp
+                    )
+                  }
+                  Text(
+                    text = "v${com.example.BuildConfig.VERSION_NAME}",
+                    color = CyanLight,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Bold
+                  )
+                }
+
+                Row(
+                  modifier = Modifier.fillMaxWidth(),
+                  horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                  Button(
+                    onClick = { showChildDebugLogsDialog = true },
+                    colors = ButtonDefaults.buttonColors(containerColor = CyanLight, contentColor = Slate950),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    modifier = Modifier.weight(1f).height(34.dp)
+                  ) {
+                    Text("📜 Открыть лог", fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                  }
+                  OutlinedButton(
+                    onClick = {
+                      val cid = activeChild?.id ?: 1L
+                      com.example.data.cloud.RealtimeCloudRelay.publishChildDebugLogs(
+                        childId = cid,
+                        fullDump = true,
+                        triggerReason = "Ручная отправка с телефона ребёнка"
+                      )
+                      android.widget.Toast.makeText(
+                        context,
+                        "Полный лог и срез параметров отправлены Родителю",
+                        android.widget.Toast.LENGTH_SHORT
+                      ).show()
+                    },
+                    border = androidx.compose.foundation.BorderStroke(1.dp, EmeraldShield.copy(alpha = 0.6f)),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    modifier = Modifier.weight(1f).height(34.dp)
+                  ) {
+                    Text("📤 Родителю", color = EmeraldShieldLight, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                  }
+                  OutlinedButton(
+                    onClick = {
+                      com.example.util.DeviceControlDebugger.clearLogs()
+                      android.widget.Toast.makeText(
+                        context,
+                        "Журнал на телефоне ребёнка очищен",
+                        android.widget.Toast.LENGTH_SHORT
+                      ).show()
+                    },
+                    border = androidx.compose.foundation.BorderStroke(1.dp, RoseLock.copy(alpha = 0.6f)),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    modifier = Modifier.weight(0.9f).height(34.dp)
+                  ) {
+                    Text("🗑️ Очистить", color = RoseLock, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                  }
+                }
+              }
+            }
+          }
         }
       }
 
@@ -898,6 +1014,35 @@ fun ChildModeScreen(
   if (showSecurityPermissionsDialog) {
     ChildPermissionsSetupDialog(
       onDismiss = { showSecurityPermissionsDialog = false }
+    )
+  }
+
+  if (showChildDebugLogsDialog) {
+    DebugLogsDialog(
+      onDismiss = { showChildDebugLogsDialog = false },
+      onRunSelfTest = {
+        val cid = activeChild?.id ?: 1L
+        com.example.util.DeviceControlDebugger.logFullDeviceSnapshot(
+          context = context,
+          role = "РЕБЁНОК",
+          childId = cid,
+          triggerReason = "Ручной срез на телефоне ребёнка"
+        )
+      },
+      onRequestChildLogs = {
+        val cid = activeChild?.id ?: 1L
+        com.example.data.cloud.RealtimeCloudRelay.publishChildDebugLogs(
+          childId = cid,
+          fullDump = true,
+          triggerReason = "Отправка из окна логов ребёнка"
+        )
+      },
+      onToggleRemoteLogging = { enabled ->
+        com.example.util.DeviceControlDebugger.setLoggingEnabled(context, enabled)
+      },
+      onClearChildLogs = {
+        com.example.util.DeviceControlDebugger.clearLogs()
+      }
     )
   }
 

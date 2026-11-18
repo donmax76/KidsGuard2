@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.util.Base64
 import java.util.Properties
 
 plugins {
@@ -28,13 +29,13 @@ val versionProps = Properties().apply {
 
 val verMajor = versionProps.getProperty("VERSION_MAJOR", "3").toIntOrNull() ?: 3
 val verMinor = versionProps.getProperty("VERSION_MINOR", "3").toIntOrNull() ?: 3
-val currentPatch = maxOf(34, versionProps.getProperty("VERSION_PATCH", "34").toIntOrNull() ?: 34)
-val currentVerCode = maxOf(64, versionProps.getProperty("VERSION_CODE", "64").toIntOrNull() ?: 64)
+val currentPatch = maxOf(35, versionProps.getProperty("VERSION_PATCH", "35").toIntOrNull() ?: 35)
+val currentVerCode = maxOf(140, versionProps.getProperty("VERSION_CODE", "140").toIntOrNull() ?: 140)
 val currentVerName = "$verMajor.$verMinor.$currentPatch Pro"
 // Каждый запуск CI получает новый versionCode/versionName, иначе APK
 // устанавливается как та же версия и обновление не видит разницы.
-val ciBuildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 58
-val effectiveVersionCode = currentVerCode + ciBuildNumber
+val ciBuildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 62
+val effectiveVersionCode = maxOf(202, currentVerCode + ciBuildNumber)
 val effectiveVersionName = if (ciBuildNumber > 0) "$currentVerName.${ciBuildNumber}" else currentVerName
 
 android {
@@ -48,17 +49,23 @@ android {
     versionCode = effectiveVersionCode
     versionName = effectiveVersionName
 
-    buildConfigField("String", "LIVE_APK_URL", "\"https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk\"")
-    buildConfigField("String", "PRE_APK_URL", "\"https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk\"")
+    buildConfigField("String", "LIVE_APK_URL", "\"https://kappa.lol/yNdx5w.apk\"")
+    buildConfigField("String", "PRE_APK_URL", "\"https://kappa.lol/yNdx5w.apk\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
   signingConfigs {
-    // Проектный debug.keystore может отсутствовать (например, на CI или на новом ПК).
-    // Раньше build падал на подписи; теперь при отсутствии файла используется
-    // стандартный debug-ключ Android (AGP создаст его сам).
+    // Гарантируем единый ключ подписи debug.keystore во всех сборках (локально и в GitHub Actions),
+    // чтобы обновление APK поверх предыдущей версии никогда не требовало удаления старой версии.
     val projectDebugKeystore = file("${rootDir}/debug.keystore")
+    val projectDebugKeystoreB64 = file("${rootDir}/debug.keystore.base64")
+    if (!projectDebugKeystore.exists() && projectDebugKeystoreB64.exists()) {
+      try {
+        val cleanB64 = projectDebugKeystoreB64.readText().replace("\\s".toRegex(), "")
+        projectDebugKeystore.writeBytes(Base64.getDecoder().decode(cleanB64))
+      } catch (_: Exception) {}
+    }
     if (projectDebugKeystore.exists()) {
       create("debugConfig") {
         storeFile = projectDebugKeystore

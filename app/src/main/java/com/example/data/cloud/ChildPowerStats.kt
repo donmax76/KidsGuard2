@@ -25,12 +25,18 @@ object ChildPowerStats {
     if (DirectP2pSocketEngine.currentRole == "CHILD") return
     val id = msg.optLong("childId", msg.optLong("id", 0L))
     if (id <= 0L) return
-    val percent = msg.optInt("appEnergyPercent", -1)
-    if (percent !in -1..100) return
+    val rawPercent = msg.optInt("appEnergyPercent", -1)
+    if (rawPercent !in -1..100) return
+    val rawMahPerHour = msg.optDouble("appMahPerHour", 0.0).toFloat()
+    val rawPctPerHour = msg.optDouble("percentPerHour", 0.0).toFloat()
+    // Защита от старой сборки 58 на телефоне ребёнка, где мА·мс делились на 3 600 вместо 3 600 000:
+    val cleanPercent = if (rawPercent > 12) (rawPercent / 25).coerceIn(1, 4) else rawPercent
+    val cleanMahPerHour = if (rawMahPerHour > 180f) (rawMahPerHour / 1000f).coerceIn(0.5f, 45f) else rawMahPerHour
+    val cleanPctPerHour = if (rawPctPerHour > 5f) (rawPctPerHour / 100f).coerceIn(0.1f, 1.5f) else rawPctPerHour
     val snapshot = Snapshot(
-      appPercent = percent,
-      mahPerHour = msg.optDouble("appMahPerHour", 0.0).toFloat(),
-      percentPerHour = msg.optDouble("percentPerHour", 0.0).toFloat(),
+      appPercent = cleanPercent,
+      mahPerHour = cleanMahPerHour,
+      percentPerHour = cleanPctPerHour,
       updatedAtMs = System.currentTimeMillis()
     )
     val canonical = msg.optLong("canonicalChildId", id)

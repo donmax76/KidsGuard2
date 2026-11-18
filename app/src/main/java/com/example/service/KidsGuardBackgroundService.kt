@@ -551,6 +551,7 @@ class KidsGuardBackgroundService : Service() {
                               )
                             }
                           }
+                          cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
                           if (isBlocked && DeviceUsageTracker.resolveCurrentForegroundPackage(applicationContext) == pkg) {
                             bringLockScreenToFront()
                           }
@@ -564,24 +565,101 @@ class KidsGuardBackgroundService : Service() {
                           val existing = dao.getAppByPackageOnce(activeChildId, pkg)
                           if (existing != null) {
                             dao.setAppLimit(existing.id, mins)
+                            cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
+                            com.example.util.DeviceControlDebugger.logEvent(
+                              "ЛИМИТ_ПРОГРАММЫ",
+                              "Установлен лимит для ${existing.appName} ($pkg): $mins мин/день",
+                              "SUCCESS",
+                              "CHILD"
+                            )
                           }
                         }
                       }
                       "LOUD_RING" -> {
+                        com.example.util.DeviceControlDebugger.logEvent(
+                          "СИРЕНА_ВКЛЮЧЕНА",
+                          "Запущена громкая сирена на телефоне ребёнка #$activeChildId по команде родителя",
+                          "WARNING",
+                          "CHILD"
+                        )
                         playLoudAlarm()
                       }
                       "STOP_LOUD_RING" -> {
+                        com.example.util.DeviceControlDebugger.logEvent(
+                          "СИРЕНА_ОСТАНОВЛЕНА",
+                          "Громкая сирена остановлена по команде родителя",
+                          "SUCCESS",
+                          "CHILD"
+                        )
                         com.example.util.SoundAlertManager.stopAlarm(applicationContext)
                       }
                       "SET_LIMIT" -> {
-                        payload.toIntOrNull()?.let { dao.setChildDailyLimit(activeChildId, it) }
+                        payload.toIntOrNull()?.let { mins ->
+                          com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(
+                            activeChildId,
+                            dailyScreenLimitMinutes = mins
+                          )
+                          dao.setChildDailyLimit(activeChildId, mins)
+                          com.example.util.DeviceControlDebugger.logEvent(
+                            "ДНЕВНОЙ_ЛИМИТ",
+                            "Изменён дневной лимит экранного времени: $mins мин",
+                            "SUCCESS",
+                            "CHILD"
+                          )
+                        }
+                      }
+                      "STUDY_ON" -> {
+                        com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(
+                          activeChildId,
+                          studyModeActive = true
+                        )
+                        dao.setChildStudyMode(activeChildId, true)
+                        com.example.util.DeviceControlDebugger.logEvent(
+                          "РЕЖИМ_УЧЁБЫ",
+                          "Режим «Время учёбы» ВКЛЮЧЕН родителем",
+                          "SUCCESS",
+                          "CHILD"
+                        )
+                      }
+                      "STUDY_OFF" -> {
+                        com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(
+                          activeChildId,
+                          studyModeActive = false
+                        )
+                        dao.setChildStudyMode(activeChildId, false)
+                        com.example.util.DeviceControlDebugger.logEvent(
+                          "РЕЖИМ_УЧЁБЫ",
+                          "Режим «Время учёбы» ВЫКЛЮЧЕН родителем",
+                          "SUCCESS",
+                          "CHILD"
+                        )
                       }
                       "NET_WIFI_ONLY" -> {
+                        com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(
+                          activeChildId,
+                          allowMobileData = false
+                        )
                         dao.setChildAllowMobileData(activeChildId, false)
+                        com.example.util.DeviceControlDebugger.logEvent(
+                          "РЕЖИМ_СЕТИ",
+                          "Переключён сетевой режим ребёнка: ТОЛЬКО Wi-Fi (мобильные данные 4G запрещены для сокетов)",
+                          "WARNING",
+                          "CHILD"
+                        )
                         com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(false)
                       }
                       "NET_ALL" -> {
+                        com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(
+                          activeChildId,
+                          allowMobileData = true
+                        )
                         dao.setChildAllowMobileData(activeChildId, true)
+                        com.example.util.DeviceControlDebugger.logEvent(
+                          "РЕЖИМ_СЕТИ",
+                          "Переключён сетевой режим ребёнка: Wi-Fi + 4G (все сети разрешены)",
+                          "SUCCESS",
+                          "CHILD"
+                        )
                         com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(true)
                       }
                       "PARENT_SESSION_START" -> {
@@ -623,6 +701,42 @@ class KidsGuardBackgroundService : Service() {
                         }
                         cloudSync.clearRemoteCommand(activeChildId)
                       }
+                      "REQUEST_DEBUG_LOGS" -> {
+                        com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
+                        com.example.data.cloud.RealtimeCloudRelay.publishChildDebugLogs(
+                          childId = activeChildId,
+                          fullDump = true,
+                          triggerReason = "Запрос лога из фонового сервиса"
+                        )
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
+                      "CLEAR_DEBUG_LOGS" -> {
+                        com.example.util.DeviceControlDebugger.clearLogs()
+                        com.example.util.DeviceControlDebugger.logEvent(
+                          "ЛОГ_РЕБЁНКА_ОЧИЩЕН",
+                          "Журнал диагностики на телефоне ребёнка #$activeChildId полностью очищен по команде родителя",
+                          "SUCCESS",
+                          "CHILD"
+                        )
+                        com.example.data.cloud.RealtimeCloudRelay.publishChildDebugLogs(
+                          childId = activeChildId,
+                          fullDump = true,
+                          triggerReason = "Подтверждение очистки лога"
+                        )
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
+                      "SET_REMOTE_LOGGING" -> {
+                        val en = payload.trim().equals("ON", ignoreCase = true) || payload.trim() == "1"
+                        com.example.util.DeviceControlDebugger.setLoggingEnabled(applicationContext, en)
+                        if (en) {
+                          com.example.data.cloud.RealtimeCloudRelay.publishChildDebugLogs(
+                            childId = activeChildId,
+                            fullDump = true,
+                            triggerReason = "Включение удалённого логирования"
+                          )
+                        }
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
                       "CONFIGURE_VPS" -> {
                         // Родитель передал настройки VPS/Cloudflare Relay — применяем на ребёнке.
                         try {
@@ -659,15 +773,35 @@ class KidsGuardBackgroundService : Service() {
                         com.example.data.cloud.OfflineStoreAndForwardManager.flushUnsyncedHistoryToParent(applicationContext, activeChildId)
                       }
                       "GPS_TRACKING_ON" -> {
+                        com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(
+                          activeChildId,
+                          gpsTrackingEnabled = true
+                        )
                         com.example.location.LiveLocationTracker.setGpsTrackingAllowed(true)
                         dao.setChildGpsTrackingEnabled(activeChildId, true)
+                        com.example.util.DeviceControlDebugger.logEvent(
+                          "РЕЖИМ_GPS",
+                          "Отслеживание GPS ВКЛЮЧЕНО родителем",
+                          "SUCCESS",
+                          "CHILD"
+                        )
                         launch(Dispatchers.Main) {
                           startGpsTracking(requestImmediateFix = true)
                         }
                       }
                       "GPS_TRACKING_OFF" -> {
+                        com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(
+                          activeChildId,
+                          gpsTrackingEnabled = false
+                        )
                         com.example.location.LiveLocationTracker.setGpsTrackingAllowed(false)
                         dao.setChildGpsTrackingEnabled(activeChildId, false)
+                        com.example.util.DeviceControlDebugger.logEvent(
+                          "РЕЖИМ_GPS",
+                          "Отслеживание GPS ВЫКЛЮЧЕНО родителем",
+                          "WARNING",
+                          "CHILD"
+                        )
                         launch(Dispatchers.Main) {
                           stopGpsTracking()
                         }
@@ -696,15 +830,33 @@ class KidsGuardBackgroundService : Service() {
                       }
                       "START_LIVE_STREAM" -> {
                         KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
+                        if (KidsGuardAccessibilityService.instance == null) {
+                          val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
+                          ScreenShotManager.triggerHardwareScreenCapture(appLabel, false) { item ->
+                            serviceScope.launch(Dispatchers.IO) {
+                              if (!item.base64Bitmap.isNullOrBlank()) {
+                                cloudSync.uploadScreenSnapshot(activeChildId, appLabel, item.base64Bitmap)
+                              } else {
+                                cloudSync.updateActiveAppOnly(activeChildId, appLabel)
+                              }
+                            }
+                          }
+                        }
                       }
                       "TAKE_SCREENSHOT" -> {
-                        val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
-                        ScreenShotManager.triggerHardwareScreenCapture(appLabel, false) { item ->
-                          serviceScope.launch(Dispatchers.IO) {
-                            if (!item.base64Bitmap.isNullOrBlank()) {
-                              cloudSync.uploadScreenSnapshot(activeChildId, appLabel, item.base64Bitmap)
-                            } else {
-                              cloudSync.updateActiveAppOnly(activeChildId, appLabel)
+                        KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
+                        val accSvc = KidsGuardAccessibilityService.instance
+                        if (accSvc != null) {
+                          accSvc.triggerImmediateCaptureNow()
+                        } else {
+                          val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
+                          ScreenShotManager.triggerHardwareScreenCapture(appLabel, false) { item ->
+                            serviceScope.launch(Dispatchers.IO) {
+                              if (!item.base64Bitmap.isNullOrBlank()) {
+                                cloudSync.uploadScreenSnapshot(activeChildId, appLabel, item.base64Bitmap)
+                              } else {
+                                cloudSync.updateActiveAppOnly(activeChildId, appLabel)
+                              }
                             }
                           }
                         }
@@ -1032,6 +1184,11 @@ class KidsGuardBackgroundService : Service() {
 
   override fun onDestroy() {
     isRunning = false
+    if (activeChildId > 0L) {
+      try {
+        com.example.data.cloud.RealtimeCloudRelay.publishChildOffline(activeChildId)
+      } catch (_: Exception) {}
+    }
     try {
       unregisterReceiver(powerConnectionReceiver)
     } catch (_: Exception) {

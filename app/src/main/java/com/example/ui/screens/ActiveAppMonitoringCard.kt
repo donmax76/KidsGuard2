@@ -88,11 +88,17 @@ fun ActiveAppMonitoringCard(
     androidx.compose.runtime.mutableStateOf(false)
   }
 
+  var lastThumbReceivedAtMs by androidx.compose.runtime.remember(child?.id) {
+    androidx.compose.runtime.mutableStateOf(0L)
+  }
+
   val applyIncomingFrame: suspend (String?, String?, Long?) -> Unit = { remoteApp, remoteB64, ts ->
+    val nowMs = System.currentTimeMillis()
     if (!remoteApp.isNullOrBlank() && !remoteApp.contains("Определение")) {
       cloudActiveApp = remoteApp
     }
-    if (!remoteB64.isNullOrBlank()) {
+    val isFresh = ts == null || ts <= 0L || kotlin.math.abs(nowMs - ts) <= 20_000L
+    if (!remoteB64.isNullOrBlank() && isFresh) {
       val decodedBmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
         try {
           val bytes = android.util.Base64.decode(remoteB64, android.util.Base64.DEFAULT)
@@ -106,8 +112,8 @@ fun ActiveAppMonitoringCard(
       }
       if (decodedBmp != null) {
         cloudThumbBitmap = decodedBmp
-        val displayDate = if (ts != null && ts > 0L) java.util.Date(ts) else java.util.Date()
-        lastFrameTimeStr = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(displayDate)
+        lastThumbReceivedAtMs = nowMs
+        lastFrameTimeStr = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(nowMs))
         val existingTop = ScreenShotManager.capturedScreens.value.firstOrNull()?.base64Bitmap
         if (existingTop != remoteB64 && child != null) {
           ScreenShotManager.addCapturedItem(
@@ -147,9 +153,15 @@ fun ActiveAppMonitoringCard(
     }
     try {
       cloudSync.sendRemoteCommand(cId, "START_LIVE_STREAM", "")
+      cloudSync.sendRemoteCommand(cId, "TAKE_SCREENSHOT", "")
     } catch (_: Exception) {}
     while (isPollingActive) {
       try {
+        val nowMs = System.currentTimeMillis()
+        if (cloudThumbBitmap != null && lastThumbReceivedAtMs > 0L && (nowMs - lastThumbReceivedAtMs > 20_000L)) {
+          cloudThumbBitmap = null
+        }
+        cloudSync.sendRemoteCommand(cId, "TAKE_SCREENSHOT", "")
         val polled = cloudSync.pollLatestScreenSnapshot(cId)
         pollCount++
         if (polled != null) {

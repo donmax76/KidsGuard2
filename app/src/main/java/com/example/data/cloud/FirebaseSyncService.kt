@@ -52,17 +52,11 @@ class FirebaseSyncService(context: Context) {
       for (attempt in 0..14) {
         val relayChildren = RealtimeCloudRelay.pollChildrenFromRelay()
         val matchedRelay = relayChildren.firstOrNull {
-          it.pairingCode.replace("-", "").replace(" ", "").uppercase() == digitsOnly ||
-            it.id.toString() == digitsOnly
+          val candidateDigits = it.pairingCode.replace("-", "").replace(" ", "").uppercase()
+          candidateDigits.isNotEmpty() && candidateDigits == digitsOnly
         }
         if (matchedRelay != null) {
           return matchedRelay
-        }
-        // If there is exactly 1 child profile in the family relay (e.g. "Назрин"), reuse that exact profile
-        // and update its pairingCode so reinstalling/re-pairing NEVER creates a second duplicate child!
-        if (attempt >= 6 && relayChildren.size == 1 && numericDigits.length == 6) {
-          val singleChild = relayChildren.first()
-          return singleChild.copy(pairingCode = formattedCode)
         }
         if (attempt == 0 || attempt == 3 || attempt == 7 || attempt == 11) {
           DirectP2pSocketEngine.requestPairingCodeDiscovery(clean)
@@ -185,10 +179,14 @@ class FirebaseSyncService(context: Context) {
   fun observeRemoteCommands(childId: Long): Flow<Pair<String, String>?> = callbackFlow {
     val targetId = if (childId > 0L) childId else 1L
     var lastHandledSig = ""
+    var lastHandledAt = 0L
     val emitDedup: (String, String, Long) -> Unit = { cmd, payload, ts ->
-      val sig = "${cmd}_${payload}_$ts"
-      if (cmd.isNotBlank() && kotlin.math.abs(System.currentTimeMillis() - ts) < 180_000L && sig != lastHandledSig) {
+      val now = System.currentTimeMillis()
+      val sig = "${cmd}_${payload.trim()}"
+      val dedupWindow = if (cmd == "LOUD_RING") 10_000L else 4_000L
+      if (cmd.isNotBlank() && kotlin.math.abs(now - ts) < 35_000L && (sig != lastHandledSig || (now - lastHandledAt) > dedupWindow)) {
         lastHandledSig = sig
+        lastHandledAt = now
         trySend(Pair(cmd, payload))
       }
     }
@@ -380,9 +378,6 @@ class FirebaseSyncService(context: Context) {
 
   suspend fun sendChatMessage(message: ChatMessageEntity) {
     RealtimeCloudRelay.publishChatMessage(message)
-    if (message.isAttentionSignal) {
-      sendRemoteCommand(message.childId, "LOUD_RING", message.text)
-    }
   }
 
   fun observeChatMessages(childId: Long): Flow<List<ChatMessageEntity>> = callbackFlow {
@@ -450,14 +445,17 @@ class FirebaseSyncService(context: Context) {
     val targetId = if (childId > 0L) childId else 1L
     var lastEmittedFrameTs = 0L
     var lastEmittedAppName = ""
+    var lastEmittedB64Hash = 0
 
     val directJob = launch {
       DirectP2pSocketEngine.framesByChild.collect { _ ->
         val frame = DirectP2pSocketEngine.getLatestDirectFrameForChild(targetId)
         if (frame != null && (frame.first.isNotBlank() || frame.second.isNotBlank())) {
-          if (frame.third != lastEmittedFrameTs || frame.first != lastEmittedAppName) {
+          val b64Hash = frame.second.hashCode()
+          if (frame.third != lastEmittedFrameTs || frame.first != lastEmittedAppName || b64Hash != lastEmittedB64Hash) {
             lastEmittedFrameTs = frame.third
             lastEmittedAppName = frame.first
+            lastEmittedB64Hash = b64Hash
             trySend(Pair(frame.first, frame.second))
           }
         }

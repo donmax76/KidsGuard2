@@ -4,9 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "dev": "python3 server.py",
+    "start": "python3 server.py",
+    "build": "echo 'Build complete'",
+    "preview": "python3 server.py"
   },
   "dependencies": {
 

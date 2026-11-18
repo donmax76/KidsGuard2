@@ -78,12 +78,19 @@ fun VpsRelaySetupPanel(onSave: (enabled: Boolean, host: String, port: Int, passw
       )
       Spacer(Modifier.height(8.dp))
       Button(onClick = {
+        val cleanHost = host.trim()
+        val effectiveEnabled = enabled && cleanHost.isNotBlank()
+        enabled = effectiveEnabled
         val p = port.toIntOrNull() ?: 443
-        onSave(enabled, host.trim(), p, password, roomCode.trim())
-        DirectP2pSocketEngine.configureVpsRelay(enabled, host.trim(), p, password, roomCode.trim())
+        onSave(effectiveEnabled, cleanHost, p, password, roomCode.trim())
+        DirectP2pSocketEngine.configureVpsRelay(effectiveEnabled, cleanHost, p, password, roomCode.trim())
         saved = true
       }, modifier = Modifier.fillMaxWidth()) {
-        Text(if (saved) "✓ Сохранено" else "Сохранить и подключить VPS")
+        Text(
+          if (saved && host.trim().isBlank() && !enabled) "✓ VPS выключен (работают P2P-брокеры)"
+          else if (saved) "✓ Сохранено и отправлено ребёнку"
+          else "Сохранить и подключить VPS"
+        )
       }
     }
   }

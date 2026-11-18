@@ -220,6 +220,18 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
         onDismiss = { isDebugLogsDialogVisible = false },
         onRunSelfTest = {
           viewModel.runControlSelfTest()
+        },
+        onRequestChildLogs = {
+          val cid = activeChild?.id ?: allChildren.firstOrNull()?.id ?: 1L
+          viewModel.sendCustomCloudCommand(cid, "REQUEST_DEBUG_LOGS", "1")
+        },
+        onToggleRemoteLogging = { enabled ->
+          val cid = activeChild?.id ?: allChildren.firstOrNull()?.id ?: 1L
+          viewModel.sendCustomCloudCommand(cid, "SET_REMOTE_LOGGING", if (enabled) "ON" else "OFF")
+        },
+        onClearChildLogs = {
+          val cid = activeChild?.id ?: allChildren.firstOrNull()?.id ?: 1L
+          viewModel.sendCustomCloudCommand(cid, "CLEAR_DEBUG_LOGS", "1")
         }
       )
     }
@@ -635,6 +647,18 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
       onDismiss = { isDebugLogsDialogVisible = false },
       onRunSelfTest = {
         viewModel.runControlSelfTest()
+      },
+      onRequestChildLogs = {
+        val cid = activeChild?.id ?: allChildren.firstOrNull()?.id ?: 1L
+        viewModel.sendCustomCloudCommand(cid, "REQUEST_DEBUG_LOGS", "1")
+      },
+      onToggleRemoteLogging = { enabled ->
+        val cid = activeChild?.id ?: allChildren.firstOrNull()?.id ?: 1L
+        viewModel.sendCustomCloudCommand(cid, "SET_REMOTE_LOGGING", if (enabled) "ON" else "OFF")
+      },
+      onClearChildLogs = {
+        val cid = activeChild?.id ?: allChildren.firstOrNull()?.id ?: 1L
+        viewModel.sendCustomCloudCommand(cid, "CLEAR_DEBUG_LOGS", "1")
       }
     )
   }

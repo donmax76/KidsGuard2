@@ -46,9 +46,10 @@ object SoundAlertManager {
   @Synchronized
   fun playLoudAttentionSignal(context: Context) {
     val now = System.currentTimeMillis()
-    // Deduplicate simultaneous triggers from BackgroundService + AccessibilityService + Repository
-    if (isPlaying && (now - lastStartTimeMs) < 4500L) {
-      Log.d(TAG, "Siren is already playing (${now - lastStartTimeMs}ms elapsed), skipping duplicate trigger")
+    // Deduplicate simultaneous or delayed triggers across brokers (emqx, hivemq, VPS, LAN)
+    // for the full 12-second siren duration so a single click never plays the siren twice.
+    if ((isPlaying && (now - lastStartTimeMs) < 13_000L) || (now - lastStartTimeMs) < 12_500L) {
+      Log.d(TAG, "Siren is already playing or recently triggered (${now - lastStartTimeMs}ms elapsed), skipping duplicate trigger")
       return
     }
 

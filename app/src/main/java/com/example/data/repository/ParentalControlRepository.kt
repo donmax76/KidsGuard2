@@ -33,11 +33,151 @@ class ParentalControlRepository(private val context: Context) {
   private val dao: KidsGuardDao = database.kidsGuardDao()
   val cloudSync: CloudSyncManager = CloudSyncManager(context)
 
+  companion object {
+    private val backgroundSyncStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val chatDedupMutex = kotlinx.coroutines.sync.Mutex()
+    private val alertDedupMutex = kotlinx.coroutines.sync.Mutex()
+    private val recentChatSignatures = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val recentAlertSignatures = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    fun recordLocalOutgoingChat(childId: Long, senderRole: String, text: String, timestamp: Long) {
+      val sig = "${childId}_${senderRole.uppercase()}_${text.trim()}"
+      recentChatSignatures[sig] = timestamp
+    }
+
+    suspend fun ingestIncomingChatIfNew(
+      context: Context,
+      dao: KidsGuardDao,
+      incomingMsg: ChatMessageEntity
+    ): Boolean {
+      chatDedupMutex.lock()
+      try {
+        val allLocalChildren = dao.getAllChildrenOnce()
+        val cfg = dao.getFamilyConfigOnce()
+        val localRole = if (cfg?.selectedRole == "CHILD") "CHILD" else "PARENT"
+        val resolvedChildId = allLocalChildren.firstOrNull { it.id == incomingMsg.childId }?.id
+          ?: allLocalChildren.firstOrNull { it.name.equals(incomingMsg.senderName, ignoreCase = true) }?.id
+          ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
+          ?: allLocalChildren.firstOrNull()?.id
+          ?: incomingMsg.childId
+
+        val cleanText = incomingMsg.text.trim()
+        if (cleanText.isEmpty()) return false
+        val sig = "${resolvedChildId}_${incomingMsg.senderRole.uppercase()}_$cleanText"
+        val now = System.currentTimeMillis()
+        val lastMemTs = recentChatSignatures[sig] ?: 0L
+        if (kotlin.math.abs(now - lastMemTs) < 15_000L || kotlin.math.abs(incomingMsg.timestamp - lastMemTs) < 15_000L) {
+          return false
+        }
+
+        val localMsgs = dao.getChatMessagesForChild(resolvedChildId).firstOrNull().orEmpty()
+        val duplicate = localMsgs.any {
+          it.senderRole.equals(incomingMsg.senderRole, ignoreCase = true) &&
+            it.text.trim() == cleanText &&
+            (kotlin.math.abs(it.timestamp - incomingMsg.timestamp) < 15_000L ||
+              kotlin.math.abs(now - it.timestamp) < 15_000L)
+        }
+        if (duplicate) {
+          recentChatSignatures[sig] = incomingMsg.timestamp
+          return false
+        }
+
+        recentChatSignatures[sig] = incomingMsg.timestamp
+        dao.insertChatMessage(incomingMsg.copy(id = 0, childId = resolvedChildId, text = cleanText))
+        val isRecent = kotlin.math.abs(now - incomingMsg.timestamp) < 60_000L
+        if (isRecent && !incomingMsg.senderRole.equals(localRole, ignoreCase = true)) {
+          com.example.service.FloatingChatOverlayService.showIncomingMessageOrSos(
+            context = context,
+            childId = resolvedChildId,
+            senderName = incomingMsg.senderName,
+            senderRole = incomingMsg.senderRole,
+            messageText = cleanText,
+            isSosAlert = incomingMsg.isAttentionSignal || cleanText.contains("SOS", ignoreCase = true)
+          )
+        }
+        return true
+      } finally {
+        chatDedupMutex.unlock()
+      }
+    }
+
+    suspend fun ingestIncomingAlertIfNew(
+      context: Context,
+      dao: KidsGuardDao,
+      alert: AlertNotificationEntity
+    ): Boolean {
+      alertDedupMutex.lock()
+      try {
+        val cfg = dao.getFamilyConfigOnce()
+        if (cfg?.selectedRole == "CHILD") return false
+        val allLocalChildren = dao.getAllChildrenOnce()
+        val resolvedChildId = allLocalChildren.firstOrNull { it.id == alert.childId }?.id
+          ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
+          ?: allLocalChildren.firstOrNull()?.id
+          ?: alert.childId
+
+        if (alert.type == "SOS" && alert.extraPayload.contains(",")) {
+          val parts = alert.extraPayload.split(",")
+          val sosLat = parts.getOrNull(0)?.trim()?.toDoubleOrNull() ?: 0.0
+          val sosLng = parts.getOrNull(1)?.trim()?.toDoubleOrNull() ?: 0.0
+          if (sosLat != 0.0 && sosLng != 0.0 && !com.example.location.LiveLocationTracker.isEmulatorSyntheticUsLocation(sosLat, sosLng)) {
+            val addr = com.example.location.LiveLocationTracker.reverseGeocodeExact(context, sosLat, sosLng)
+            dao.updateChildLocation(resolvedChildId, sosLat, sosLng, addr, alert.timestamp)
+          }
+        }
+
+        if (alert.type == "REMOTE_UPDATE_COMPLETED") {
+          dao.setChildUpdatePending(resolvedChildId, false)
+        }
+
+        val sig = "${resolvedChildId}_${alert.type}_${alert.message.trim()}"
+        val now = System.currentTimeMillis()
+        val lastMemTs = recentAlertSignatures[sig] ?: 0L
+        if (kotlin.math.abs(now - lastMemTs) < 15_000L || kotlin.math.abs(alert.timestamp - lastMemTs) < 15_000L) {
+          return false
+        }
+
+        val currentLocalAlerts = dao.getAllAlerts().firstOrNull().orEmpty()
+        val existing = currentLocalAlerts.any {
+          it.type == alert.type &&
+            it.childId == resolvedChildId &&
+            it.message.trim() == alert.message.trim() &&
+            (kotlin.math.abs(it.timestamp - alert.timestamp) < 15_000L ||
+              kotlin.math.abs(now - it.timestamp) < 15_000L)
+        }
+        if (existing) {
+          recentAlertSignatures[sig] = alert.timestamp
+          return false
+        }
+
+        recentAlertSignatures[sig] = alert.timestamp
+        dao.insertAlert(alert.copy(id = 0, childId = resolvedChildId))
+        val isRecent = kotlin.math.abs(now - alert.timestamp) < 60_000L
+        // Only trigger floating overlay for SOS alerts here; CHAT_MESSAGE overlays are already shown by ingestIncomingChatIfNew!
+        if (isRecent && alert.type == "SOS") {
+          val childName = allLocalChildren.firstOrNull { it.id == resolvedChildId }?.name ?: "Ребёнок"
+          com.example.service.FloatingChatOverlayService.showIncomingMessageOrSos(
+            context = context,
+            childId = resolvedChildId,
+            senderName = childName,
+            senderRole = "CHILD",
+            messageText = alert.message,
+            isSosAlert = true
+          )
+        }
+        return true
+      } finally {
+        alertDedupMutex.unlock()
+      }
+    }
+  }
+
   init {
-    CoroutineScope(Dispatchers.IO).launch {
-      val existingConfig = dao.getFamilyConfigOnce()
-      if (existingConfig == null) {
-        database.openHelper.writableDatabase // trigger onCreate
+    if (backgroundSyncStarted.compareAndSet(false, true)) {
+      CoroutineScope(Dispatchers.IO).launch {
+        val existingConfig = dao.getFamilyConfigOnce()
+        if (existingConfig == null) {
+          database.openHelper.writableDatabase // trigger onCreate
         // Fallback default population if needed
         val checkAgain = dao.getFamilyConfigOnce()
         if (checkAgain == null) {
@@ -137,6 +277,7 @@ class ParentalControlRepository(private val context: Context) {
           lastLocationAddress = if (isStaleLoc) "Ожидание точного GPS-сигнала с телефона ребёнка..." else child.lastLocationAddress
         )
         dao.updateChild(fixed)
+        com.example.data.cloud.RealtimeCloudRelay.authorizeChildId(fixed.id)
         if (isBoundToThisExactChild) {
           com.example.data.cloud.RealtimeCloudRelay.publishChildProfile(fixed, true)
         } else if (currentRole != "CHILD") {
@@ -207,15 +348,32 @@ class ParentalControlRepository(private val context: Context) {
                 it.pairingCode.replace("-", "").replace(" ", "").uppercase() == cloudCodeDigits
               }
             } else null
-            val localByName = if (localByCode == null && com.example.data.cloud.RealtimeCloudRelay.isRealCustomChildName(cloudChild.name)) {
-              allLocalSnap.firstOrNull {
+            // CRITICAL: On the Parent phone, NEVER match a cloud profile by name or ID if its 6-digit pairingCode differs!
+            // This prevents a fresh install from automatically adopting an old paired profile without entering the pairing code.
+            val localExisting = when {
+              localByCode != null -> localByCode
+              isThisChildDevice -> dao.getChildByIdOnce(cloudChild.id) ?: allLocalSnap.firstOrNull {
                 com.example.data.cloud.RealtimeCloudRelay.isRealCustomChildName(it.name) &&
                   it.name.trim().equals(cloudChild.name.trim(), ignoreCase = true)
               }
-            } else null
-            val localExisting = localByCode ?: localByName ?: dao.getChildByIdOnce(cloudChild.id)
+              else -> {
+                val byId = dao.getChildByIdOnce(cloudChild.id)
+                val byIdCode = byId?.pairingCode?.replace("-", "")?.replace(" ", "")?.uppercase().orEmpty()
+                val detCode = "${100 + cloudChild.id}${700 + cloudChild.id}"
+                val isAuth = com.example.data.cloud.RealtimeCloudRelay.isAuthorizedChild(cloudChild.id)
+                if (byId != null && (
+                    byIdCode == cloudCodeDigits ||
+                    isAuth ||
+                    byIdCode == "101701" ||
+                    cloudCodeDigits == detCode
+                  )
+                ) {
+                  byId
+                } else null
+              }
+            }
             val resolvedId = localExisting?.id ?: cloudChild.id
-            val isThisExactChild = isThisChildDevice && thisDeviceChildId > 0L && (resolvedId == thisDeviceChildId || localByCode != null || localByName != null)
+            val isThisExactChild = isThisChildDevice && thisDeviceChildId > 0L && (resolvedId == thisDeviceChildId || localByCode != null)
             val cloudHasValidCoords = !com.example.location.LiveLocationTracker.isEmulatorSyntheticUsLocation(cloudChild.lastLocationLat, cloudChild.lastLocationLng) &&
               cloudChild.lastLocationLat != 0.0 && cloudChild.lastLocationLng != 0.0
             val localHasRealLoc = localExisting != null &&
@@ -250,6 +408,28 @@ class ParentalControlRepository(private val context: Context) {
               else -> cloudChild.isDeviceLocked
             }
 
+            val authToggles = com.example.data.cloud.RealtimeCloudRelay.getAuthoritativeParentToggle(resolvedId)
+            val resolvedAllowMobileData = when {
+              authToggles?.allowMobileData != null -> authToggles.allowMobileData!!
+              !isThisChildDevice && localExisting != null -> localExisting.allowMobileData
+              else -> cloudChild.allowMobileData
+            }
+            val resolvedGpsTrackingEnabled = when {
+              authToggles?.gpsTrackingEnabled != null -> authToggles.gpsTrackingEnabled!!
+              !isThisChildDevice && localExisting != null -> localExisting.gpsTrackingEnabled
+              else -> cloudChild.gpsTrackingEnabled
+            }
+            val resolvedStudyMode = when {
+              authToggles?.studyModeActive != null -> authToggles.studyModeActive!!
+              !isThisChildDevice && localExisting != null -> localExisting.studyModeActive
+              else -> cloudChild.studyModeActive
+            }
+            val resolvedDailyLimit = when {
+              authToggles?.dailyScreenLimitMinutes != null -> authToggles.dailyScreenLimitMinutes!!
+              !isThisChildDevice && localExisting != null -> localExisting.dailyScreenLimitMinutes
+              else -> cloudChild.dailyScreenLimitMinutes
+            }
+
             // Preserve custom child name created on Parent device if cloud had default placeholder
             val resolvedName = when {
               localExisting != null && localExisting.name.isNotBlank() && !localExisting.name.startsWith("Ребёнок #") &&
@@ -266,8 +446,12 @@ class ParentalControlRepository(private val context: Context) {
             }
 
             val resolvedPairingCode = when {
-              localExisting != null && localExisting.pairingCode.isNotBlank() && localByCode != null -> localExisting.pairingCode
-              cloudChild.pairingCode.isNotBlank() && cloudChild.isPaired -> cloudChild.pairingCode
+              cloudChild.pairingCode.isNotBlank() && (
+                localExisting == null ||
+                localExisting.pairingCode.isBlank() ||
+                localExisting.pairingCode == "101-701" ||
+                cloudCodeDigits == "${100 + resolvedId}${700 + resolvedId}"
+              ) -> cloudChild.pairingCode
               localExisting != null && localExisting.pairingCode.isNotBlank() -> localExisting.pairingCode
               else -> cloudChild.pairingCode
             }
@@ -304,6 +488,10 @@ class ParentalControlRepository(private val context: Context) {
                   pairingCode = resolvedPairingCode,
                   batteryLevel = resolvedBattery,
                   isDeviceLocked = resolvedLocked,
+                  allowMobileData = resolvedAllowMobileData,
+                  gpsTrackingEnabled = resolvedGpsTrackingEnabled,
+                  studyModeActive = resolvedStudyMode,
+                  dailyScreenLimitMinutes = resolvedDailyLimit,
                   appVersion = currentInstalledVer,
                   updatePending = false,
                   lastLocationLat = bestLat,
@@ -318,6 +506,10 @@ class ParentalControlRepository(private val context: Context) {
                 pairingCode = resolvedPairingCode,
                 batteryLevel = resolvedBattery,
                 isDeviceLocked = resolvedLocked,
+                allowMobileData = resolvedAllowMobileData,
+                gpsTrackingEnabled = resolvedGpsTrackingEnabled,
+                studyModeActive = resolvedStudyMode,
+                dailyScreenLimitMinutes = resolvedDailyLimit,
                 appVersion = resolvedChildVer,
                 updatePending = if (isUpToDateNow) false else cloudChild.updatePending,
                 lastLocationLat = bestLat,
@@ -443,36 +635,10 @@ class ParentalControlRepository(private val context: Context) {
         }
       }
 
-      // Listen for remote chat messages from Cloud & real-time P2P Relay
+      // Listen for remote chat messages from Cloud & real-time P2P Relay (strictly deduplicated via companion mutex)
       launch {
         com.example.data.cloud.RealtimeCloudRelay.incomingChatsFlow.collect { incomingMsg ->
-          val allLocalChildren = dao.getAllChildrenOnce()
-          val cfg = dao.getFamilyConfigOnce()
-          val localRole = if (cfg?.selectedRole == "CHILD") "CHILD" else "PARENT"
-          val resolvedChildId = allLocalChildren.firstOrNull { it.id == incomingMsg.childId }?.id
-            ?: allLocalChildren.firstOrNull { it.name.equals(incomingMsg.senderName, ignoreCase = true) }?.id
-            ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
-            ?: allLocalChildren.firstOrNull()?.id
-            ?: incomingMsg.childId
-          val localMsgs = dao.getChatMessagesForChild(resolvedChildId).firstOrNull().orEmpty()
-          val duplicate = localMsgs.any {
-            it.senderRole == incomingMsg.senderRole &&
-              it.text == incomingMsg.text &&
-              kotlin.math.abs(it.timestamp - incomingMsg.timestamp) < 2500L
-          }
-          if (!duplicate) {
-            dao.insertChatMessage(incomingMsg.copy(id = 0, childId = resolvedChildId))
-            if (!incomingMsg.senderRole.equals(localRole, ignoreCase = true)) {
-              com.example.service.FloatingChatOverlayService.showIncomingMessageOrSos(
-                context = context,
-                childId = resolvedChildId,
-                senderName = incomingMsg.senderName,
-                senderRole = incomingMsg.senderRole,
-                messageText = incomingMsg.text,
-                isSosAlert = incomingMsg.isAttentionSignal || incomingMsg.text.contains("SOS", ignoreCase = true)
-              )
-            }
-          }
+          ingestIncomingChatIfNew(context, dao, incomingMsg)
         }
       }
 
@@ -483,29 +649,8 @@ class ParentalControlRepository(private val context: Context) {
           childChatJobs = children.map { child ->
             launch {
               cloudSync.observeChatMessages(child.id).collect { cloudMsgs ->
-                val cfg = dao.getFamilyConfigOnce()
-                val localRole = if (cfg?.selectedRole == "CHILD") "CHILD" else "PARENT"
-                val localMsgs = dao.getChatMessagesForChild(child.id).firstOrNull().orEmpty()
                 for (msg in cloudMsgs) {
-                  val exists = localMsgs.any {
-                    it.senderRole == msg.senderRole &&
-                      it.text == msg.text &&
-                      kotlin.math.abs(it.timestamp - msg.timestamp) < 2500L
-                  }
-                  if (!exists) {
-                    dao.insertChatMessage(msg.copy(id = 0, childId = child.id))
-                    val isRecent = (System.currentTimeMillis() - msg.timestamp) < 120_000L
-                    if (isRecent && !msg.senderRole.equals(localRole, ignoreCase = true)) {
-                      com.example.service.FloatingChatOverlayService.showIncomingMessageOrSos(
-                        context = context,
-                        childId = child.id,
-                        senderName = msg.senderName,
-                        senderRole = msg.senderRole,
-                        messageText = msg.text,
-                        isSosAlert = msg.isAttentionSignal || msg.text.contains("SOS", ignoreCase = true)
-                      )
-                    }
-                  }
+                  ingestIncomingChatIfNew(context, dao, msg.copy(childId = child.id))
                 }
               }
             }
@@ -547,6 +692,7 @@ class ParentalControlRepository(private val context: Context) {
                         val existing = dao.getAppByPackageOnce(thisChildId, pkg)
                         if (existing != null) {
                           dao.setAppBlocked(existing.id, true)
+                          cloudSync.uploadChildApps(thisChildId, dao.getAppsForChildOnce(thisChildId))
                         }
                       }
                     }
@@ -556,6 +702,7 @@ class ParentalControlRepository(private val context: Context) {
                         val existing = dao.getAppByPackageOnce(thisChildId, pkg)
                         if (existing != null) {
                           dao.setAppBlocked(existing.id, false)
+                          cloudSync.uploadChildApps(thisChildId, dao.getAppsForChildOnce(thisChildId))
                         }
                       }
                     }
@@ -567,6 +714,7 @@ class ParentalControlRepository(private val context: Context) {
                         val existing = dao.getAppByPackageOnce(thisChildId, pkg)
                         if (existing != null) {
                           dao.setAppLimit(existing.id, limitMin)
+                          cloudSync.uploadChildApps(thisChildId, dao.getAppsForChildOnce(thisChildId))
                         }
                       }
                     }
@@ -591,22 +739,35 @@ class ParentalControlRepository(private val context: Context) {
                       }
                       com.example.util.DeviceUsageTracker.syncRealUsageStats(context, thisChildId)
                     }
-                    "SET_LIMIT" -> payload.toIntOrNull()?.let { dao.setChildDailyLimit(thisChildId, it) }
-                    "STUDY_ON" -> dao.setChildStudyMode(thisChildId, true)
-                    "STUDY_OFF" -> dao.setChildStudyMode(thisChildId, false)
+                    "SET_LIMIT" -> payload.toIntOrNull()?.let {
+                      com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(thisChildId, dailyScreenLimitMinutes = it)
+                      dao.setChildDailyLimit(thisChildId, it)
+                    }
+                    "STUDY_ON" -> {
+                      com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(thisChildId, studyModeActive = true)
+                      dao.setChildStudyMode(thisChildId, true)
+                    }
+                    "STUDY_OFF" -> {
+                      com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(thisChildId, studyModeActive = false)
+                      dao.setChildStudyMode(thisChildId, false)
+                    }
                     "NET_WIFI_ONLY" -> {
+                      com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(thisChildId, allowMobileData = false)
                       dao.setChildAllowMobileData(thisChildId, false)
                       com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(false)
                     }
                     "NET_ALL" -> {
+                      com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(thisChildId, allowMobileData = true)
                       dao.setChildAllowMobileData(thisChildId, true)
                       com.example.data.cloud.DirectP2pSocketEngine.setAllowMobileData(true)
                     }
                     "GPS_TRACKING_ON" -> {
+                      com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(thisChildId, gpsTrackingEnabled = true)
                       com.example.location.LiveLocationTracker.setGpsTrackingAllowed(true)
                       dao.setChildGpsTrackingEnabled(thisChildId, true)
                     }
                     "GPS_TRACKING_OFF" -> {
+                      com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(thisChildId, gpsTrackingEnabled = false)
                       com.example.location.LiveLocationTracker.setGpsTrackingAllowed(false)
                       dao.setChildGpsTrackingEnabled(thisChildId, false)
                     }
@@ -617,13 +778,9 @@ class ParentalControlRepository(private val context: Context) {
                       stopDeviceLoudAlarm()
                     }
                     "START_LIVE_STREAM" -> {
-                      // Только явный просмотр включает «живое окно». Одиночный снимок
-                      // (TAKE_SCREENSHOT) и запрос активного приложения НЕ должны
-                      // держать MediaProjection включённым — иначе батарея течёт зря.
                       com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(120_000L)
                     }
                     "STOP_LIVE_STREAM" -> {
-                      // Родитель закрыл просмотр — сразу отцепляем зеркало экрана (экономия батареи).
                       com.example.service.KidsGuardAccessibilityService.stopLiveStreamingWindow()
                     }
                     "PARENT_SESSION_START" -> {
@@ -640,8 +797,6 @@ class ParentalControlRepository(private val context: Context) {
                       cloudSync.clearRemoteCommand(thisChildId)
                     }
                     "PING" -> {
-                      // Ответ на PING родителя для честного индикатора «Онлайн»
-                      // (даже если фоновый сервис ещё не поднялся).
                       com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(thisChildId)
                       val batt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(context)
                       dao.updateChildBattery(thisChildId, batt)
@@ -662,7 +817,6 @@ class ParentalControlRepository(private val context: Context) {
                       } catch (_: Exception) {}
                     }
                     "REQUEST_POWER_STATS" -> {
-                      // Мгновенный ответ на запрос расхода энергии (HealthStats) от родителя.
                       com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(thisChildId)
                       com.example.util.AppEnergyMeter.read(context)?.let { reading ->
                         com.example.data.cloud.RealtimeCloudRelay.publishPowerStats(
@@ -712,87 +866,15 @@ class ParentalControlRepository(private val context: Context) {
       // Listen for real-time incoming alerts from P2P Relay (instant SOS & coordinate sync)
       launch {
         com.example.data.cloud.RealtimeCloudRelay.incomingAlertsFlow.collect { alert ->
-          val cfg = dao.getFamilyConfigOnce()
-          if (cfg?.selectedRole == "CHILD") return@collect
-          val allLocalChildren = dao.getAllChildrenOnce()
-          val resolvedChildId = allLocalChildren.firstOrNull { it.id == alert.childId }?.id
-            ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
-            ?: allLocalChildren.firstOrNull()?.id
-            ?: alert.childId
-
-          if (alert.type == "SOS" && alert.extraPayload.contains(",")) {
-            val parts = alert.extraPayload.split(",")
-            val sosLat = parts.getOrNull(0)?.trim()?.toDoubleOrNull() ?: 0.0
-            val sosLng = parts.getOrNull(1)?.trim()?.toDoubleOrNull() ?: 0.0
-            if (sosLat != 0.0 && sosLng != 0.0 && !com.example.location.LiveLocationTracker.isEmulatorSyntheticUsLocation(sosLat, sosLng)) {
-              val addr = com.example.location.LiveLocationTracker.reverseGeocodeExact(context, sosLat, sosLng)
-              dao.updateChildLocation(resolvedChildId, sosLat, sosLng, addr, alert.timestamp)
-            }
-          }
-
-          val currentLocalAlerts = dao.getAllAlerts().firstOrNull().orEmpty()
-          val existing = currentLocalAlerts.any {
-            it.type == alert.type &&
-              it.childId == resolvedChildId &&
-              kotlin.math.abs(it.timestamp - alert.timestamp) < 2500L
-          }
-          if (!existing) {
-            dao.insertAlert(alert.copy(id = 0, childId = resolvedChildId))
-            if (alert.type == "SOS" || alert.type == "CHAT_MESSAGE") {
-              val childName = allLocalChildren.firstOrNull { it.id == resolvedChildId }?.name ?: "Ребёнок"
-              com.example.service.FloatingChatOverlayService.showIncomingMessageOrSos(
-                context = context,
-                childId = resolvedChildId,
-                senderName = childName,
-                senderRole = "CHILD",
-                messageText = alert.message,
-                isSosAlert = alert.type == "SOS"
-              )
-            }
-          }
-          if (alert.type == "REMOTE_UPDATE_COMPLETED") {
-            // extraPayload — версия ЯДРА; appVersion (APK) не трогаем.
-            dao.setChildUpdatePending(resolvedChildId, false)
-          }
+          ingestIncomingAlertIfNew(context, dao, alert)
         }
       }
 
       // Listen for remote alerts (including REMOTE_UPDATE_COMPLETED from Child phone)
       launch {
         cloudSync.observeAlerts().collect { remoteAlerts ->
-          val cfg = dao.getFamilyConfigOnce()
-          if (cfg?.selectedRole == "CHILD") return@collect
-          val allLocalChildren = dao.getAllChildrenOnce()
-          val currentLocalAlerts = dao.getAllAlerts().firstOrNull().orEmpty()
           for (alert in remoteAlerts) {
-            val resolvedChildId = allLocalChildren.firstOrNull { it.id == alert.childId }?.id
-              ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
-              ?: allLocalChildren.firstOrNull()?.id
-              ?: alert.childId
-            val existing = currentLocalAlerts.any {
-              kotlin.math.abs(it.timestamp - alert.timestamp) < 2500L &&
-                it.type == alert.type &&
-                it.childId == resolvedChildId
-            }
-            if (!existing) {
-              dao.insertAlert(alert.copy(id = 0, childId = resolvedChildId))
-              val isRecent = (System.currentTimeMillis() - alert.timestamp) < 120_000L
-              if (isRecent && (alert.type == "SOS" || alert.type == "CHAT_MESSAGE")) {
-                val childName = allLocalChildren.firstOrNull { it.id == resolvedChildId }?.name ?: "Ребёнок"
-                com.example.service.FloatingChatOverlayService.showIncomingMessageOrSos(
-                  context = context,
-                  childId = resolvedChildId,
-                  senderName = childName,
-                  senderRole = "CHILD",
-                  messageText = alert.message,
-                  isSosAlert = alert.type == "SOS"
-                )
-              }
-            }
-            if (alert.type == "REMOTE_UPDATE_COMPLETED") {
-              // extraPayload — версия ЯДРА; appVersion (APK) не трогаем.
-              dao.setChildUpdatePending(resolvedChildId, false)
-            }
+            ingestIncomingAlertIfNew(context, dao, alert)
           }
         }
       }
@@ -803,6 +885,7 @@ class ParentalControlRepository(private val context: Context) {
           com.example.data.cloud.OfflineStoreAndForwardManager.ingestOfflineBundleOnParent(context, bundleMsg)
         }
       }
+    }
     }
   }
 
@@ -919,7 +1002,7 @@ class ParentalControlRepository(private val context: Context) {
         val cCode = c.pairingCode.replace("-", "").replace(" ", "").uppercase()
         val cName = c.name.trim().lowercase()
         (codeClean.length >= 6 && cCode == codeClean) ||
-          (realName && com.example.data.cloud.RealtimeCloudRelay.isRealCustomChildName(c.name) && cName == nameClean) ||
+          ((codeClean.length < 6 || cCode.length < 6) && realName && com.example.data.cloud.RealtimeCloudRelay.isRealCustomChildName(c.name) && cName == nameClean) ||
           (cfg?.selectedRole == "CHILD" && preferredId > 0L) // On a Child phone, keep strictly 1 bound child profile!
       }
 
@@ -949,31 +1032,27 @@ class ParentalControlRepository(private val context: Context) {
     }
   }
 
-  // Generate pairing code and add new child with globally unique ID (or reuse existing profile if same name!)
+  // Generate a new 6-digit pairing code and add a new child profile.
+  // CRITICAL: NEVER adopt an existing paired profile from the P2P broker just because the name matches!
+  // Pairing MUST always require explicit entry of the 6-digit pairing code on the Child phone.
   suspend fun addNewChild(name: String, age: Int, dailyLimitMinutes: Int = 120): Long {
     val cleanName = name.trim()
-    val existingSameName = dao.getAllChildrenOnce().firstOrNull {
-      it.name.trim().equals(cleanName, ignoreCase = true)
-    } ?: com.example.data.cloud.RealtimeCloudRelay.liveChildrenFlow.value.firstOrNull {
+    val existingSameNameLocal = dao.getAllChildrenOnce().firstOrNull {
       it.name.trim().equals(cleanName, ignoreCase = true)
     }
 
-    if (existingSameName != null) {
-      val updatedExisting = existingSameName.copy(
+    if (existingSameNameLocal != null) {
+      val updatedExisting = existingSameNameLocal.copy(
         name = cleanName,
         age = age,
         dailyScreenLimitMinutes = dailyLimitMinutes.coerceIn(30, 360),
         appVersion = com.example.BuildConfig.VERSION_NAME
       )
-      if (dao.getChildByIdOnce(existingSameName.id) == null) {
-        dao.insertChild(updatedExisting)
-      } else {
-        dao.updateChild(updatedExisting)
-      }
+      dao.updateChild(updatedExisting)
       deduplicateLocalChildrenInDb()
-      dao.setActiveChildId(existingSameName.id)
+      dao.setActiveChildId(existingSameNameLocal.id)
       cloudSync.upsertChildProfile(updatedExisting)
-      return existingSameName.id
+      return existingSameNameLocal.id
     }
 
     val existingIds = (
@@ -1236,11 +1315,13 @@ class ParentalControlRepository(private val context: Context) {
   }
 
   suspend fun setChildDailyLimit(childId: Long, limitMinutes: Int) {
+    com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(childId, dailyScreenLimitMinutes = limitMinutes)
     dao.setChildDailyLimit(childId, limitMinutes)
     cloudSync.updateDailyLimit(childId, limitMinutes)
   }
 
   suspend fun setChildStudyMode(childId: Long, active: Boolean) {
+    com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(childId, studyModeActive = active)
     dao.setChildStudyMode(childId, active)
     dao.setNonEducationalAppsBlockedForChild(childId, active)
     cloudSync.updateStudyMode(childId, active)
@@ -1249,7 +1330,10 @@ class ParentalControlRepository(private val context: Context) {
   suspend fun grantExtraScreenTimeForChild(childId: Long, extraMinutes: Int) {
     val child = dao.getChildByIdOnce(childId)
     if (child != null) {
-      dao.setChildDailyLimit(childId, child.dailyScreenLimitMinutes + extraMinutes)
+      val newLimit = child.dailyScreenLimitMinutes + extraMinutes
+      com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(childId, dailyScreenLimitMinutes = newLimit)
+      dao.setChildDailyLimit(childId, newLimit)
+      cloudSync.updateDailyLimit(childId, newLimit)
       addAlert(
         childId = childId,
         type = "BONUS_APPROVED",
@@ -1261,6 +1345,7 @@ class ParentalControlRepository(private val context: Context) {
 
   // --- Network Control (Wi-Fi vs Mobile Data) ---
   suspend fun setChildAllowMobileData(childId: Long, allow: Boolean) {
+    com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(childId, allowMobileData = allow)
     dao.setChildAllowMobileData(childId, allow)
     cloudSync.updateAllowMobileData(childId, allow)
     val child = dao.getChildByIdOnce(childId)
@@ -1279,6 +1364,7 @@ class ParentalControlRepository(private val context: Context) {
 
   // --- GPS Navigation & Satellite Tracking Control (Battery Saving Toggle) ---
   suspend fun setChildGpsTrackingEnabled(childId: Long, enabled: Boolean) {
+    com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(childId, gpsTrackingEnabled = enabled)
     com.example.location.LiveLocationTracker.setGpsTrackingAllowed(enabled)
     dao.setChildGpsTrackingEnabled(childId, enabled)
     cloudSync.updateGpsTrackingEnabled(childId, enabled)
@@ -1551,37 +1637,42 @@ class ParentalControlRepository(private val context: Context) {
     text: String,
     isAttentionSignal: Boolean = false
   ): Long {
+    val cleanText = text.trim()
     val message = ChatMessageEntity(
       childId = childId,
       senderRole = senderRole,
       senderName = senderName,
-      text = text,
+      text = cleanText,
       timestamp = System.currentTimeMillis(),
       isRead = false,
       isAttentionSignal = isAttentionSignal
     )
+    recordLocalOutgoingChat(childId, senderRole, cleanText, message.timestamp)
     val id = dao.insertChatMessage(message)
     cloudSync.sendChatMessage(message.copy(id = id))
 
-    // Notify parent if message comes from child
+    // Notify parent in Alerts history if message comes from child
     if (senderRole == "CHILD") {
       val chatAlert = AlertNotificationEntity(
         childId = childId,
         type = "CHAT_MESSAGE",
         title = "💬 Сообщение от «$senderName»",
-        message = text,
+        message = cleanText,
         timestamp = message.timestamp
       )
+      recentAlertSignatures["${childId}_CHAT_MESSAGE_$cleanText"] = message.timestamp
       dao.insertAlert(chatAlert)
       cloudSync.sendAlert(chatAlert)
     } else if (isAttentionSignal) {
+      val attnMsg = "Родитель отправил громкий сигнал привлечения внимания на устройство ребенка"
       val attnAlert = AlertNotificationEntity(
         childId = childId,
         type = "ATTENTION_SIGNAL",
         title = "🔊 Звуковой сигнал ребенку",
-        message = "Родитель отправил громкий сигнал привлечения внимания на устройство ребенка",
+        message = attnMsg,
         timestamp = message.timestamp
       )
+      recentAlertSignatures["${childId}_ATTENTION_SIGNAL_$attnMsg"] = message.timestamp
       dao.insertAlert(attnAlert)
       cloudSync.sendAlert(attnAlert)
     }

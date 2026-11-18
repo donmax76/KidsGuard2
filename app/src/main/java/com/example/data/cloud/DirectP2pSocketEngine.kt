@@ -123,6 +123,9 @@ object DirectP2pSocketEngine {
   private val globalSockets = CopyOnWriteArrayList<Socket>()
   private val globalWriteLock = Any()
   private val retainedPacketsOutbox = ConcurrentHashMap<String, JSONObject>()
+  private val recentIncomingCmdSignatures = ConcurrentHashMap<String, Long>()
+  private val processedCmdIds = ConcurrentHashMap<String, Long>()
+  private val purgedBrokerHosts = java.util.Collections.synchronizedSet(HashSet<String>())
 
   // --- VPS / Cloudflare Relay (WebSocket MQTT поверх OkHttp) ---
   private const val VPS_PREFS = "kidsguard_vps_prefs"
@@ -254,13 +257,42 @@ object DirectP2pSocketEngine {
   }
 
   fun getLatestDirectFrameForChild(childId: Long): Triple<String, String, Long>? {
+    val now = System.currentTimeMillis()
     val map = _framesByChild.value
-    map[childId]?.let { return it }
-    val canonicalId = RealtimeCloudRelay.resolveCanonicalChildId(childId)
-    map[canonicalId]?.let { return it }
-    // Никакого «взять любой последний кадр»: иначе при переключении на ребёнка без
-    // кадров в диалоге мог показаться экран ДРУГОГО ребёнка.
-    return null
+    val raw = map[childId] ?: map[RealtimeCloudRelay.resolveCanonicalChildId(childId)] ?: return null
+    // Если картинке больше 20 секунд — никогда не выдаём старый скриншот за живой экран!
+    return if (raw.second.isNotBlank() && kotlin.math.abs(now - raw.third) > 20_000L) {
+      Triple(raw.first, "", raw.third)
+    } else {
+      raw
+    }
+  }
+
+  private fun clearRetainedTopicOnBrokers(topic: String) {
+    retainedPacketsOutbox.remove(topic)
+    try {
+      val body = ByteArrayOutputStream()
+      writeUtf8String(body, topic)
+      val bodyBytes = body.toByteArray()
+      val pkt = ByteArrayOutputStream()
+      pkt.write(0x31) // PUBLISH with retain=1 and 0-byte payload deletes retained message on MQTT broker
+      encodeRemainingLength(pkt, bodyBytes.size)
+      pkt.write(bodyBytes)
+      val packetBytes = pkt.toByteArray()
+      if (vpsEnabled && vpsConnected) {
+        try { vpsWebSocket?.send(ByteString.of(*packetBytes)) } catch (_: Exception) {}
+      }
+      for (out in globalTcpOuts.toList()) {
+        scope.launch(Dispatchers.IO) {
+          try {
+            synchronized(out) {
+              out.write(packetBytes)
+              out.flush()
+            }
+          } catch (_: Exception) {}
+        }
+      }
+    } catch (_: Exception) {}
   }
 
   fun clearDirectFrameForChild(childId: Long) {
@@ -268,18 +300,9 @@ object DirectP2pSocketEngine {
     currentMap.remove(childId)
     _framesByChild.value = currentMap
     childLanIps.remove(childId)
-    // Стираем старый retained-кадр с брокера пустым retained-пакетом.
-    try {
-      val cid = if (childId > 0) childId else 1L
-      val empty = JSONObject().apply {
-        put("type", "DIRECT_SCREEN_FRAME")
-        put("childId", cid)
-        put("activeAppName", "")
-        put("base64Bitmap", "")
-        put("timestamp", System.currentTimeMillis())
-      }
-      publishTcpSocketPacket("$TOPIC_SCREEN/$cid", empty, retain = true)
-    } catch (_: Exception) {}
+    // Стираем старый retained-кадр с брокера настоящим пустым (0 байт) retained-пакетом MQTT 0x31
+    val cid = if (childId > 0) childId else 1L
+    clearRetainedTopicOnBrokers("$TOPIC_SCREEN/$cid")
   }
 
   fun clearAllFrames() {
@@ -372,9 +395,52 @@ object DirectP2pSocketEngine {
   /** Родитель переключил режим сети ребёнка: применяем мгновенно. */
   fun setAllowMobileData(allow: Boolean) {
     if (allowMobileData == allow) return
+    val cid = thisDeviceBoundChildId.takeIf { it > 0L } ?: 1L
+    if (!allow && currentRole == "CHILD") {
+      refreshNetworkState()
+      if (!hasWifi) {
+        // Если Wi-Fi сейчас нет, перед отключением 4G мгновенно уведомляем родителя, что ребёнок ушёл в Оффлайн
+        RealtimeCloudRelay.publishChildOffline(cid)
+      }
+    }
     allowMobileData = allow
     wakeGlobalTcp()
     Log.d(TAG, "Network mode changed: allowMobileData=$allow; wake global TCP")
+  }
+
+  private fun broadcastImmediateChildOnlinePresence() {
+    if (currentRole != "CHILD") return
+    val ctx = appContext ?: return
+    scope.launch {
+      try {
+        delay(250L)
+        val dao = com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+        val cfg = dao.getFamilyConfigOnce()
+        val cid = thisDeviceBoundChildId.takeIf { it > 0L }
+          ?: cfg?.thisDeviceChildId?.takeIf { it > 0L }
+          ?: cfg?.currentActiveChildId?.takeIf { it > 0L }
+          ?: 1L
+        val realBatt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(ctx)
+        if (realBatt in 1..100) {
+          dao.updateChildBattery(cid, realBatt)
+          RealtimeCloudRelay.publishChildFields(
+            cid,
+            mapOf(
+              "batteryLevel" to realBatt,
+              "lastPingAt" to System.currentTimeMillis()
+            )
+          )
+        }
+        RealtimeCloudRelay.publishChildPong(cid)
+        // Автоматическая догрузка накопленного офлайн-лога ребёнка родителю при появлении связи
+        delay(600L)
+        RealtimeCloudRelay.publishChildDebugLogs(
+          childId = cid,
+          fullDump = false,
+          triggerReason = "Авто-догрузка после выхода в сеть"
+        )
+      } catch (_: Exception) {}
+    }
   }
 
   private fun startNetworkMonitor() {
@@ -384,16 +450,34 @@ object DirectP2pSocketEngine {
     if (networkMonitorCallback != null) return
     val cb = object : ConnectivityManager.NetworkCallback() {
       override fun onAvailable(network: Network) {
+        val wasAny = hasAnyNetwork
         refreshNetworkState()
+        if (!wasAny && hasAnyNetwork) {
+          com.example.util.DeviceControlDebugger.logEvent(
+            "СЕТЬ_ВОССТАНОВЛЕНА",
+            "Появился доступ в интернет (Wi-Fi=$hasWifi, 4G=$hasCellular, роль=$currentRole)",
+            "SUCCESS",
+            if (currentRole == "CHILD") "CHILD" else "PARENT"
+          )
+        }
         ensureConnectedAndWake()
         if (vpsEnabled && !vpsConnected && !vpsConnecting) {
           runVpsRelayLoop()
+        }
+        if (currentRole == "CHILD" && childNetworkAllowed()) {
+          broadcastImmediateChildOnlinePresence()
         }
       }
 
       override fun onLost(network: Network) {
         refreshNetworkState()
         if (!hasAnyNetwork) {
+          com.example.util.DeviceControlDebugger.logEvent(
+            "СЕТЬ_ПОТЕРЯНА",
+            "Устройство полностью потеряло выход в интернет (переход в автономный офлайн-режим, роль=$currentRole)",
+            "WARNING",
+            if (currentRole == "CHILD") "CHILD" else "PARENT"
+          )
           wakeGlobalTcp()
         }
       }
@@ -439,6 +523,7 @@ object DirectP2pSocketEngine {
   }
 
   fun startEngine(role: String, boundChildId: Long = 0L) {
+    appContext?.let { com.example.util.DeviceControlDebugger.init(it) }
     currentRole = role
     if (boundChildId > 0L) {
       thisDeviceBoundChildId = boundChildId
@@ -842,13 +927,13 @@ object DirectP2pSocketEngine {
   }
 
   private suspend fun CoroutineScope.runBinaryTcpSocketLoop(host: String, port: Int) {
-    var retryDelayMs = 2_000L
+    var retryDelayMs = 1_000L
     while (isActive) {
       // P2P Connect (emqx/hivemq) работает параллельно с VPS Relay (как в ПК-агенте),
       // чтобы и VPS, и P2P Connect гарантированно работали в любых сетях и со старым ПК-агентом.
       if (!childNetworkAllowed()) {
-        retryDelayMs = 2_000L
-        delay(3_000L)
+        retryDelayMs = 1_000L
+        delay(2_000L)
         continue
       }
       var sock: Socket? = null
@@ -860,10 +945,10 @@ object DirectP2pSocketEngine {
             try { wifi.bindSocket(sock) } catch (_: Exception) {}
           }
         }
-        sock.connect(InetSocketAddress(host, port), 5000)
+        sock.connect(InetSocketAddress(host, port), 3500)
         sock.keepAlive = true
         sock.tcpNoDelay = true
-        sock.soTimeout = 12_000
+        sock.soTimeout = 10_000
         val inp = DataInputStream(BufferedInputStream(sock.getInputStream()))
         out = BufferedOutputStream(sock.getOutputStream())
 
@@ -875,9 +960,9 @@ object DirectP2pSocketEngine {
         inp.readFully(connAckBody)
 
         if ((connAckType and 0xF0) == 0x20) {
-          retryDelayMs = 2_000L
-          // Если 40с нет пакетов/PINGRESP от сервера — переподключаемся!
-          sock.soTimeout = 40_000
+          retryDelayMs = 1_000L
+          // Если 35с нет пакетов/PINGRESP от сервера — переподключаемся!
+          sock.soTimeout = 35_000
           globalSockets.add(sock)
           globalTcpOuts.add(out)
           _status.value = _status.value.copy(
@@ -885,25 +970,67 @@ object DirectP2pSocketEngine {
             activeTransportLabel = "⚡ Прямой бинарный TCP-Сокет ($host:$port)"
           )
           Log.d(TAG, "Connected persistent binary TCP socket to $host:$port")
-
-          // И родитель, и ребёнок подписываются на ВСЁ + legacy-топики, чтобы ребёнок
-          // никогда не терял команды PING/LOCK, а родитель не терял CHILD_STATE/PONG.
-          val subscriptions = listOf(
-            TOPIC_WILDCARD_ALL,
-            "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
-            "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
-            "$TOPIC_ROOT_LEGACY_PC/pc_stream/#",
-            "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#",
-            "$TOPIC_ROOT_LEGACY_PC/cmd/#",
-            "$TOPIC_ROOT_LEGACY_PC/lock/#",
-            "$TOPIC_ROOT_LEGACY_PC/data/#"
+          com.example.util.DeviceControlDebugger.logEvent(
+            "P2P_БРОКЕР_ПОДКЛЮЧЕН",
+            "Установлено соединение с брокером $host:$port (роль: $currentRole)",
+            "SUCCESS",
+            "P2P"
           )
-          sendMqttSubscribe(out, subscriptions)
 
-          // Выгрузка retained-пакетов — в отдельной дочерней корутине с задержкой,
-          // чтобы не блокировать старт чтения сокета.
+          // Телефон ребёнка НЕ подписывается на TOPIC_SCREEN/# и pc_screen/#, чтобы брокер
+          // не присылал ребёнку обратно его же собственные 50 КБ кадры экрана!
+          val subscriptions = if (currentRole == "CHILD") {
+            listOf(
+              "$TOPIC_STATE/#",
+              "$TOPIC_CMD/#",
+              "$TOPIC_LOCK/#",
+              "$TOPIC_DATA/#",
+              "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+              "$TOPIC_ROOT_LEGACY_PC/lock/#",
+              "$TOPIC_ROOT_LEGACY_PC/data/#"
+            )
+          } else {
+            listOf(
+              TOPIC_WILDCARD_ALL,
+              "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_stream/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#",
+              "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+              "$TOPIC_ROOT_LEGACY_PC/lock/#",
+              "$TOPIC_ROOT_LEGACY_PC/data/#"
+            )
+          }
+          val activeOut = out
+          sendMqttSubscribe(activeOut, subscriptions)
+
+          // Выгрузка retained-пакетов и однократная зачистка устаревших retained-топиков брокера (включая старые экраны!)
           launch {
-            delay(400L)
+            delay(200L)
+            if (purgedBrokerHosts.add("$host:$port")) {
+              val staleRetainedTopics = listOf(
+                "$TOPIC_SCREEN/1", "$TOPIC_SCREEN/2", "$TOPIC_SCREEN/3", "$TOPIC_SCREEN/4", "$TOPIC_SCREEN/5",
+                "$TOPIC_STATE/1", "$TOPIC_STATE/2", "$TOPIC_STATE/3",
+                "$TOPIC_CMD/1", "$TOPIC_CMD/2", "$TOPIC_CMD/3",
+                "$TOPIC_DATA/chat_1", "$TOPIC_DATA/chat_2", "$TOPIC_DATA/chat_3",
+                "$TOPIC_DATA/alert_1", "$TOPIC_DATA/alert_2", "$TOPIC_DATA/alert_3"
+              )
+              for (staleTopic in staleRetainedTopics) {
+                try {
+                  val body = ByteArrayOutputStream()
+                  writeUtf8String(body, staleTopic)
+                  val bodyBytes = body.toByteArray()
+                  val pkt = ByteArrayOutputStream()
+                  pkt.write(0x31) // PUBLISH with retain=1 and empty payload clears retained message on MQTT broker
+                  encodeRemainingLength(pkt, bodyBytes.size)
+                  pkt.write(bodyBytes)
+                  synchronized(activeOut) {
+                    activeOut.write(pkt.toByteArray())
+                    activeOut.flush()
+                  }
+                } catch (_: Exception) {}
+              }
+            }
             for ((retTopic, retJson) in retainedPacketsOutbox) {
               try {
                 val body = ByteArrayOutputStream()
@@ -914,21 +1041,24 @@ object DirectP2pSocketEngine {
                 pkt.write(0x31)
                 encodeRemainingLength(pkt, bodyBytes.size)
                 pkt.write(bodyBytes)
-                synchronized(globalWriteLock) {
-                  out.write(pkt.toByteArray())
-                  out.flush()
+                synchronized(activeOut) {
+                  activeOut.write(pkt.toByteArray())
+                  activeOut.flush()
                 }
               } catch (_: Exception) {}
+            }
+            if (currentRole == "CHILD") {
+              broadcastImmediateChildOnlinePresence()
             }
           }
 
           val pingJob = launch {
             while (isActive && sock.isConnected && !sock.isClosed) {
-              delay(20_000L)
-              synchronized(globalWriteLock) {
+              delay(18_000L)
+              synchronized(activeOut) {
                 try {
-                  out.write(byteArrayOf(0xC0.toByte(), 0x00))
-                  out.flush()
+                  activeOut.write(byteArrayOf(0xC0.toByte(), 0x00))
+                  activeOut.flush()
                 } catch (_: Exception) {
                   try { sock.close() } catch (_: Exception) {}
                 }
@@ -985,7 +1115,7 @@ object DirectP2pSocketEngine {
         }
       }
       delay(retryDelayMs)
-      retryDelayMs = (retryDelayMs * 2L).coerceAtMost(4_000L)
+      retryDelayMs = (retryDelayMs + 750L).coerceAtMost(2_500L)
     }
   }
 
@@ -1035,7 +1165,7 @@ object DirectP2pSocketEngine {
     pkt.write(0x10) // CONNECT
     encodeRemainingLength(pkt, bodyBytes.size)
     pkt.write(bodyBytes)
-    synchronized(globalWriteLock) {
+    synchronized(out) {
       out.write(pkt.toByteArray())
       out.flush()
     }
@@ -1092,18 +1222,20 @@ object DirectP2pSocketEngine {
 
   private fun loadVpsPrefs() {
     val p = appContext?.getSharedPreferences(VPS_PREFS, android.content.Context.MODE_PRIVATE) ?: return
-    vpsEnabled = p.getBoolean("enabled", false)
     vpsHost = p.getString("host", "").orEmpty().trim()
+    vpsEnabled = p.getBoolean("enabled", false) && vpsHost.isNotBlank()
     vpsPort = p.getInt("port", 443)
     vpsPassword = p.getString("password", "1234").orEmpty()
     vpsRoomCode = p.getString("roomCode", "101-701").orEmpty()
   }
 
   fun configureVpsRelay(enabled: Boolean, host: String, port: Int, password: String, roomCode: String) {
-    val changed = (vpsEnabled != enabled) || (vpsHost != host.trim()) || (vpsPort != port) ||
+    val cleanHost = host.trim()
+    val effectiveEnabled = enabled && cleanHost.isNotBlank()
+    val changed = (vpsEnabled != effectiveEnabled) || (vpsHost != cleanHost) || (vpsPort != port) ||
       (vpsPassword != password) || (vpsRoomCode != roomCode.ifBlank { "101-701" })
-    vpsEnabled = enabled
-    vpsHost = host.trim()
+    vpsEnabled = effectiveEnabled
+    vpsHost = cleanHost
     vpsPort = port
     vpsPassword = password
     vpsRoomCode = roomCode.ifBlank { "101-701" }
@@ -1254,27 +1386,63 @@ object DirectP2pSocketEngine {
               isGlobalTcpSocketConnected = true,
               activeTransportLabel = "☁️ VPS / Cloudflare Релей ($vpsHost)"
             )
-            val subs = listOf(
-              TOPIC_WILDCARD_ALL,
-              "$TOPIC_ROOT_LEGACY_PC/cmd/#",
-              "$TOPIC_ROOT_LEGACY_PC/lock/#",
-              "$TOPIC_ROOT_LEGACY_PC/data/#",
-              "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
-              "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
-              "$TOPIC_ROOT_LEGACY_PC/pc_stream/#",
-              "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
-            )
+            val subs = if (currentRole == "CHILD") {
+              listOf(
+                "$TOPIC_STATE/#",
+                "$TOPIC_CMD/#",
+                "$TOPIC_LOCK/#",
+                "$TOPIC_DATA/#",
+                "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+                "$TOPIC_ROOT_LEGACY_PC/lock/#",
+                "$TOPIC_ROOT_LEGACY_PC/data/#"
+              )
+            } else {
+              listOf(
+                TOPIC_WILDCARD_ALL,
+                "$TOPIC_ROOT_LEGACY_PC/cmd/#",
+                "$TOPIC_ROOT_LEGACY_PC/lock/#",
+                "$TOPIC_ROOT_LEGACY_PC/data/#",
+                "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
+                "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
+                "$TOPIC_ROOT_LEGACY_PC/pc_stream/#",
+                "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
+              )
+            }
             try {
               vpsWebSocket?.send(ByteString.of(*buildSubscribePacket(subs)))
             } catch (_: Exception) {}
-            // Выгружаем retained-пакеты в VPS брокер сразу после подключения
+            // Выгружаем retained-пакеты в VPS брокер сразу после подключения и мгновенно шлём PONG от ребёнка
             scope.launch {
-              delay(300L)
+              delay(200L)
               val ws = vpsWebSocket ?: return@launch
+              if (purgedBrokerHosts.add("vps:$vpsHost:$vpsPort")) {
+                val staleRetainedTopics = listOf(
+                  "$TOPIC_SCREEN/1", "$TOPIC_SCREEN/2", "$TOPIC_SCREEN/3", "$TOPIC_SCREEN/4", "$TOPIC_SCREEN/5",
+                  "$TOPIC_STATE/1", "$TOPIC_STATE/2", "$TOPIC_STATE/3",
+                  "$TOPIC_CMD/1", "$TOPIC_CMD/2", "$TOPIC_CMD/3",
+                  "$TOPIC_DATA/chat_1", "$TOPIC_DATA/chat_2", "$TOPIC_DATA/chat_3",
+                  "$TOPIC_DATA/alert_1", "$TOPIC_DATA/alert_2", "$TOPIC_DATA/alert_3"
+                )
+                for (staleTopic in staleRetainedTopics) {
+                  try {
+                    val body = ByteArrayOutputStream()
+                    writeUtf8String(body, staleTopic)
+                    val bodyBytes = body.toByteArray()
+                    val pkt = ByteArrayOutputStream()
+                    pkt.write(0x31)
+                    encodeRemainingLength(pkt, bodyBytes.size)
+                    pkt.write(bodyBytes)
+                    ws.send(ByteString.of(*pkt.toByteArray()))
+                  } catch (_: Exception) {}
+                }
+              }
               for ((retTopic, retJson) in retainedPacketsOutbox) {
                 try {
                   ws.send(ByteString.of(*buildPublishPacket(retTopic, retJson, retain = true)))
                 } catch (_: Exception) {}
+              }
+              if (currentRole == "CHILD") {
+                broadcastImmediateChildOnlinePresence()
               }
             }
             vpsPingJob?.cancel()
@@ -1324,7 +1492,7 @@ object DirectP2pSocketEngine {
     pkt.write(0x82) // SUBSCRIBE
     encodeRemainingLength(pkt, bodyBytes.size)
     pkt.write(bodyBytes)
-    synchronized(globalWriteLock) {
+    synchronized(out) {
       out.write(pkt.toByteArray())
       out.flush()
     }
@@ -1352,33 +1520,29 @@ object DirectP2pSocketEngine {
       } catch (_: Exception) {}
     }
     if (globalTcpOuts.isEmpty()) return sent || vpsSent
-    scope.launch(Dispatchers.IO) {
-      try {
-        val body = ByteArrayOutputStream()
-        writeUtf8String(body, topic)
-        val payloadBytes = json.toString().toByteArray(Charsets.UTF_8)
-        body.write(payloadBytes)
-        val bodyBytes = body.toByteArray()
+    val body = ByteArrayOutputStream()
+    writeUtf8String(body, topic)
+    val payloadBytes = json.toString().toByteArray(Charsets.UTF_8)
+    body.write(payloadBytes)
+    val bodyBytes = body.toByteArray()
 
-        val pkt = ByteArrayOutputStream()
-        pkt.write(if (retain) 0x31 else 0x30)
-        encodeRemainingLength(pkt, bodyBytes.size)
-        pkt.write(bodyBytes)
-        val packetBytes = pkt.toByteArray()
+    val pkt = ByteArrayOutputStream()
+    pkt.write(if (retain) 0x31 else 0x30)
+    encodeRemainingLength(pkt, bodyBytes.size)
+    pkt.write(bodyBytes)
+    val packetBytes = pkt.toByteArray()
 
-        synchronized(globalWriteLock) {
-          val snapshot = globalTcpOuts.toList()
-          for (out in snapshot) {
-            try {
-              out.write(packetBytes)
-              out.flush()
-            } catch (_: Exception) {
-              globalTcpOuts.remove(out)
-            }
+    val snapshot = globalTcpOuts.toList()
+    for (out in snapshot) {
+      scope.launch(Dispatchers.IO) {
+        try {
+          synchronized(out) {
+            out.write(packetBytes)
+            out.flush()
           }
+        } catch (_: Exception) {
+          globalTcpOuts.remove(out)
         }
-      } catch (e: Exception) {
-        Log.d(TAG, "publishTcpSocketPacket error: ${e.message}")
       }
     }
     return true
@@ -1414,37 +1578,64 @@ object DirectP2pSocketEngine {
         val pktPairingCode = msg.optString("pairingCode", "")
         when {
           type == "DIRECT_SCREEN_FRAME" || type == "SCREEN_FRAME" || topic.startsWith(TOPIC_SCREEN) || topic.endsWith("/screen") -> {
+            // Телефон ребёнка сам отправляет кадры экрана и НЕ должен принимать их обратно с брокера!
+            if (currentRole == "CHILD") return@launch
             val rawCid = msg.optLong("childId", topic.substringAfterLast("/").toLongOrNull() ?: 0L)
             val cid = RealtimeCloudRelay.resolveCanonicalChildId(rawCid, pktPairingCode)
-            val ts = msg.optLong("timestamp", msg.optLong("ts", now))
+            val packetTs = msg.optLong("timestamp", msg.optLong("ts", now))
             if (cid <= 0L) return@launch
-            // Кадр старше 60 с — не сохраняем (брокер мог отдать старый retained-кадр).
-            if (now - ts > 60_000L) return@launch
-            val appName = msg.optString("activeAppName", "Экран ребёнка")
+            val appName = msg.optString("activeAppName", "").trim()
             val directB64 = msg.optString("base64Bitmap", "")
             val key = msg.optString("blobKey", "")
-            val currentMap = _framesByChild.value.toMutableMap()
-            val prevEntry = currentMap[cid] ?: currentMap[rawCid]
-            // Only ignore if we already have a strictly newer frame with non-empty bitmap
-            if (prevEntry != null && prevEntry.second.isNotBlank() && ts < prevEntry.third && directB64.isBlank()) {
+            // Пустой пакет очистки топика просто игнорируем без ложных предупреждений
+            if (directB64.isBlank() && key.isBlank() && appName.isBlank()) {
               return@launch
             }
+            // Принимаем только реально свежие кадры экрана (не старше 25 секунд!)
+            val ageMs = now - packetTs
+            if (ageMs > 25_000L) {
+              com.example.util.DeviceControlDebugger.logEvent(
+                "СТАРЫЙ_КАДР_ОТБРОШЕН",
+                "Отброшен устаревший пакет экрана для #$cid (возраст ${ageMs / 1000} с)",
+                "WARNING",
+                "P2P"
+              )
+              return@launch
+            }
+
+            RealtimeCloudRelay.authorizeChildId(cid)
+            if (rawCid > 0L) RealtimeCloudRelay.authorizeChildId(rawCid)
+            val displayAppName = appName.ifBlank { "Экран ребёнка" }
+            val currentMap = _framesByChild.value.toMutableMap()
+            val prevEntry = currentMap[cid] ?: currentMap[rawCid]
             if (directB64.isNotBlank()) {
-              val entry = Triple(appName, directB64, ts)
+              // Дедупликация одинакового кадра со второго брокера в пределах 350 мс
+              if (prevEntry != null && (now - prevEntry.third) < 350L && prevEntry.second.length == directB64.length) {
+                return@launch
+              }
+              val entry = Triple(displayAppName, directB64, now)
               currentMap[cid] = entry
               if (rawCid > 0L) currentMap[rawCid] = entry
               _framesByChild.value = currentMap
+              com.example.util.DeviceControlDebugger.logEvent(
+                "КАДР_ЭКРАНА_ПРИНЯТ",
+                "Живой кадр экрана от #$cid: «${displayAppName.take(45)}» (${directB64.length / 1024} КБ)",
+                "SUCCESS",
+                "P2P"
+              )
             } else if (key.isNotBlank()) {
               val downloaded = RealtimeCloudRelay.downloadLargeBlob(key).orEmpty()
               if (downloaded.isNotBlank()) {
-                val entry = Triple(appName, downloaded, ts)
+                val entry = Triple(displayAppName, downloaded, now)
                 currentMap[cid] = entry
                 if (rawCid > 0L) currentMap[rawCid] = entry
                 _framesByChild.value = currentMap
               }
             } else if (appName.isNotBlank()) {
-              val prevB64 = currentMap[cid]?.second ?: currentMap[rawCid]?.second.orEmpty()
-              val entry = Triple(appName, prevB64, ts)
+              // КРИТИЧНО: никогда не подставляем старый скриншот (старше 15 с) к новому имени оболочки/приложения!
+              val freshPrevB64 = prevEntry?.takeIf { it.second.isNotBlank() && (now - it.third <= 15_000L) }?.second.orEmpty()
+              val entryTs = prevEntry?.takeIf { freshPrevB64.isNotBlank() }?.third ?: now
+              val entry = Triple(displayAppName, freshPrevB64, entryTs)
               currentMap[cid] = entry
               if (rawCid > 0L) currentMap[rawCid] = entry
               _framesByChild.value = currentMap
@@ -1465,32 +1656,107 @@ object DirectP2pSocketEngine {
             }
           }
           type == "CMD" || topic.startsWith(TOPIC_CMD) || topic.endsWith("/cmd") || msg.has("command") -> {
+            // Телефон РОДИТЕЛЯ сам отправляет команды в TOPIC_CMD и не должен принимать/логировать свои же эхо-пакеты!
+            if (currentRole != "CHILD") return@launch
             val rawCid = msg.optLong("childId", topic.substringAfterLast("/").toLongOrNull() ?: 0L)
             val cid = RealtimeCloudRelay.resolveCanonicalChildId(rawCid, pktPairingCode)
             val cmd = msg.optString("command", "")
             val payload = msg.optString("payload", "")
+            val cmdId = msg.optString("cmdId", "")
             val ts = msg.optLong("timestamp", now)
-            val maxAgeMs = if (cmd == "LOCK" || cmd == "UNLOCK") 300_000L else 180_000L
-            if (cmd.isNotBlank() && kotlin.math.abs(now - ts) < maxAgeMs) {
-              if (currentRole == "CHILD") {
-                markParentPresenceActive(cid)
-                if (cmd == "MAP_VIEWING") {
-                  lastParentMapViewMs = now
+            // Отбрасываем любые устаревшие команды старше 35 секунд
+            val maxAgeMs = 35_000L
+            val ageMs = kotlin.math.abs(now - ts)
+            if (cmd.isNotBlank() && ageMs >= maxAgeMs) {
+              com.example.util.DeviceControlDebugger.logEvent(
+                "СТАРАЯ_КОМАНДА_ОТБРОШЕНА",
+                "Отброшена устаревшая команда [$cmd] (возраст ${ageMs / 1000} с)",
+                "BLOCKED",
+                "P2P"
+              )
+            } else if (cmd.isNotBlank() && ageMs < maxAgeMs) {
+              // 1. Тихая фильтрация сетевых эхо-копий одного и того же пакета (с одинаковым cmdId) от параллельных брокеров (emqx + hivemq + LAN)
+              if (cmdId.isNotBlank()) {
+                val prevIdTs = processedCmdIds.putIfAbsent(cmdId, now)
+                if (prevIdTs != null && (now - prevIdTs) < 60_000L) {
+                  return@launch
+                }
+              }
+              // 2. Анти-дребезг повторных команд с разными cmdId:
+              // для LOUD_RING — 8 с, для частых запросов экрана TAKE_SCREENSHOT / START_LIVE_STREAM — 650 мс (чтобы опрос раз в 2 с никогда не блокировался!)
+              val cmdDedupWindowMs = when (cmd) {
+                "LOUD_RING" -> 8_000L
+                "TAKE_SCREENSHOT", "START_LIVE_STREAM", "STOP_LIVE_STREAM", "QUERY_ACTIVE_APP" -> 650L
+                "PING", "MAP_VIEWING" -> 1_500L
+                else -> 1_200L
+              }
+              val cmdSig = "${cid}_${cmd}_${payload.trim()}"
+              val prevCmdTs = recentIncomingCmdSignatures[cmdSig] ?: 0L
+              if (now - prevCmdTs < cmdDedupWindowMs) {
+                if (cmd != "PING" && cmd != "MAP_VIEWING" && cmd != "TAKE_SCREENSHOT") {
+                  com.example.util.DeviceControlDebugger.logEvent(
+                    "ДУБЛЬ_КОМАНДЫ_ОТБРОШЕН",
+                    "Отброшен дубликат команды [$cmd] со второго канала (${now - prevCmdTs} мс)",
+                    "INTERCEPTED",
+                    "P2P"
+                  )
+                }
+                return@launch
+              }
+              recentIncomingCmdSignatures[cmdSig] = now
+              if (cmd != "PING" && cmd != "MAP_VIEWING") {
+                com.example.util.DeviceControlDebugger.logEvent(
+                  "КОМАНДА_ПОЛУЧЕНА",
+                  "Принята команда [$cmd] для #$cid (payload=${payload.take(45)})",
+                  "SUCCESS",
+                  "P2P"
+                )
+              }
+
+              markParentPresenceActive(cid)
+              if (cmd == "MAP_VIEWING") {
+                lastParentMapViewMs = now
+              } else if (cmd == "REQUEST_DEBUG_LOGS") {
+                RealtimeCloudRelay.publishChildDebugLogs(
+                  childId = cid,
+                  fullDump = true,
+                  triggerReason = "Запрос лога от родителя"
+                )
+              } else if (cmd == "CLEAR_DEBUG_LOGS") {
+                com.example.util.DeviceControlDebugger.clearLogs()
+                com.example.util.DeviceControlDebugger.logEvent(
+                  "ЛОГ_РЕБЁНКА_ОЧИЩЕН",
+                  "Журнал диагностики на телефоне ребёнка #$cid полностью очищен по команде родителя",
+                  "SUCCESS",
+                  "CHILD"
+                )
+                RealtimeCloudRelay.publishChildDebugLogs(
+                  childId = cid,
+                  fullDump = true,
+                  triggerReason = "Подтверждение очистки лога"
+                )
+              } else if (cmd == "SET_REMOTE_LOGGING") {
+                val en = payload.trim().equals("ON", ignoreCase = true) || payload.trim() == "1"
+                com.example.util.DeviceControlDebugger.setLoggingEnabled(appContext, en)
+                if (en) {
+                  RealtimeCloudRelay.publishChildDebugLogs(
+                    childId = cid,
+                    fullDump = true,
+                    triggerReason = "Включение удалённого логирования"
+                  )
                 }
               }
               if (cmd == "UNLOCK") {
                 RealtimeCloudRelay.setLocalAuthoritativeLock(cid, false, ts)
-                if (currentRole == "CHILD") applyImmediateLockOrUnlockIfChild(cid, false)
+                applyImmediateLockOrUnlockIfChild(cid, false)
               } else if (cmd == "LOCK") {
                 RealtimeCloudRelay.setLocalAuthoritativeLock(cid, true, ts)
-                if (currentRole == "CHILD") applyImmediateLockOrUnlockIfChild(cid, true)
+                applyImmediateLockOrUnlockIfChild(cid, true)
               }
-              if (currentRole == "CHILD" || (cmd != "LOCK" && cmd != "UNLOCK")) {
-                _incomingCommandsFlow.tryEmit(Triple(cid, cmd, payload))
-              }
+              _incomingCommandsFlow.tryEmit(Triple(cid, cmd, payload))
             }
           }
-          type == "CHILD_STATE" || type == "CHILD_PATCH" || type == "CHILD_DELETE" || topic.startsWith(TOPIC_STATE) -> {
+          type == "CHILD_STATE" || type == "CHILD_PATCH" || type == "CHILD_OFFLINE" || type == "CHILD_DELETE" || topic.startsWith(TOPIC_STATE) -> {
             if (type == "PAIR_LOOKUP_REQ") {
               val reqIp = msg.optString("requesterIp", "")
               RealtimeCloudRelay.rebroadcastAllChildrenForPairing(reqIp)
@@ -1533,11 +1799,14 @@ object DirectP2pSocketEngine {
   }
 
   fun storeReceivedScreenFrame(childId: Long, activeAppName: String, base64Bitmap: String, timestamp: Long = System.currentTimeMillis()) {
+    val now = System.currentTimeMillis()
     val cid = if (childId > 0L) childId else 1L
     val currentMap = _framesByChild.value.toMutableMap()
-    val prevB64 = currentMap[cid]?.second.orEmpty()
-    val resolvedB64 = base64Bitmap.ifBlank { prevB64 }
-    currentMap[cid] = Triple(activeAppName.ifBlank { "Экран ребёнка" }, resolvedB64, timestamp)
+    val prevEntry = currentMap[cid]
+    val freshPrevB64 = prevEntry?.takeIf { it.second.isNotBlank() && (now - it.third <= 15_000L) }?.second.orEmpty()
+    val resolvedB64 = base64Bitmap.ifBlank { freshPrevB64 }
+    val resolvedTs = if (base64Bitmap.isNotBlank()) now else (prevEntry?.takeIf { freshPrevB64.isNotBlank() }?.third ?: now)
+    currentMap[cid] = Triple(activeAppName.ifBlank { "Экран ребёнка" }, resolvedB64, resolvedTs)
     _framesByChild.value = currentMap
   }
 
@@ -1622,19 +1891,19 @@ object DirectP2pSocketEngine {
 
   @Volatile
   private var lastLoudSirenPlayedAtMs: Long = 0L
-  private val recentProcessedChatKeys = java.util.Collections.synchronizedSet( LinkedHashSet<String>() )
-  private val recentProcessedAlertKeys = java.util.Collections.synchronizedSet( LinkedHashSet<String>() )
 
   private suspend fun handleImmediateIncomingSosOrChatOnParent(msg: JSONObject, now: Long) {
     val ctx = appContext ?: return
     try {
       val type = msg.optString("type", "")
       if (type != "ALERT" && type != "CHAT") return
+      val ts = msg.optLong("timestamp", msg.optLong("ts", now))
+      // Отбрасываем любые устаревшие сообщения чата и алерты старше 60 секунд
+      if (kotlin.math.abs(now - ts) > 60_000L) return
+
       val dao = com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
       val cfg = dao.getFamilyConfigOnce()
       val localRole = cfg?.selectedRole ?: "PARENT"
-      val ts = msg.optLong("timestamp", msg.optLong("ts", now))
-      val isFresh = kotlin.math.abs(now - ts) < 90_000L
 
       val allChildren = dao.getAllChildrenOnce()
       val rawCid = msg.optLong("childId", 1L).coerceAtLeast(1L)
@@ -1660,91 +1929,50 @@ object DirectP2pSocketEngine {
         val messageText = msg.optString("message", "")
         val payload = msg.optString("payload", "")
 
-        // If SOS alert carries coordinates ("lat,lng"), immediately update the child's location in Room!
-        if (alertType == "SOS" && payload.contains(",")) {
-          val parts = payload.split(",")
-          val sosLat = parts.getOrNull(0)?.trim()?.toDoubleOrNull() ?: 0.0
-          val sosLng = parts.getOrNull(1)?.trim()?.toDoubleOrNull() ?: 0.0
-          if (sosLat != 0.0 && sosLng != 0.0 && !com.example.location.LiveLocationTracker.isEmulatorSyntheticUsLocation(sosLat, sosLng)) {
-            val addr = com.example.location.LiveLocationTracker.reverseGeocodeExact(ctx, sosLat, sosLng)
-            dao.updateChildLocation(matchedChildId, sosLat, sosLng, addr, ts)
-          }
-        }
+        com.example.data.repository.ParentalControlRepository.ingestIncomingAlertIfNew(
+          context = ctx,
+          dao = dao,
+          alert = com.example.data.model.AlertNotificationEntity(
+            id = 0,
+            childId = matchedChildId,
+            type = alertType,
+            title = title,
+            message = messageText,
+            extraPayload = payload,
+            timestamp = ts,
+            isRead = false
+          )
+        )
 
-        val alertKey = "${matchedChildId}_${alertType}_${ts / 2000L}"
-        if (recentProcessedAlertKeys.add(alertKey)) {
-          val existingAlerts = dao.getAllAlerts().firstOrNull().orEmpty()
-          val alreadyInDb = existingAlerts.any {
-            it.type == alertType && it.childId == matchedChildId && kotlin.math.abs(it.timestamp - ts) < 2500L
-          }
-          if (!alreadyInDb) {
-            dao.insertAlert(
-              com.example.data.model.AlertNotificationEntity(
-                id = 0,
-                childId = matchedChildId,
-                type = alertType,
-                title = title,
-                message = messageText,
-                extraPayload = payload,
-                timestamp = ts,
-                isRead = false
-              )
-            )
-          }
-        }
-
-        if (alertType == "SOS" && isFresh && (now - lastLoudSirenPlayedAtMs) > 4_000L) {
+        if (alertType == "SOS" && (now - lastLoudSirenPlayedAtMs) > 12_500L) {
           lastLoudSirenPlayedAtMs = now
           com.example.util.SoundAlertManager.playLoudAttentionSignal(ctx)
         }
       } else if (type == "CHAT") {
         val senderRole = msg.optString("senderRole", msg.optString("sender", "CHILD")).ifBlank { "CHILD" }
-        // Parent processes messages from CHILD; Child processes messages from PARENT
         val shouldIngest = (localRole != "CHILD" && senderRole == "CHILD") ||
           (localRole == "CHILD" && senderRole == "PARENT")
         if (shouldIngest) {
-          val text = msg.optString("text", "")
+          val text = msg.optString("text", "").trim()
           val senderName = msg.optString("senderName", if (senderRole == "CHILD") (matchedChild?.name ?: "Ребёнок") else "Родитель")
           val isAttention = msg.optBoolean("isAttentionSignal", msg.optBoolean("attention", false))
           if (text.isNotBlank()) {
-            val chatKey = "${matchedChildId}_${senderRole}_${ts / 2000L}_${text.hashCode()}"
-            if (recentProcessedChatKeys.add(chatKey)) {
-              val existingMsgs = dao.getChatMessagesForChild(matchedChildId).firstOrNull().orEmpty()
-              val alreadyInDb = existingMsgs.any {
-                it.senderRole == senderRole && it.text == text && kotlin.math.abs(it.timestamp - ts) < 2500L
-              }
-              if (!alreadyInDb) {
-                dao.insertChatMessage(
-                  com.example.data.model.ChatMessageEntity(
-                    id = 0,
-                    childId = matchedChildId,
-                    senderRole = senderRole,
-                    senderName = senderName,
-                    text = text,
-                    timestamp = ts,
-                    isRead = false,
-                    isAttentionSignal = isAttention
-                  )
-                )
-                if (localRole != "CHILD" && senderRole == "CHILD" && !isAttention) {
-                  dao.insertAlert(
-                    com.example.data.model.AlertNotificationEntity(
-                      id = 0,
-                      childId = matchedChildId,
-                      type = "CHAT_MESSAGE",
-                      title = "💬 Сообщение от «$senderName»",
-                      message = text,
-                      timestamp = ts,
-                      isRead = false
-                    )
-                  )
-                }
-              }
-            }
-            if (isAttention && isFresh && (now - lastLoudSirenPlayedAtMs) > 4_000L) {
-              lastLoudSirenPlayedAtMs = now
-              com.example.util.SoundAlertManager.playLoudAttentionSignal(ctx)
-            }
+            com.example.data.repository.ParentalControlRepository.ingestIncomingChatIfNew(
+              context = ctx,
+              dao = dao,
+              incomingMsg = com.example.data.model.ChatMessageEntity(
+                id = 0,
+                childId = matchedChildId,
+                senderRole = senderRole,
+                senderName = senderName,
+                text = text,
+                timestamp = ts,
+                isRead = false,
+                isAttentionSignal = isAttention
+              )
+            )
+            // Внимание: сирена на телефоне ребёнка запускается ТОЛЬКО командой LOUD_RING,
+            // чтобы пакет CHAT не перезапускал сирену повторно!
           }
         }
       }

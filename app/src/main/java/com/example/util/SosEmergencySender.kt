@@ -126,57 +126,10 @@ object SosEmergencySender {
           cloudSync.updateLocation(boundId, lat, lng, addressText)
         }
 
-        // Broadcast SOS Alert and Chat across primary + alias IDs so Parent receives it 100% regardless of ID mapping
-        val targetIds = linkedSetOf(boundId, 1L, 2L).apply {
-          allChildren.forEach { add(it.id) }
-        }
-        for (tid in targetIds) {
-          RealtimeCloudRelay.publishAlert(alertEntity.copy(childId = tid))
-          RealtimeCloudRelay.publishChatMessage(chatEntity.copy(childId = tid))
-        }
-
-        // Also send explicit ALERT and CHAT packets with pairingCode + childName over Global TCP + LAN + UDP
-        val sosPacket = JSONObject().apply {
-          put("type", "ALERT")
-          put("id", now)
-          put("childId", boundId)
-          put("childName", childName)
-          if (pairingCode.isNotBlank()) put("pairingCode", pairingCode)
-          put("alertType", "SOS")
-          put("title", sosTitle)
-          put("message", sosMessage)
-          put("payload", coordsPayload)
-          put("timestamp", now)
-        }
-        DirectP2pSocketEngine.publishTcpSocketPacket(
-          topic = "${DirectP2pSocketEngine.TOPIC_DATA}/alert_$boundId",
-          json = sosPacket,
-          retain = true
-        )
-        DirectP2pSocketEngine.pushDirectLanPacket(sosPacket)
-        DirectP2pSocketEngine.broadcastUdpJson(sosPacket)
-
-        val sosChatPacket = JSONObject().apply {
-          put("type", "CHAT")
-          put("id", now + 1L)
-          put("childId", boundId)
-          put("childName", childName)
-          if (pairingCode.isNotBlank()) put("pairingCode", pairingCode)
-          put("senderRole", "CHILD")
-          put("sender", "CHILD")
-          put("senderName", childName)
-          put("text", chatEntity.text)
-          put("timestamp", now)
-          put("isAttentionSignal", true)
-          put("attention", true)
-        }
-        DirectP2pSocketEngine.publishTcpSocketPacket(
-          topic = "${DirectP2pSocketEngine.TOPIC_DATA}/chat_$boundId",
-          json = sosChatPacket,
-          retain = true
-        )
-        DirectP2pSocketEngine.pushDirectLanPacket(sosChatPacket)
-        DirectP2pSocketEngine.broadcastUdpJson(sosChatPacket)
+        // Отправляем SOS-алерт и сообщение в чат ровно один раз и БЕЗ retain,
+        // чтобы сигнал тревоги и чат не дублировались и не срабатывали повторно при реконнекте к брокеру!
+        RealtimeCloudRelay.publishAlert(alertEntity.copy(childId = boundId))
+        RealtimeCloudRelay.publishChatMessage(chatEntity.copy(childId = boundId))
 
         CoroutineScope(Dispatchers.Main).launch {
           val confirmMsg = if (hasCoords) {

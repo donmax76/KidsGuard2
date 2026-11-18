@@ -348,9 +348,9 @@ class KidsGuardAccessibilityService : AccessibilityService() {
           DeviceUsageTracker.isInteractive(applicationContext) &&
           !com.example.location.LiveLocationTracker.isEmulator()
         if (shouldStream) {
-          // Если MediaProjection уже отдаёт кадры напрямую (pushDirectScreenFrame), повторный
-          // дорогой AccessibilityService.takeScreenshot каждые 2.5 с не нужен — только активное окно.
-          if (com.example.util.ScreenShotManager.isMediaProjectionActive.value) {
+          // Пропускаем takeScreenshot ТОЛЬКО если MediaProjection реально отдал свежий кадр
+          // за последние 2.5 секунды. Иначе (статичный экран или нет MediaProjection) делаем реальный снимок!
+          if (com.example.util.ScreenShotManager.isMediaProjectionDeliveringFreshFrames()) {
             serviceScope.launch(Dispatchers.IO) {
               try {
                 val app = currentForegroundAppLabel.ifBlank {
@@ -359,15 +359,14 @@ class KidsGuardAccessibilityService : AccessibilityService() {
                 CloudSyncManager(applicationContext).updateActiveAppOnly(activeChildId, app)
               } catch (_: Exception) {}
             }
-            delay(10_000L)
+            delay(2_000L)
           } else {
             triggerImmediateCaptureNow()
-            delay(2_500L)
+            delay(1_800L)
           }
         } else {
-          // Rest quietly when Parent is not actively watching Live Stream.
-          // 30 с вместо 12 с — меньше пробуждений CPU на простаивающем телефоне.
-          delay(30_000L)
+          // Быстрая проверка включения живого эфира без ожидания 30 секунд
+          delay(2_000L)
         }
       }
     }
@@ -624,12 +623,20 @@ class KidsGuardAccessibilityService : AccessibilityService() {
                     }
                   }
                   "GPS_TRACKING_ON" -> {
+                    com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(
+                      activeChildId,
+                      gpsTrackingEnabled = true
+                    )
                     com.example.location.LiveLocationTracker.setGpsTrackingAllowed(true)
                     serviceScope.launch(Dispatchers.IO) {
                       dao.setChildGpsTrackingEnabled(activeChildId, true)
                     }
                   }
                   "GPS_TRACKING_OFF" -> {
+                    com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeParentToggle(
+                      activeChildId,
+                      gpsTrackingEnabled = false
+                    )
                     com.example.location.LiveLocationTracker.setGpsTrackingAllowed(false)
                     serviceScope.launch(Dispatchers.IO) {
                       dao.setChildGpsTrackingEnabled(activeChildId, false)
@@ -644,6 +651,7 @@ class KidsGuardAccessibilityService : AccessibilityService() {
                         if (existing != null) {
                           dao.setAppBlocked(existing.id, true)
                         }
+                        cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
                       }
                       launch(Dispatchers.Main) {
                         if (currentForegroundPackage == pkg) {
@@ -662,6 +670,7 @@ class KidsGuardAccessibilityService : AccessibilityService() {
                         if (existing != null) {
                           dao.setAppBlocked(existing.id, false)
                         }
+                        cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
                       }
                       launch(Dispatchers.Main) {
                         hideLockOverlay()
@@ -669,14 +678,15 @@ class KidsGuardAccessibilityService : AccessibilityService() {
                     }
                   }
                   "LIMIT_APP", "SET_APP_LIMIT" -> {
-                    val parts = payload.split("|")
-                    val pkg = parts.getOrNull(0)?.trim().orEmpty()
-                    val limitMin = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
+                    val delim = if (payload.contains("|")) "|" else ":"
+                    val pkg = payload.substringBefore(delim).trim()
+                    val limitMin = payload.substringAfter(delim, "0").trim().toIntOrNull() ?: 0
                     if (pkg.isNotBlank()) {
                       serviceScope.launch(Dispatchers.IO) {
                         val existing = dao.getAppByPackageOnce(activeChildId, pkg)
                         if (existing != null) {
                           dao.setAppLimit(existing.id, limitMin)
+                          cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
                         }
                       }
                     }

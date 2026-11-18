@@ -174,9 +174,11 @@ object OfflineStoreAndForwardManager {
 
         val unsyncedLogs = dao.getUnsyncedActivityLogs(childId)
         val unsyncedLocs = dao.getUnsyncedLocationPoints(childId)
-        val unsyncedShots = dao.getUnsyncedScreenshots(childId).take(3) // до 3 скриншотов за один пакет
+        // Удаляем старые оффлайн-скриншоты, чтобы вчерашние снимки (например, за 22:36)
+        // никогда не прилетали родителю под видом текущего живого экрана!
+        try { dao.deleteOfflineScreenshotsForChild(childId) } catch (_: Exception) {}
 
-        if (unsyncedLogs.isEmpty() && unsyncedLocs.isEmpty() && unsyncedShots.isEmpty()) {
+        if (unsyncedLogs.isEmpty() && unsyncedLocs.isEmpty()) {
           return@launch
         }
 
@@ -206,23 +208,12 @@ object OfflineStoreAndForwardManager {
           })
         }
 
-        val shotsArr = JSONArray()
-        for (s in unsyncedShots) {
-          shotsArr.put(JSONObject().apply {
-            put("deviceType", s.deviceType)
-            put("activeAppName", s.activeAppName)
-            put("statusNote", s.statusNote)
-            put("base64Bitmap", s.base64Bitmap)
-            put("timestamp", s.timestamp)
-          })
-        }
-
         val packet = JSONObject().apply {
           put("type", "OFFLINE_HISTORY_BUNDLE")
           put("childId", childId)
           put("activityLogs", logsArr)
           put("locationPoints", locsArr)
-          put("screenshots", shotsArr)
+          put("screenshots", JSONArray())
           put("ts", System.currentTimeMillis())
         }
 
@@ -237,9 +228,6 @@ object OfflineStoreAndForwardManager {
           }
           if (unsyncedLocs.isNotEmpty()) {
             dao.markLocationPointsSynced(unsyncedLocs.map { it.id })
-          }
-          if (unsyncedShots.isNotEmpty()) {
-            dao.markScreenshotsSynced(unsyncedShots.map { it.id })
           }
           refreshPendingCounts(context, childId)
           _syncStats.value = _syncStats.value.copy(
@@ -353,51 +341,16 @@ object OfflineStoreAndForwardManager {
           }
         }
 
-        var addedShots = 0
-        val shotsArr = msg.optJSONArray("screenshots")
-        if (shotsArr != null && shotsArr.length() > 0) {
-          for (i in 0 until shotsArr.length()) {
-            val obj = shotsArr.optJSONObject(i) ?: continue
-            val b64 = obj.optString("base64Bitmap", "")
-            if (b64.isBlank()) continue
-            val appName = obj.optString("activeAppName", "Экран ребёнка")
-            val note = obj.optString("statusNote", "Снимок из оффлайн-архива")
-            val ts = obj.optLong("timestamp", System.currentTimeMillis())
-            val devType = obj.optString("deviceType", "PHONE")
-            dao.insertOfflineScreenshot(
-              OfflineScreenshotEntity(
-                childId = targetChildId,
-                deviceType = devType,
-                activeAppName = appName,
-                statusNote = note,
-                base64Bitmap = b64,
-                timestamp = ts,
-                isSyncedToParent = true
-              )
-            )
-            ScreenShotManager.addCapturedItem(
-              CapturedScreenItem(
-                id = ts,
-                childId = targetChildId,
-                activeAppName = appName,
-                timestamp = ts,
-                timeFormatted = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(ts)),
-                statusNote = note,
-                base64Bitmap = b64
-              )
-            )
-            addedShots++
-          }
-          dao.trimOfflineScreenshots(targetChildId)
-        }
+        // Пункт 6: Никогда не подгружаем старые оффлайн-скриншоты из OFFLINE_HISTORY_BUNDLE в ScreenShotManager,
+        // чтобы родитель всегда видел только реальный живой экран онлайн, а не вчерашний снимок (22:36)!
+        try { dao.deleteOfflineScreenshotsForChild(targetChildId) } catch (_: Exception) {}
 
         val prev = _syncStats.value
         _syncStats.value = prev.copy(
           totalSyncedLogsOnParent = prev.totalSyncedLogsOnParent + addedLogs,
           totalSyncedLocationsOnParent = prev.totalSyncedLocationsOnParent + addedLocs,
-          totalSyncedScreenshotsOnParent = prev.totalSyncedScreenshotsOnParent + addedShots,
           lastSyncTimestampMs = System.currentTimeMillis(),
-          statusMessage = "Получен оффлайн-архив: +$addedLogs событ., +$addedLocs GPS, +$addedShots снимков"
+          statusMessage = "Получен оффлайн-архив: +$addedLogs событ., +$addedLocs GPS"
         )
       } catch (_: Exception) {}
     }

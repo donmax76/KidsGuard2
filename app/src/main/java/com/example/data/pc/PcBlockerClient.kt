@@ -654,6 +654,12 @@ object PcBlockerClient {
     )
   }
 
+  private fun extractPcPacketTimestampMs(msg: JSONObject): Long {
+    val raw = msg.optDouble("ts", msg.optDouble("timestamp", 0.0))
+    if (raw <= 0.0) return 0L
+    return if (raw < 10_000_000_000.0) (raw * 1000.0).toLong() else raw.toLong()
+  }
+
   fun ingestP2pStateJson(msg: JSONObject) {
     // Телефону ребёнка пакеты о ПК не нужны: не тратим его батарею и не пишем чужую историю.
     if (DirectP2pSocketEngine.currentRole == "CHILD") return
@@ -661,23 +667,43 @@ object PcBlockerClient {
     val msgCode = msg.optString("pairing_code", "").trim()
     val msgPcId = msg.optString("pc_id", "").trim()
     if (!matchesConfiguredPc(msgCode, msgPcId)) return
-    markPcContact()
+    val pktTs = extractPcPacketTimestampMs(msg)
+    val now = System.currentTimeMillis()
+    // Пункт 7: Если пакет PC_STATE старше 35 секунд (retained-пакет на брокере при выключенном ПК) —
+    // НЕ помечаем ПК онлайн и НЕ показываем старый снимок экрана!
+    val isLiveNow = pktTs > 0L && kotlin.math.abs(now - pktTs) <= 35_000L
+    if (isLiveNow) {
+      markPcContact()
+    }
     learnPcIdentity(msgCode, msgPcId)
     try {
       val parsed = parseStateJson(
         msg = msg,
         current = _state.value.copy(pairingCode = configuredCode),
-        transport = if (_state.value.isLanHttpAuthenticated) {
+        transport = if (!isLiveNow && !_state.value.isLanHttpAuthenticated) {
+          "🔴 ПК выключен (оффлайн • Код $configuredCode)"
+        } else if (_state.value.isLanHttpAuthenticated) {
           "🟢 Wi-Fi LAN (${_state.value.lanIp}:${_state.value.port}) + Интернет P2P"
         } else {
           "🌐 Интернет P2P-мост (${msg.optString("pc_name", "Windows ПК")} • Код $configuredCode)"
-        }
+        },
+        markContact = isLiveNow
       )
-      val statusErr = msg.optString("auth_error", "")
-      _state.value = if (statusErr.isNotBlank()) {
-        parsed.copy(statusMessage = statusErr)
+      val finalState = if (!isLiveNow && !_state.value.isLanHttpAuthenticated) {
+        parsed.copy(
+          isOnline = false,
+          screenBase64 = "",
+          screenTimestampMs = 0L,
+          statusMessage = "ПК сейчас выключен (показаны сохранённые правила и история)"
+        )
       } else {
         parsed
+      }
+      val statusErr = msg.optString("auth_error", "")
+      _state.value = if (statusErr.isNotBlank()) {
+        finalState.copy(statusMessage = statusErr)
+      } else {
+        finalState
       }
     } catch (_: Exception) {}
   }
@@ -688,6 +714,12 @@ object PcBlockerClient {
     val msgCode = msg.optString("pairing_code", "").trim()
     val msgPcId = msg.optString("pc_id", "").trim()
     if (!matchesConfiguredPc(msgCode, msgPcId)) return
+    val pktTs = extractPcPacketTimestampMs(msg)
+    val now = System.currentTimeMillis()
+    // Пункт 7: Отбрасываем retained-скриншоты выключенного ПК старше 35 секунд!
+    if (pktTs <= 0L || kotlin.math.abs(now - pktTs) > 35_000L) {
+      return
+    }
     markPcContact()
     learnPcIdentity(msgCode, msgPcId)
     val b64 = msg.optString("screen_b64", "")
@@ -695,8 +727,8 @@ object PcBlockerClient {
       _state.value = _state.value.copy(
         pairingCode = configuredCode,
         screenBase64 = b64,
-        screenTimestampMs = msg.optLong("ts", System.currentTimeMillis()),
-        screenReceivedAtMs = System.currentTimeMillis(),
+        screenTimestampMs = pktTs,
+        screenReceivedAtMs = now,
         isOnline = true,
         statusMessage = "Живой кадр монитора ПК получен"
       )
@@ -1578,8 +1610,15 @@ object PcBlockerClient {
     sendCommandWithRetry("/api/delete", data)
   }
 
-  fun parseStateJson(msg: JSONObject, current: PcConnectionState, transport: String): PcConnectionState {
-    markPcContact()
+  fun parseStateJson(
+    msg: JSONObject,
+    current: PcConnectionState,
+    transport: String,
+    markContact: Boolean = true
+  ): PcConnectionState {
+    if (markContact) {
+      markPcContact()
+    }
     val fullObj = msg.optJSONObject("full") ?: JSONObject()
     val fullState = PcFullLockState(
       now = fullObj.optBoolean("now", false),

@@ -211,13 +211,12 @@ fun ScreenStreamDialog(
       remoteTimestamp = 0L
       return@LaunchedEffect
     }
-    onSendCloudCommand("START_LIVE_STREAM", "")
-    onSendCloudCommand("TAKE_SCREENSHOT", "")
     cloudSync.observeScreenSnapshot(childId).collect { snapPair ->
       if (snapPair != null) {
         val (activeApp, b64) = snapPair
-        remoteAppName = activeApp
-        remoteTimestamp = System.currentTimeMillis()
+        if (activeApp.isNotBlank()) {
+          remoteAppName = activeApp
+        }
         if (b64.isNotBlank()) {
           val bmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
             try {
@@ -232,6 +231,7 @@ fun ScreenStreamDialog(
           }
           if (bmp != null) {
             remoteBitmap = bmp
+            remoteTimestamp = System.currentTimeMillis()
             frameSequenceCount++
           }
         }
@@ -239,13 +239,10 @@ fun ScreenStreamDialog(
     }
   }
 
-  // Открытие/сворачивание: включаем и выключаем «живое окно» на телефоне ребёнка.
+  // При сворачивании приложения выключаем «живое окно» на телефоне ребёнка.
   LaunchedEffect(childId, isAppResumed) {
     if (childId <= 0L) return@LaunchedEffect
-    if (isAppResumed) {
-      onSendCloudCommand("START_LIVE_STREAM", "")
-      onSendCloudCommand("TAKE_SCREENSHOT", "")
-    } else {
+    if (!isAppResumed) {
       onSendCloudCommand("STOP_LIVE_STREAM", "")
     }
   }
@@ -255,22 +252,25 @@ fun ScreenStreamDialog(
     if (childId <= 0L || !isAppResumed) return@LaunchedEffect
     var lastStartSentMs = 0L
     while (isAutoStreamActive && isAppResumed) {
-      // «Живое окно» на телефоне живёт 120 с — продлеваем его раз в минуту,
-      // пока родитель реально смотрит экран.
       val nowMs = System.currentTimeMillis()
-      if (nowMs - lastStartSentMs > 60_000L) {
+      // Если кадр не обновлялся более 20 секунд (например, связь прервалась) —
+      // убираем застывший старый кадр, чтобы никогда не показывать устаревший скриншот!
+      if (remoteBitmap != null && remoteTimestamp > 0L && (nowMs - remoteTimestamp > 20_000L)) {
+        remoteBitmap = null
+      }
+      if (nowMs - lastStartSentMs > 45_000L) {
         lastStartSentMs = nowMs
         onSendCloudCommand("START_LIVE_STREAM", "")
       }
       onSendCloudCommand("TAKE_SCREENSHOT", "")
       val fetched = cloudSync.pollLatestScreenSnapshot(childId)
       if (fetched != null) {
-        val (activeApp, b64, _) = fetched
-        remoteAppName = activeApp
-        // Время кадра — по часам РОДИТЕЛЬСКОГО телефона: часы ребёнка могут быть
-        // сдвинуты на час/пояс, и подпись «Обновлено» тогда врёт.
-        remoteTimestamp = System.currentTimeMillis()
-        if (b64.isNotBlank()) {
+        val (activeApp, b64, frameTs) = fetched
+        if (activeApp.isNotBlank()) {
+          remoteAppName = activeApp
+        }
+        val isFreshFrame = kotlin.math.abs(System.currentTimeMillis() - frameTs) <= 20_000L
+        if (b64.isNotBlank() && isFreshFrame) {
           val bmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
             try {
               val bytes = Base64.decode(b64, Base64.DEFAULT)
@@ -281,11 +281,16 @@ fun ScreenStreamDialog(
           }
           if (bmp != null) {
             remoteBitmap = bmp
+            remoteTimestamp = System.currentTimeMillis()
             frameSequenceCount++
           }
         }
       }
-      val delayMs = (refreshIntervalSec * 1000).toLong().coerceAtLeast(1200L)
+      val delayMs = if (remoteBitmap == null) {
+        1100L
+      } else {
+        (refreshIntervalSec * 1000).toLong().coerceAtLeast(1300L)
+      }
       delay(delayMs)
     }
   }

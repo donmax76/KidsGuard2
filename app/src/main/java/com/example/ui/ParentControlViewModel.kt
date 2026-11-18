@@ -463,7 +463,7 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
               repository.sendRemoteCloudCommand(targetChildId, "MAP_VIEWING", "1")
             }
           }
-          kotlinx.coroutines.delay(12_000L)
+          kotlinx.coroutines.delay(8_000L)
           continue
         }
         if (_deviceRole.value == AppRole.CHILD && !com.example.location.LiveLocationTracker.isEmulator()) {
@@ -927,7 +927,6 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     }
     viewModelScope.launch {
       repository.setChildDailyLimit(child.id, limitMinutes)
-      repository.sendRemoteCloudCommand(child.id, "SET_LIMIT", limitMinutes.toString())
       showToast("Лимит для «${child.name}»: ${limitMinutes / 60} ч ${limitMinutes % 60} мин")
     }
   }
@@ -1014,9 +1013,6 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     viewModelScope.launch {
       val newBlocked = !app.isBlocked
       repository.setAppBlocked(app.id, newBlocked)
-      val cmd = if (newBlocked) "BLOCK_APP" else "UNBLOCK_APP"
-      repository.sendRemoteCloudCommand(app.childId, cmd, app.packageName)
-      repository.cloudSync.updateAppBlocked(app.childId, app.packageName, newBlocked)
       showToast(if (newBlocked) "«${app.appName}» принудительно заблокировано!" else "«${app.appName}» разрешено!")
     }
   }
@@ -1024,12 +1020,9 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
   fun setAppsBlockedBatch(appsToUpdate: List<AppControlEntity>, blocked: Boolean) {
     if (appsToUpdate.isEmpty()) return
     viewModelScope.launch {
-      val cmd = if (blocked) "BLOCK_APP" else "UNBLOCK_APP"
       for (app in appsToUpdate) {
         if (app.isBlocked != blocked) {
           repository.setAppBlocked(app.id, blocked)
-          repository.cloudSync.updateAppBlocked(app.childId, app.packageName, blocked)
-          repository.sendRemoteCloudCommand(app.childId, cmd, app.packageName)
         }
       }
       val actionText = if (blocked) "Принудительно заблокировано" else "Разрешено"
@@ -1041,10 +1034,6 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     viewModelScope.launch {
       repository.setAppLimit(appId, limitMinutes)
       val app = repository.getAppById(appId)
-      if (app != null) {
-        repository.sendRemoteCloudCommand(app.childId, "SET_APP_LIMIT", "${app.packageName}:$limitMinutes")
-        repository.cloudSync.updateAppLimit(app.childId, app.packageName, limitMinutes)
-      }
       showToast("Лимит приложения «${app?.appName ?: ""}» обновлен: $limitMinutes мин")
     }
   }

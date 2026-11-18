@@ -41,4 +41,15 @@ object DeviceBatteryUtil {
     }
     return 100
   }
+
+  fun isDeviceCharging(context: Context): Boolean {
+    return try {
+      val batteryFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+      val batteryStatus: Intent? = context.applicationContext.registerReceiver(null, batteryFilter)
+      val status = batteryStatus?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+      status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+    } catch (_: Exception) {
+      false
+    }
+  }
 }

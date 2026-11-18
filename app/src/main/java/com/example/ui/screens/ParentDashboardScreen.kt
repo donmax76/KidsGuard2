@@ -136,6 +136,7 @@ fun ParentDashboardScreen(
   var isTrafficDialogVisible by remember { mutableStateOf(false) }
   var isScreenshotsViewerVisible by remember { mutableStateOf(false) }
   var isLiveStreamVisible by remember { mutableStateOf(false) }
+  var isDebugLogsDialogVisible by remember { mutableStateOf(false) }
 
   val currentChild = activeChild ?: children.firstOrNull()
   val hasChildren = children.isNotEmpty()
@@ -665,6 +666,187 @@ fun ParentDashboardScreen(
             onSendCloudCommand(child.id, "CONFIGURE_VPS", payload)
           }
           showVpsSetupPanel = false
+        }
+      }
+    }
+
+    // ДИАГНОСТИКА И ЛОГИРОВАНИЕ (ВКЛ / ВЫКЛ У РОДИТЕЛЯ)
+    item {
+      val ctx = androidx.compose.ui.platform.LocalContext.current
+      val isLoggingEnabled by com.example.util.DeviceControlDebugger.isLoggingEnabled.collectAsState()
+      val debugLogs by com.example.util.DeviceControlDebugger.logs.collectAsState()
+      val issuesCount = debugLogs.count { it.status == "ERROR" || it.status == "BLOCKED" || it.status == "WARNING" || it.status == "INTERCEPTED" }
+      val latestLog = debugLogs.firstOrNull()
+
+      Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = Slate900),
+        border = androidx.compose.foundation.BorderStroke(
+          1.5.dp,
+          if (isLoggingEnabled) EmeraldShield.copy(alpha = 0.65f) else Slate800
+        ),
+        modifier = Modifier
+          .fillMaxWidth()
+          .testTag("parent_diagnostic_logger_card")
+      ) {
+        Column(
+          modifier = Modifier.padding(16.dp),
+          verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.spacedBy(10.dp),
+              modifier = Modifier.weight(1f)
+            ) {
+              Box(
+                modifier = Modifier
+                  .size(40.dp)
+                  .clip(CircleShape)
+                  .background(if (isLoggingEnabled) EmeraldContainer else Slate800),
+                contentAlignment = Alignment.Center
+              ) {
+                Icon(
+                  imageVector = Icons.Default.Security,
+                  contentDescription = null,
+                  tint = if (isLoggingEnabled) EmeraldShieldLight else Slate400,
+                  modifier = Modifier.size(20.dp)
+                )
+              }
+              Column(modifier = Modifier.weight(1f)) {
+                Text(
+                  text = "Логирование и диагностика",
+                  color = Color.White,
+                  fontSize = 14.sp,
+                  fontWeight = FontWeight.ExtraBold,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                  text = if (isLoggingEnabled) {
+                    "🟢 ВКЛЮЧЕНО • Записей: ${debugLogs.size} (отсечено/сбоев: $issuesCount)"
+                  } else {
+                    "⚪ ВЫКЛЮЧЕНО • Включите для записи всех пакетов и команд"
+                  },
+                  color = if (isLoggingEnabled) EmeraldShieldLight else Slate400,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.SemiBold,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
+                )
+              }
+            }
+
+            Switch(
+              checked = isLoggingEnabled,
+              onCheckedChange = { enabled ->
+                com.example.util.DeviceControlDebugger.setLoggingEnabled(ctx, enabled)
+                currentChild?.let { child ->
+                  onSendCloudCommand(child.id, "SET_REMOTE_LOGGING", if (enabled) "ON" else "OFF")
+                }
+              },
+              colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.White,
+                checkedTrackColor = EmeraldShield,
+                uncheckedThumbColor = Slate400,
+                uncheckedTrackColor = Slate800
+              )
+            )
+          }
+
+          Box(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(RoundedCornerShape(10.dp))
+              .background(Slate950)
+              .clickable { isDebugLogsDialogVisible = true }
+              .padding(10.dp)
+          ) {
+            if (latestLog != null) {
+              Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                  text = "Последнее событие: ${latestLog.action}",
+                  color = CyanLight,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.Bold,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                  text = latestLog.details,
+                  color = Slate200,
+                  fontSize = 10.5.sp,
+                  maxLines = 2,
+                  overflow = TextOverflow.Ellipsis
+                )
+              }
+            } else {
+              Text(
+                text = "Журнал фиксирует все P2P-пакеты, команды блокировки, сирену, батарею, кадры экрана и логи с телефона ребёнка.",
+                color = Slate400,
+                fontSize = 11.sp,
+                lineHeight = 15.sp
+              )
+            }
+          }
+
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+          ) {
+            Button(
+              onClick = { isDebugLogsDialogVisible = true },
+              colors = ButtonDefaults.buttonColors(containerColor = CyanLight, contentColor = Slate950),
+              shape = RoundedCornerShape(10.dp),
+              contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+              modifier = Modifier.weight(1.1f).height(38.dp)
+            ) {
+              Text("📜 Лог (${debugLogs.size})", fontSize = 11.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1)
+            }
+            OutlinedButton(
+              onClick = {
+                com.example.util.DeviceControlDebugger.logFullDeviceSnapshot(
+                  context = ctx,
+                  role = "РОДИТЕЛЬ",
+                  childId = currentChild?.id ?: 1L,
+                  triggerReason = "Запрос с главного экрана"
+                )
+                currentChild?.let { child ->
+                  onSendCloudCommand(child.id, "REQUEST_DEBUG_LOGS", "1")
+                }
+                isDebugLogsDialogVisible = true
+              },
+              border = androidx.compose.foundation.BorderStroke(1.dp, CyanLight.copy(alpha = 0.5f)),
+              shape = RoundedCornerShape(10.dp),
+              contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+              modifier = Modifier.weight(1f).height(38.dp)
+            ) {
+              Text("📡 Срез ребёнка", color = CyanLight, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            }
+            OutlinedButton(
+              onClick = {
+                com.example.util.DeviceControlDebugger.clearLogs()
+                currentChild?.let { child ->
+                  onSendCloudCommand(child.id, "CLEAR_DEBUG_LOGS", "1")
+                }
+                android.widget.Toast.makeText(
+                  ctx,
+                  "Журнал очищен у Родителя + отправлена команда очистки Ребёнку",
+                  android.widget.Toast.LENGTH_SHORT
+                ).show()
+              },
+              border = androidx.compose.foundation.BorderStroke(1.dp, RoseLock.copy(alpha = 0.6f)),
+              shape = RoundedCornerShape(10.dp),
+              contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+              modifier = Modifier.weight(0.9f).height(38.dp)
+            ) {
+              Text("🗑️ Очистить оба", color = RoseLock, fontSize = 10.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            }
+          }
         }
       }
     }
@@ -2142,6 +2324,33 @@ fun ParentDashboardScreen(
     TrafficCalculationDialog(
       estimates = trafficEstimates,
       onDismiss = { isTrafficDialogVisible = false }
+    )
+  }
+
+  if (isDebugLogsDialogVisible) {
+    DebugLogsDialog(
+      onDismiss = { isDebugLogsDialogVisible = false },
+      onRunSelfTest = {
+        currentChild?.let { child ->
+          onSendCloudCommand(child.id, "PING", "1")
+          onSendCloudCommand(child.id, "REQUEST_DEBUG_LOGS", "1")
+        }
+      },
+      onRequestChildLogs = {
+        currentChild?.let { child ->
+          onSendCloudCommand(child.id, "REQUEST_DEBUG_LOGS", "1")
+        }
+      },
+      onToggleRemoteLogging = { enabled ->
+        currentChild?.let { child ->
+          onSendCloudCommand(child.id, "SET_REMOTE_LOGGING", if (enabled) "ON" else "OFF")
+        }
+      },
+      onClearChildLogs = {
+        currentChild?.let { child ->
+          onSendCloudCommand(child.id, "CLEAR_DEBUG_LOGS", "1")
+        }
+      }
     )
   }
 }

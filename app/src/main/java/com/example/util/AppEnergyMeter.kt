@@ -124,36 +124,43 @@ object AppEnergyMeter {
       }
       if (baseTs <= 0L || now - baseTs < 2 * 60_000L) return null
 
-      val levelDrop = baseLevel - level
-      // Полная ёмкость батареи: charge_counter (µА·ч) / уровень заряда. Доля считается
-      // от полной ёмкости, а не от маленькой дельты разряда — иначе при разряде 100%→91%
-      // деление на 9% даёт ложные 97,5% для приложения.
+      val levelDrop = (baseLevel - level).coerceAtLeast(0)
+      // Полная ёмкость батареи: charge_counter (µА·ч) / уровень заряда.
       var capacityMah = if (counter > 0 && level in 1..100) {
         (counter / 1000.0) / (level / 100.0)
       } else {
-        4000.0
+        4500.0
       }
-      capacityMah = maxOf(capacityMah, 4500.0)
+      capacityMah = capacityMah.coerceIn(3000.0, 7000.0)
 
       var usedAppMah = appMahNow - baseAppMah.toDouble()
-      // Аномалия единиц: на некоторых прошивках UidHealthStats отдаёт мА·с или мкА·ч.
-      // Если «расход» неправдоподобно велик (>15% ёмкости), делим до адекватного уровня.
-      if (usedAppMah > capacityMah * 0.15) {
-        usedAppMah /= 1000.0
-        if (usedAppMah > capacityMah * 0.15) {
-          usedAppMah /= 3.6
-        }
+      if (usedAppMah < 0.0) {
+        startWindow(context)
+        return null
       }
-      // Защита от малых дельт: меньше 0,1 мА·ч — шум, не показываем и не «раздуваем».
-      if (usedAppMah < 0.1) {
+      // В Android AOSP (BatteryStatsImpl) ключи UidHealthStats.STATS_POWER_* возвращают
+      // энергию в миллиампер-миллисекундах (мА·мс), где 1 мА·ч = 3 600 000 мА·мс!
+      // Раньше здесь делили только на 1000 и 3.6 (= 3 600 вместо 3 600 000), из-за чего
+      // расход завышался в 1000 раз (например, 0.065% превращалось в 65%)!
+      if (appMahNow > 50_000.0 || usedAppMah > capacityMah * 0.08) {
+        usedAppMah /= 3_600_000.0
+      } else if (usedAppMah > capacityMah * 0.03) {
+        usedAppMah /= 3_600.0
+      }
+
+      // Защита от малых дельт: меньше 0,05 мА·ч — шум, не показываем.
+      if (usedAppMah < 0.05) {
         if (counter >= baseCounter || levelDrop <= 0) startWindow(context)
         return null
       }
 
-      val appPercent = (usedAppMah / capacityMah * 100.0).coerceIn(0.0, 100.0)
-      val hours = ((now - baseTs) / 3_600_000.0).coerceAtLeast(0.05)
-      val mahPerHour = usedAppMah / hours
-      val pctPerHour = (mahPerHour / capacityMah * 100.0).coerceIn(0.0, 100.0)
+      val rawPercent = (usedAppMah / capacityMah * 100.0).coerceIn(0.0, 15.0)
+      // Расход одного фонового приложения не может превышать фактическое падение заряда всего телефона!
+      val maxPossibleByDrop = if (levelDrop > 0) levelDrop.toDouble() else 1.0
+      val appPercent = minOf(rawPercent, maxPossibleByDrop).coerceIn(0.0, 12.0)
+      val hours = ((now - baseTs) / 3_600_000.0).coerceAtLeast(0.08)
+      val mahPerHour = (usedAppMah / hours).coerceIn(0.0, 180.0)
+      val pctPerHour = (mahPerHour / capacityMah * 100.0).coerceIn(0.0, 5.0)
 
       return Reading(
         appPercent = appPercent.roundToInt(),

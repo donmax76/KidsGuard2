@@ -1,5 +1,59 @@
 # KidsGuard2 — HANDOFF
 
+## Сборка run #60 (2026-11-18)
+
+- Версия сборки: **`3.3.35 Pro.60` (`versionCode = 200`)**
+- Комплексное исправление по всем 8 пунктам после полевого теста на телефонах Родителя и Ребёнка:
+  1. **Запрет авто-подключения по имени ребёнка без 6-значного кода сопряжения (`ParentalControlRepository.kt`, `RealtimeCloudRelay.kt`, `FirebaseSyncService.kt`, `AndroidManifest.xml`)**:
+     - В `ParentalControlRepository.addNewChild()` убран поиск и подхват старого профиля из кэша MQTT-брокера по совпадению имени ребёнка. Теперь новый профиль создаётся строго несопряжённым (`isPaired = false`, `batteryLevel = -1`, новый 6-значный `pairingCode`), пока телефон ребёнка реально не введёт этот код.
+     - В `RealtimeCloudRelay.resolveCanonicalChildId`, `mergeChildPreservingLocal`, `deduplicateChildrenCache`, `ParentalControlRepository.observeAllChildren` и `FirebaseSyncService.findChildByPairingCode` отключено склеивание профилей по имени (`sameName`) — связывание работает **только по точному 6-значному `pairingCode`**.
+     - В `AndroidManifest.xml` установлено `android:allowBackup="false"`, чтобы Android не восстанавливал старую базу SQLite после переустановки.
+  2. **Устранены скачки заряда (`75% → 78% → 75%`) и ложный статус «Онлайн» (`RealtimeCloudRelay.kt`, `DirectP2pSocketEngine.kt`, `ParentControlViewModel.kt`, `KidsGuardBackgroundService.kt`)**:
+     - Пакеты `CHILD_STATE` и `CHILD_PATCH` больше **не сохраняются как `retained` на MQTT-брокерах** (`retain = false`), а при подключении к брокеру старые retained-топики принудительно очищаются.
+     - Добавлен монотонный фильтр времени пакета `lastChildTelemetryTsByChild` и отсечение пакетов старше `45 с` (`extractPacketTimestampMs`), поэтому запоздавший пакет со второго брокера (`78%`) никогда не перетирает более свежий реальный заряд (`75%`).
+     - Таймаут онлайна сокращён до `28 с` (`CHILD_ONLINE_TIMEOUT_MS = 28_000L`), `PING` родителя ускорен до `8 с`, при потере сети или остановке сервиса отправляется мгновенный `CHILD_OFFLINE`, а при появлении интернета (`NetworkCallback.onAvailable`) сокет мгновенно переподключается и отправляет реальный заряд и `CHILD_PONG`.
+  3. **Переключатели `GPS` и `Wi-Fi + 4G` больше не включаются сами обратно (`RealtimeCloudRelay.kt`, `ParentalControlRepository.kt`, `KidsGuardBackgroundService.kt`, `KidsGuardAccessibilityService.kt`)**:
+     - Флаги `allowMobileData`, `gpsTrackingEnabled`, `studyModeActive` и `dailyScreenLimitMinutes` закреплены как **авторитетные настройки Родителя** (`ParentAuthoritativeToggles`): входящая телеметрия от телефона ребёнка (`isFromChild == true`) больше не может перезаписать выключенный родителем `GPS` или режим `Только Wi-Fi`.
+     - В `RealtimeCloudRelay.publishChildFields` убрана отправка синтетического `ChildProfileEntity` с дефолтами `allowMobileData = true, gpsTrackingEnabled = true` — теперь отправляется только точечный `CHILD_PATCH`.
+  4. **Устранено самопроизвольное включение вчерашней сирены и повторные срабатывания (`DirectP2pSocketEngine.kt`, `RealtimeCloudRelay.kt`, `FirebaseSyncService.kt`, `SoundAlertManager.kt`, `FloatingChatOverlayService.kt`)**:
+     - Команды `CMD`, `CHAT` и `ALERT` публикуются строго с `retain = false`, при подключении очищаются старые retained-топики `cmd/*`, `chat_*`, `alert_*`, а входящие команды старше `35 с` игнорируются.
+     - В `DirectP2pSocketEngine` добавлена глобальная дедупликация входящих команд (`recentIncomingCmdSignatures`) между брокерами `emqx`, `hivemq`, `VPS` и `LAN`.
+     - При нажатии кнопки «Сирена» убрана повторная отправка `LOUD_RING` внутри `FirebaseSyncService.sendChatMessage` и убран повторный запуск сирены из `FloatingChatOverlayService.vibrateAndChime`, а окно защиты от дублей в `SoundAlertManager` увеличено до `13 с`.
+  5. **Устранено раздвоение сообщений в чате («окей» → два «окей», «привет» → два «привет») (`ParentalControlRepository.kt`, `DirectP2pSocketEngine.kt`, `FloatingChatOverlayService.kt`)**:
+     - Вся вставка входящих и исходящих сообщений чата централизована через `ParentalControlRepository.ingestIncomingChatIfNew` и `recordLocalOutgoingChat` под `Mutex` с 15-секундным окном дедупликации по `(childId, senderRole, text.trim())`, а фоновые слушатели защищены атомарным флагом `backgroundSyncStarted`.
+  6. **Устранён показ вчерашнего (`22:36`) скриншота из оффлайн-пакета (`OfflineStoreAndForwardManager.kt`)**:
+     - В `flushUnsyncedHistoryToParent` и `ingestOfflineBundleOnParent` отключена пересылка и подстановка старых оффлайн-скриншотов в живой экран `ScreenShotManager`.
+  7. **Исправлен показ `65%` энергопотребления и ложный онлайн/скриншот выключенного ПК (`AppEnergyMeter.kt`, `ChildPowerStats.kt`, `PcBlockerClient.kt`)**:
+     - В `AppEnergyMeter.kt` исправлен делитель перевода `мА·мс → мА·ч` (`3_600_000.0` вместо `3_600.0`) с ограничением сверху реальным разрядом батареи.
+     - В `PcBlockerClient.kt` (`ingestP2pStateJson`, `ingestP2pScreenJson`, `parseStateJson`) добавлена проверка свежести `ts` (`<= 35 с`), поэтому выключенный ПК больше никогда не отображается «Онлайн» и не показывает старый кэшированный скриншот с брокера.
+  8. **Аудит всех кнопок управления и бесшовное обновление APK поверх старой версии (`ParentControlViewModel.kt`, `app/build.gradle.kts`)**:
+     - Убрана дублирующая отправка команд в `toggleAppBlocked`, `setAppsBlockedBatch`, `setAppLimit`, `setDailyLimitForActiveChild`; после `BLOCK_APP`/`UNBLOCK_APP`/`LIMIT_APP` телефон ребёнка сразу синхронизирует список приложений обратно родителю.
+     - В `app/build.gradle.kts` `versionCode` поднят до `200`, а `debug.keystore` автоматически разворачивается из `debug.keystore.base64`, чтобы все сборки имели идентичную подпись и устанавливались поверх предыдущей версии без удаления.
+  9. **Полное диагностическое логирование (ВКЛ / ВЫКЛ у Родителя) (`DeviceControlDebugger.kt`, `DebugLogsDialog.kt`, `ParentDashboardScreen.kt`, `RealtimeCloudRelay.kt`, `DirectP2pSocketEngine.kt`)**:
+     - На главный экран Родителя добавлена карточка **«Логирование и диагностика (ВКЛ / ВЫКЛ)»** с переключателем, который включает/выключает подробную запись всех событий на телефоне родителя и на телефоне ребёнка (`SET_REMOTE_LOGGING`), кнопкой **«📡 Лог ребёнка»** (`REQUEST_DEBUG_LOGS`), фильтрами по категориям (`Все`, `Сбои/Отсев`, `Сеть/Команды`, `Ребёнок`) и копированием всего журнала в буфер обмена в 1 клик.
+     - Прямая публичная ссылка на APK `v3.3.35 Pro.60` (`versionCode = 200`): https://kappa.lol/j8yksm.apk
+
+---
+
+## Сборка run #59 (2026-11-17)
+
+- Версия сборки: **`3.3.35 Pro.59` (`versionCode = 124`)**
+- Исправленные проблемы с показом экрана (почему показывался скриншот 30-минутной давности или только название оболочки без картинки):
+  1. **Устранён показ старого скриншота (30-минутной давности) на стороне телефона ребёнка (`ScreenShotManager.kt`, `ChildModeScreen.kt`)**:
+     - В `ScreenShotManager.fallbackToCachedBitmapOrText` и `recordScreenSnapshot` раньше без проверки давности брались `latestProjectionBitmap ?: lastHardwareBitmap ?: lastDecorViewBitmap` (хранившиеся в RAM с момента последнего снимка хоть полчаса назад!), кодировались в Base64 с текущей меткой времени (`timestamp = now`) и отправлялись родителю как «живой» кадр.
+     - Добавлено поле `lastHardwareBitmapMs` и строгая проверка свежести (`< 3.5 с`). Старые кадры и `lastDecorViewBitmap` (снимок собственного окна KidsGuard из `ChildModeScreen.kt`) больше **никогда** не отправляются родителю.
+  2. **Устранён показ старого скриншота на стороне телефона родителя (`DirectP2pSocketEngine.kt`, `ScreenStreamDialog.kt`, `ActiveAppMonitoringCard.kt`)**:
+     - В `DirectP2pSocketEngine.handleIncomingJsonPacket` (строка 1446) и `storeReceivedScreenFrame` при приходе пакета только с названием открытой оболочки/приложения (`updateActiveAppOnly`, где `base64Bitmap` пустой) раньше подставлялся `prevB64` из `_framesByChild` (даже если этому скриншоту было 30 минут!) и ему обновлялся `timestamp = now`.
+     - Теперь `prevB64` сохраняется только если ему не более 15 секунд, а `getLatestDirectFrameForChild`, `ScreenStreamDialog` и `ActiveAppMonitoringCard` автоматически очищают кадр старше 20 секунд, чтобы родитель видел **только реальный живой экран здесь и сейчас**, либо честный статус ожидания/офлайна.
+  3. **Исправлено отсутствие картинки экрана при правильном названии открытой оболочки (`ScreenShotManager.kt`, `KidsGuardAccessibilityService.kt`, `DirectP2pSocketEngine.kt`)**:
+     - В `ScreenShotManager.setLiveStreamEnabled(context, true)` раньше безусловно выставлялся `_isMediaProjectionActive.value = true` даже когда `mediaProjection == null`, а в `startMediaProjection` каждые 5 с вызывался `vd.setSurface(null)`, ломавший `VirtualDisplay` на Android 12–14+. Из-за `isMediaProjectionActive.value == true` служба `KidsGuardAccessibilityService` (строка 353) **пропускала `triggerImmediateCaptureNow()`** и отправляла только текстовое имя приложения (`updateActiveAppOnly`) без картинки!
+     - Добавлен метод `ScreenShotManager.isMediaProjectionDeliveringFreshFrames()` (проверяет, что `mediaProjection != null` и реальный кадр пришёл менее 2.5 с назад), убран `vd.setSurface(null)`, а при попадании `takeScreenshot` в 1-секундный лимит Android 11+ запрос ставится в очередь с автоматическим доснятием через `postDelayed` (вместо возврата `base64Bitmap = null`).
+     - Убран сброс живых кадров из-за расхождения системных часов между телефоном родителя и ребёнка (`now - ts > 60_000L` в `DirectP2pSocketEngine.kt`).
+  4. **Ускорено подключение и переподключение сокета (`DirectP2pSocketEngine.kt`)**:
+     - Общий `globalWriteLock` между всеми брокерами заменён на индивидуальную синхронизацию по каждому сокету (`synchronized(out)`) с параллельной неблокирующей отправкой, а таймаут подключения и шаг реконнекта сокращены до `1.0–2.5 с`.
+
+---
+
 ## Сборка run #58 (2026-11-17)
 
 - Базовый коммит GitHub (`donmax76/KidsGuard2`): `88f1517` / `110fe97` (run #57, `3.3.35 Pro.57`)

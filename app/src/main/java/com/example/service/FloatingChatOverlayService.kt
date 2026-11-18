@@ -98,7 +98,7 @@ class FloatingChatOverlayService : Service() {
       val appContext = context.applicationContext
       val now = System.currentTimeMillis()
       val sig = "$childId|$senderRole|${messageText.trim()}|$isSosAlert"
-      if (sig == lastShownSignature && abs(now - lastShownTimestampMs) < 2000L) {
+      if (sig == lastShownSignature && abs(now - lastShownTimestampMs) < 12_000L) {
         return
       }
       lastShownSignature = sig
@@ -332,9 +332,8 @@ class FloatingChatOverlayService : Service() {
           vibrator.vibrate(if (isSos) 600L else 250L)
         }
       }
-      if (isSos) {
-        SoundAlertManager.playLoudAttentionSignal(applicationContext)
-      }
+      // Siren is triggered directly by LOUD_RING command on Child or SOS alert on Parent;
+      // do not re-trigger it from the chat overlay to prevent double siren playback.
     } catch (_: Exception) {}
   }
 
@@ -877,6 +876,12 @@ class FloatingChatOverlayService : Service() {
           isRead = false,
           isAttentionSignal = false
         )
+        com.example.data.repository.ParentalControlRepository.recordLocalOutgoingChat(
+          targetChildId,
+          role,
+          clean,
+          msg.timestamp
+        )
         val newId = dao.insertChatMessage(msg)
         sync.sendChatMessage(msg.copy(id = newId))
 
@@ -951,6 +956,12 @@ class ChatInlineReplyReceiver : BroadcastReceiver() {
           timestamp = System.currentTimeMillis(),
           isRead = false,
           isAttentionSignal = false
+        )
+        com.example.data.repository.ParentalControlRepository.recordLocalOutgoingChat(
+          childId,
+          role,
+          replyText,
+          msg.timestamp
         )
         val id = dao.insertChatMessage(msg)
         sync.sendChatMessage(msg.copy(id = id))
