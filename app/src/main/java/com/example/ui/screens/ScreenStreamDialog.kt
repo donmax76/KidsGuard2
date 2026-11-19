@@ -247,29 +247,42 @@ fun ScreenStreamDialog(
     }
   }
 
-  // Continuous live polling while dialog is open
+  // Continuous live stream session & fallback polling while dialog is open
   LaunchedEffect(isAutoStreamActive, refreshIntervalSec, childId, isAppResumed) {
     if (childId <= 0L || !isAppResumed) return@LaunchedEffect
     var lastStartSentMs = 0L
+    var lastFallbackShotSentMs = 0L
     while (isAutoStreamActive && isAppResumed) {
       val nowMs = System.currentTimeMillis()
-      // Если кадр не обновлялся более 20 секунд (например, связь прервалась) —
+      // Если кадр не обновлялся более 25 секунд (например, связь прервалась) —
       // убираем застывший старый кадр, чтобы никогда не показывать устаревший скриншот!
-      if (remoteBitmap != null && remoteTimestamp > 0L && (nowMs - remoteTimestamp > 20_000L)) {
+      if (remoteBitmap != null && remoteTimestamp > 0L && (nowMs - remoteTimestamp > 25_000L)) {
         remoteBitmap = null
       }
-      if (nowMs - lastStartSentMs > 45_000L) {
+      // Поддерживаем активное окно прямой трансляции (START_LIVE_STREAM) каждые 25 секунд.
+      // Ребёнок сам шлёт кадры каждые 0.65–1.8 с без спама командами!
+      if (nowMs - lastStartSentMs > 25_000L) {
+        val isInitialStart = lastStartSentMs == 0L
         lastStartSentMs = nowMs
         onSendCloudCommand("START_LIVE_STREAM", "")
+        if (isInitialStart) {
+          lastFallbackShotSentMs = nowMs
+          onSendCloudCommand("TAKE_SCREENSHOT", "")
+        }
+      } else if ((remoteBitmap == null || (nowMs - remoteTimestamp) >= 4_200L) &&
+                 (nowMs - lastFallbackShotSentMs) >= 3_200L) {
+        // Резервный пинок TAKE_SCREENSHOT только если новых кадров не было дольше 4.2 секунд
+        lastFallbackShotSentMs = nowMs
+        onSendCloudCommand("TAKE_SCREENSHOT", "")
       }
-      onSendCloudCommand("TAKE_SCREENSHOT", "")
+
       val fetched = cloudSync.pollLatestScreenSnapshot(childId)
       if (fetched != null) {
         val (activeApp, b64, frameTs) = fetched
         if (activeApp.isNotBlank()) {
           remoteAppName = activeApp
         }
-        val isFreshFrame = kotlin.math.abs(System.currentTimeMillis() - frameTs) <= 20_000L
+        val isFreshFrame = kotlin.math.abs(System.currentTimeMillis() - frameTs) <= 25_000L
         if (b64.isNotBlank() && isFreshFrame) {
           val bmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
             try {
@@ -287,9 +300,9 @@ fun ScreenStreamDialog(
         }
       }
       val delayMs = if (remoteBitmap == null) {
-        1100L
+        1200L
       } else {
-        (refreshIntervalSec * 1000).toLong().coerceAtLeast(1300L)
+        (refreshIntervalSec * 1000).toLong().coerceAtLeast(1500L)
       }
       delay(delayMs)
     }

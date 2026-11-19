@@ -265,16 +265,26 @@ class KidsGuardBackgroundService : Service() {
         com.example.util.DeviceTotalLockManager.releaseTotalLock(applicationContext)
       }
 
-      // Sync real installed apps from Child's physical phone to Cloud on service start
+      // Sync real installed apps from Child's physical phone to Cloud on service start (PRESERVING existing isBlocked & dailyLimitMinutes!)
       launch(Dispatchers.IO) {
         try {
           DeviceUsageTracker.ensureDailyMidnightReset(applicationContext, activeChildId)
           val realApps = com.example.util.DeviceAppsProvider.getInstalledLaunchableApps(applicationContext, activeChildId)
           if (realApps.isNotEmpty()) {
-            dao.deleteAppsForChild(activeChildId)
-            dao.insertApps(realApps)
+            val prevApps = dao.getAppsForChildOnce(activeChildId).associateBy { it.packageName.trim().lowercase() }
+            val merged = realApps.map { app ->
+              val prev = prevApps[app.packageName.trim().lowercase()]
+              if (prev != null) {
+                app.copy(
+                  isBlocked = prev.isBlocked,
+                  dailyLimitMinutes = prev.dailyLimitMinutes,
+                  usedMinutesToday = maxOf(app.usedMinutesToday, prev.usedMinutesToday)
+                )
+              } else app
+            }
+            dao.replaceChildAppsStrictlyFromRemote(activeChildId, merged)
             if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) {
-              cloudSync.uploadChildApps(activeChildId, realApps)
+              cloudSync.uploadChildApps(activeChildId, merged)
             }
           }
           DeviceUsageTracker.syncRealUsageStats(applicationContext, activeChildId)
@@ -354,13 +364,17 @@ class KidsGuardBackgroundService : Service() {
               val appEntity = dao.getAppByPackageOnce(activeChildId, activePkg)
               if (appEntity?.isBlocked == true) {
                 com.example.ui.screens.ChildLockScreenActivity.launch(
-                  applicationContext,
-                  "Приложение «${appEntity.appName}» заблокировано родительским контролем KidsGuard"
+                  context = applicationContext,
+                  reason = "Приложение «${appEntity.appName}» заблокировано родительским контролем KidsGuard",
+                  isDeviceTotalLock = false,
+                  blockedPackageName = activePkg
                 )
               } else if (dailyLimit in 1..usedToday) {
                 com.example.ui.screens.ChildLockScreenActivity.launch(
-                  applicationContext,
-                  "Дневной лимит экранного времени ($dailyLimit мин) на сегодня исчерпан!"
+                  context = applicationContext,
+                  reason = "Дневной лимит экранного времени ($dailyLimit мин) на сегодня исчерпан!",
+                  isDeviceTotalLock = false,
+                  blockedPackageName = activePkg
                 )
               }
             }
@@ -421,12 +435,14 @@ class KidsGuardBackgroundService : Service() {
         }
       }
 
-      // 4. Smart Battery & Telemetry loop (strictly bound to thisDeviceChildId; network gated on Parent presence)
+      // 4. Smart Battery & Online Heartbeat loop:
+      // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (Этап 4): Ребёнок отправляет легкий CHILD_PONG каждые 30 секунд
+      // даже когда родитель закрыл приложение более чем на 1 час (isParentActivelyConnected == false).
+      // Благодаря этому телефон ребёнка НИКОГДА не уходит в «Оффлайн» через 1 час!
       launch {
         var lastSyncedBattery = -1
         var lastSyncedChildId = -1L
         var lastSyncTimeMs = 0L
-        var lastEnergyPublishMs = 0L
         while (isActive) {
           try {
             val latestCfg = dao.getFamilyConfigOnce()
@@ -439,42 +455,31 @@ class KidsGuardBackgroundService : Service() {
               val batteryLevel = readBatteryLevel()
               val now = System.currentTimeMillis()
               // Экран выключен — батарея почти не меняется, обновляем её реже.
-              val batterySyncInterval = if (screenInteractive) 180_000L else 600_000L
+              val batterySyncInterval = if (screenInteractive) 120_000L else 300_000L
               if (batteryLevel != lastSyncedBattery || activeChildId != lastSyncedChildId || (now - lastSyncTimeMs) >= batterySyncInterval) {
                 lastSyncedBattery = batteryLevel
                 lastSyncedChildId = activeChildId
                 lastSyncTimeMs = now
-                // В профиль ребёнка пишем версию установленного APK (PackageManager),
-                // а не BuildConfig горячего ядра.
                 val apkVer = com.example.util.AppVersionInfo.installedApkVersion(applicationContext)
                 dao.updateChildBattery(activeChildId, batteryLevel)
                 dao.updateChildAppVersion(activeChildId, apkVer)
+                cloudSync.upsertBatteryLevel(activeChildId, batteryLevel)
                 if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) {
-                  cloudSync.upsertBatteryLevel(activeChildId, batteryLevel)
                   cloudSync.syncChildAppVersion(activeChildId, apkVer)
                 }
               }
-              // HealthStats — ТОЛЬКО по явному REQUEST_POWER_STATS при открытии
-              // приложения родителя (обработчик команды ниже). В цикле НЕ читаем.
             }
           } catch (e: Exception) {
             Log.e(TAG, "Battery sync error: ${e.message}")
           }
-          // Ребёнок всегда сообщает о своём онлайне на каждой итерации цикла.
+          // Ребёнок всегда сообщает о своём онлайне каждые 30–45 секунд (независимо от таймера присутствия родителя!).
           try {
-            com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
-          } catch (_: Exception) {}
-          // Экран погашен — нет смысла будить процесс каждую минуту: переходим в
-          // глубокий экономный режим (раз в 5 минут), чтобы не сажать батарею.
-          val screenInteractiveForDelay = DeviceUsageTracker.isInteractive(applicationContext)
-          val parentOnline = com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
-          delay(
-            when {
-              !screenInteractiveForDelay -> 300_000L
-              parentOnline -> 60_000L
-              else -> 180_000L
+            if (activeChildId > 0) {
+              com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
             }
-          )
+          } catch (_: Exception) {}
+          val screenInteractiveForDelay = DeviceUsageTracker.isInteractive(applicationContext)
+          delay(if (screenInteractiveForDelay) 30_000L else 45_000L)
         }
       }
 
@@ -553,7 +558,13 @@ class KidsGuardBackgroundService : Service() {
                           }
                           cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
                           if (isBlocked && DeviceUsageTracker.resolveCurrentForegroundPackage(applicationContext) == pkg) {
-                            bringLockScreenToFront()
+                            val label = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, pkg)
+                            com.example.ui.screens.ChildLockScreenActivity.launch(
+                              context = applicationContext,
+                              reason = "Приложение «$label» заблокировано родительским контролем KidsGuard",
+                              isDeviceTotalLock = false,
+                              blockedPackageName = pkg
+                            )
                           }
                         }
                       }

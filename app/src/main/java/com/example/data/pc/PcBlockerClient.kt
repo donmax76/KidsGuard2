@@ -608,6 +608,41 @@ object PcBlockerClient {
     requestSync()
   }
 
+  /**
+   * Строгий приоритет отображения канала связи для ПК:
+   * 1) ☁️ VPS (если подключён VPS-релей)
+   * 2) 🟢 LAN (если подключён прямой Wi-Fi LAN к ПК)
+   * 3) 🌐 P2P Воркеры (резервный облачный мост)
+   */
+  fun computePcTransportLabel(
+    pcName: String = _state.value.pcName,
+    lanAuth: Boolean = _state.value.isLanHttpAuthenticated,
+    lanIp: String = _state.value.lanIp,
+    port: Int = _state.value.port
+  ): String {
+    val vpsActive = DirectP2pSocketEngine.isVpsRelayConnected()
+    val vpsHostLabel = DirectP2pSocketEngine.getVpsRelayHostLabel()
+    val cleanName = pcName.ifBlank { "Windows ПК" }
+    return when {
+      vpsActive && lanAuth && lanIp.isNotBlank() ->
+        "☁️ Канал ПК: VPS ($vpsHostLabel) + 🟢 LAN ($lanIp:$port)"
+      vpsActive ->
+        "☁️ Канал ПК: VPS ($vpsHostLabel • Код $configuredCode)"
+      lanAuth && lanIp.isNotBlank() ->
+        "🟢 Канал ПК: LAN ($lanIp:$port)"
+      else ->
+        "🌐 Канал ПК: P2P Воркеры ($cleanName • Код $configuredCode)"
+    }
+  }
+
+  private fun computePcStreamTransportLabel(): String {
+    return if (DirectP2pSocketEngine.isVpsRelayConnected()) {
+      "☁️ VPS (${DirectP2pSocketEngine.getVpsRelayHostLabel()}) • живой поток"
+    } else {
+      "🌐 P2P Воркеры • живой поток"
+    }
+  }
+
   fun onUdpBeaconReceived(pcName: String, ip: String, port: Int, pairingCode: String, pcId: String = "") {
     if (forceP2pOnlyMode) return
     loadPersistedPcIdentity()
@@ -638,19 +673,19 @@ object PcBlockerClient {
     persistPcIdentity()
     val cur = _state.value
     val updatedIp = if (ip.isNotBlank() && ip != "127.0.0.1") ip else cur.lanIp
+    val resolvedPort = if (port in 1024..65535) port else cur.port
     _state.value = cur.copy(
       pcName = pcName.ifBlank { cur.pcName },
       lanIp = updatedIp,
-      port = if (port in 1024..65535) port else cur.port,
+      port = resolvedPort,
       pairingCode = configuredCode,
       isOnline = true,
-      // Тот же текст, что и у PC_STATE: иначе маяк и состояние переключали
-      // «ПК в сети» ↔ «Интернет P2P» каждые несколько секунд.
-      transportLabel = if (cur.isLanHttpAuthenticated) {
-        "🟢 Wi-Fi LAN ($updatedIp:$port) + Интернет P2P"
-      } else {
-        "🌐 Интернет P2P-мост (${pcName.ifBlank { "Windows ПК" }} • Код $configuredCode)"
-      }
+      transportLabel = computePcTransportLabel(
+        pcName = pcName.ifBlank { cur.pcName },
+        lanAuth = cur.isLanHttpAuthenticated,
+        lanIp = updatedIp,
+        port = resolvedPort
+      )
     )
   }
 
@@ -682,10 +717,13 @@ object PcBlockerClient {
         current = _state.value.copy(pairingCode = configuredCode),
         transport = if (!isLiveNow && !_state.value.isLanHttpAuthenticated) {
           "🔴 ПК выключен (оффлайн • Код $configuredCode)"
-        } else if (_state.value.isLanHttpAuthenticated) {
-          "🟢 Wi-Fi LAN (${_state.value.lanIp}:${_state.value.port}) + Интернет P2P"
         } else {
-          "🌐 Интернет P2P-мост (${msg.optString("pc_name", "Windows ПК")} • Код $configuredCode)"
+          computePcTransportLabel(
+            pcName = msg.optString("pc_name", _state.value.pcName),
+            lanAuth = _state.value.isLanHttpAuthenticated,
+            lanIp = _state.value.lanIp,
+            port = _state.value.port
+          )
         },
         markContact = isLiveNow
       )
@@ -730,6 +768,7 @@ object PcBlockerClient {
         screenTimestampMs = pktTs,
         screenReceivedAtMs = now,
         isOnline = true,
+        transportLabel = computePcTransportLabel(),
         statusMessage = "Живой кадр монитора ПК получен"
       )
     }
@@ -985,7 +1024,7 @@ object PcBlockerClient {
       if (!acceptFrameTimestamp(ts)) return
       val jpeg = ByteArray(buf.remaining())
       buf.get(jpeg)
-      publishFrameBytes(jpeg, "🌐 Интернет P2P • живой поток")
+      publishFrameBytes(jpeg, computePcStreamTransportLabel())
     } catch (_: Exception) {
     }
   }
@@ -1007,7 +1046,7 @@ object PcBlockerClient {
     scope.launch(Dispatchers.Default) {
       try {
         val bytes = Base64.decode(b64, Base64.DEFAULT)
-        publishFrameBytes(bytes, "🌐 Интернет P2P • живой поток")
+        publishFrameBytes(bytes, computePcStreamTransportLabel())
       } catch (_: Exception) {
       }
     }
@@ -1096,8 +1135,8 @@ object PcBlockerClient {
         _state.value = _state.value.copy(
           lanIp = "",
           isLanHttpAuthenticated = false,
-          transportLabel = "🌐 Интернет P2P-мост (Код $configuredCode)",
-          statusMessage = "Подключение строго через P2P по коду $configuredCode (LAN IP отключён)..."
+          transportLabel = computePcTransportLabel(lanAuth = false, lanIp = ""),
+          statusMessage = "Подключение по коду $configuredCode (${computePcTransportLabel(lanAuth = false, lanIp = "")})..."
         )
         requestSync()
         requestPcScreenshot()
@@ -1133,8 +1172,8 @@ object PcBlockerClient {
               port = cleanPort,
               isOnline = true,
               isLanHttpAuthenticated = true,
-              transportLabel = "🟢 Wi-Fi LAN ($cleanIp:$cleanPort) + Интернет P2P",
-              statusMessage = "Успешный вход в Hosts Blocker по Wi-Fi + P2P!"
+              transportLabel = computePcTransportLabel(lanAuth = true, lanIp = cleanIp, port = cleanPort),
+              statusMessage = "Успешный вход в Hosts Blocker (${computePcTransportLabel(lanAuth = true, lanIp = cleanIp, port = cleanPort)})!"
             )
             fetchLanStateNow(cleanIp, cleanPort)
           } else {
@@ -1150,8 +1189,8 @@ object PcBlockerClient {
         _state.value = _state.value.copy(
           lanIp = cleanIp,
           port = cleanPort,
-          transportLabel = "🌐 Интернет P2P-мост (Код ${_state.value.pairingCode})",
-          statusMessage = "Вне домашнего Wi-Fi ($cleanIp недоступен) — работаем через Интернет P2P-мост"
+          transportLabel = computePcTransportLabel(lanAuth = false, lanIp = cleanIp, port = cleanPort),
+          statusMessage = "Вне домашнего Wi-Fi ($cleanIp недоступен) — работаем через ${computePcTransportLabel(lanAuth = false, lanIp = cleanIp, port = cleanPort)}"
         )
         requestSync()
       } finally {

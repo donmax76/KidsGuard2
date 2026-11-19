@@ -163,6 +163,7 @@ object SosEmergencySender {
   fun verifyPinAndUnlockDevice(
     context: Context,
     enteredPin: String,
+    blockedPackageName: String? = null,
     onResult: (Boolean) -> Unit
   ) {
     val appContext = context.applicationContext
@@ -183,7 +184,44 @@ object SosEmergencySender {
             ?: allChildren.firstOrNull()?.id
             ?: 1L
 
-          // Unlock all local child records and publish authoritative UNLOCK state
+          // 1. Если окно блокировки было открыто для конкретного приложения —
+          // полностью разблокируем это приложение до новой блокировки родителем и синхронизируем с родителями!
+          val targetPkg = blockedPackageName?.trim()?.takeIf { it.isNotBlank() }
+            ?: com.example.service.KidsGuardAccessibilityService.instance?.getCurrentBlockedOverlayPackage()
+          if (!targetPkg.isNullOrBlank()) {
+            com.example.service.KidsGuardAccessibilityService.instance?.unblockPackageLocallyByPin(targetPkg)
+            val existingApp = dao.getAppByPackageOnce(boundId, targetPkg)
+            if (existingApp != null) {
+              dao.setAppBlocked(existingApp.id, false)
+              if (existingApp.dailyLimitMinutes > 0 && existingApp.usedMinutesToday >= existingApp.dailyLimitMinutes) {
+                dao.setAppLimit(existingApp.id, 0)
+              }
+            }
+            for (c in allChildren) {
+              val appForChild = dao.getAppByPackageOnce(c.id, targetPkg)
+              if (appForChild != null) {
+                dao.setAppBlocked(appForChild.id, false)
+              }
+            }
+            try {
+              RealtimeCloudRelay.publishAppUpdate(
+                childId = boundId,
+                packageName = targetPkg,
+                isBlocked = false,
+                limitMinutes = null
+              )
+              val updatedApps = dao.getAppsForChildOnce(boundId)
+              CloudSyncManager(appContext).uploadChildApps(boundId, updatedApps)
+            } catch (_: Exception) {}
+            DeviceControlDebugger.logEvent(
+              "РАЗБЛОКИРОВКА_ПО_PIN",
+              "Приложение «$targetPkg» полностью разблокировано PIN-кодом родителя и синхронизировано с родителями",
+              "SUCCESS",
+              "CHILD"
+            )
+          }
+
+          // 2. Снимаем общую блокировку экрана, если она была включена
           for (c in allChildren) {
             dao.setChildDeviceLocked(c.id, false)
             RealtimeCloudRelay.publishAuthoritativeLock(c.id, false)

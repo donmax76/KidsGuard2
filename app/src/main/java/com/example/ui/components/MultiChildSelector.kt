@@ -364,59 +364,160 @@ fun PairingCodeDialog(
 @Composable
 fun AddChildDialog(
   onDismiss: () -> Unit,
-  onConfirm: (name: String, age: Int, dailyLimit: Int) -> Unit
+  onConfirm: (name: String, age: Int, dailyLimit: Int) -> Unit,
+  onConnectExistingByCode: (pairingCode: String, customName: String) -> Unit = { _, _ -> }
 ) {
+  var isSecondParentMode by remember { mutableStateOf(false) }
   var name by remember { mutableStateOf("") }
   var ageText by remember { mutableStateOf("10") }
   var limitMinutesText by remember { mutableStateOf("120") }
+  var pairingCodeInput by remember { mutableStateOf("") }
 
   AlertDialog(
     onDismissRequest = onDismiss,
-    title = { Text("Добавить ребенка в семью", color = Color.White) },
+    title = {
+      Text(
+        text = if (isSecondParentMode) "Подключить по 6-значному коду" else "Добавить ребенка в семью",
+        color = Color.White,
+        fontSize = 17.sp,
+        fontWeight = FontWeight.Bold
+      )
+    },
     text = {
       Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        OutlinedTextField(
-          value = name,
-          onValueChange = { name = it },
-          label = { Text("Имя ребенка") },
-          placeholder = { Text("Введите имя ребенка") },
+        // Переключатель режима: Новый профиль ИЛИ 2-й родитель по 6-значному коду
+        Row(
           modifier = Modifier
             .fillMaxWidth()
-            .testTag("add_child_name_input"),
-          singleLine = true
-        )
+            .clip(RoundedCornerShape(10.dp))
+            .background(Slate950)
+            .padding(4.dp),
+          horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+          Box(
+            modifier = Modifier
+              .weight(1f)
+              .clip(RoundedCornerShape(8.dp))
+              .background(if (!isSecondParentMode) CyanLight else Color.Transparent)
+              .clickable { isSecondParentMode = false }
+              .padding(vertical = 8.dp),
+            contentAlignment = Alignment.Center
+          ) {
+            Text(
+              text = "Новый профиль",
+              color = if (!isSecondParentMode) Slate950 else Slate200,
+              fontSize = 12.sp,
+              fontWeight = FontWeight.Bold
+            )
+          }
+          Box(
+            modifier = Modifier
+              .weight(1f)
+              .clip(RoundedCornerShape(8.dp))
+              .background(if (isSecondParentMode) EmeraldShieldLight else Color.Transparent)
+              .clickable { isSecondParentMode = true }
+              .padding(vertical = 8.dp),
+            contentAlignment = Alignment.Center
+          ) {
+            Text(
+              text = "По коду (2-й родитель)",
+              color = if (isSecondParentMode) Slate950 else Slate200,
+              fontSize = 12.sp,
+              fontWeight = FontWeight.Bold
+            )
+          }
+        }
 
-        OutlinedTextField(
-          value = ageText,
-          onValueChange = { ageText = it.filter { ch -> ch.isDigit() } },
-          label = { Text("Возраст (лет)") },
-          modifier = Modifier.fillMaxWidth(),
-          singleLine = true
-        )
+        if (isSecondParentMode) {
+          Text(
+            text = "Для подключения второго родителя (Мать и Отец) введите 6-значный код привязки уже настроенного телефона ребенка. Все текущие блокировки и лимиты загрузятся автоматически.",
+            color = Slate400,
+            fontSize = 12.sp,
+            lineHeight = 16.sp
+          )
 
-        OutlinedTextField(
-          value = limitMinutesText,
-          onValueChange = { limitMinutesText = it.filter { ch -> ch.isDigit() } },
-          label = { Text("Дневной лимит (минут)") },
-          placeholder = { Text("например: 120 (2 часа)") },
-          modifier = Modifier.fillMaxWidth(),
-          singleLine = true
-        )
+          OutlinedTextField(
+            value = pairingCodeInput,
+            onValueChange = { raw ->
+              val digits = raw.filter { it.isDigit() }.take(6)
+              pairingCodeInput = if (digits.length > 3) "${digits.take(3)}-${digits.substring(3)}" else digits
+            },
+            label = { Text("6-значный код привязки ребенка") },
+            placeholder = { Text("Например: 102-702") },
+            modifier = Modifier
+              .fillMaxWidth()
+              .testTag("second_parent_code_input"),
+            singleLine = true
+          )
+
+          OutlinedTextField(
+            value = name,
+            onValueChange = { name = it },
+            label = { Text("Имя ребенка (необязательно)") },
+            placeholder = { Text("Подтянется автоматически или введите имя") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+          )
+        } else {
+          OutlinedTextField(
+            value = name,
+            onValueChange = { name = it },
+            label = { Text("Имя ребенка") },
+            placeholder = { Text("Введите имя ребенка") },
+            modifier = Modifier
+              .fillMaxWidth()
+              .testTag("add_child_name_input"),
+            singleLine = true
+          )
+
+          OutlinedTextField(
+            value = ageText,
+            onValueChange = { ageText = it.filter { ch -> ch.isDigit() } },
+            label = { Text("Возраст (лет)") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+          )
+
+          OutlinedTextField(
+            value = limitMinutesText,
+            onValueChange = { limitMinutesText = it.filter { ch -> ch.isDigit() } },
+            label = { Text("Дневной лимит (минут)") },
+            placeholder = { Text("например: 120 (2 часа)") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+          )
+        }
       }
     },
     confirmButton = {
-      Button(
-        onClick = {
-          if (name.isNotBlank()) {
-            val age = ageText.toIntOrNull() ?: 10
-            val limit = limitMinutesText.toIntOrNull() ?: 120
-            onConfirm(name.trim(), age, limit)
-          }
-        },
-        colors = ButtonDefaults.buttonColors(containerColor = CyanLight, contentColor = Slate950),
-        modifier = Modifier.testTag("submit_add_child_button")
-      ) {
-        Text("Создать профиль")
+      if (isSecondParentMode) {
+        val cleanDigits = pairingCodeInput.filter { it.isDigit() }
+        Button(
+          onClick = {
+            if (cleanDigits.length == 6) {
+              onConnectExistingByCode(pairingCodeInput.trim(), name.trim())
+            }
+          },
+          enabled = cleanDigits.length == 6,
+          colors = ButtonDefaults.buttonColors(containerColor = EmeraldShieldLight, contentColor = Slate950),
+          modifier = Modifier.testTag("submit_second_parent_code_button")
+        ) {
+          Text("Подключить и загрузить блокировки", fontWeight = FontWeight.Bold)
+        }
+      } else {
+        Button(
+          onClick = {
+            if (name.isNotBlank()) {
+              val age = ageText.toIntOrNull() ?: 10
+              val limit = limitMinutesText.toIntOrNull() ?: 120
+              onConfirm(name.trim(), age, limit)
+            }
+          },
+          colors = ButtonDefaults.buttonColors(containerColor = CyanLight, contentColor = Slate950),
+          modifier = Modifier.testTag("submit_add_child_button")
+        ) {
+          Text("Создать профиль", fontWeight = FontWeight.Bold)
+        }
       }
     },
     dismissButton = {

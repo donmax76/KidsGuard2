@@ -504,6 +504,7 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
             alerts = alerts,
             onSelectChild = { viewModel.selectChild(it) },
             onAddNewChild = { name, age, limit -> viewModel.addNewChild(name, age, limit) },
+            onConnectSecondParentByCode = { code, customName -> viewModel.connectSecondParentByCode(code, customName) },
             onDeleteChild = { viewModel.deleteChild(it) },
             onToggleRemoteLock = { viewModel.toggleRemoteLockForActiveChild() },
             onToggleStudyMode = { viewModel.toggleStudyModeForActiveChild() },

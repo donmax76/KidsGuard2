@@ -137,13 +137,51 @@ object DirectP2pSocketEngine {
   @Volatile private var vpsWebSocket: WebSocket? = null
   @Volatile private var vpsConnected = false
   @Volatile private var vpsConnecting = false
+  @Volatile private var vpsPathIndex = 0
+  @Volatile private var activeP2pBrokerHost = "broker.emqx.io:1883"
   @Volatile private var vpsPingJob: kotlinx.coroutines.Job? = null
+  @Volatile private var vpsConnAckTimeoutJob: kotlinx.coroutines.Job? = null
   private val vpsHttpClient: OkHttpClient by lazy {
     OkHttpClient.Builder()
-      .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+      .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
       .readTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
       .pingInterval(20, java.util.concurrent.TimeUnit.SECONDS)
       .build()
+  }
+
+  fun isVpsRelayConnected(): Boolean = vpsEnabled && vpsConnected
+
+  fun isVpsRelayEnabled(): Boolean = vpsEnabled
+
+  fun getVpsRelayHostLabel(): String = if (vpsHost.isNotBlank()) "$vpsHost:$vpsPort" else ""
+
+  /**
+   * Строгий приоритет отображения и выбора активного канала связи:
+   * 1) ☁️ VPS (если включён и подключён)
+   * 2) 🟢 LAN (если устройства в одной локальной сети Wi-Fi)
+   * 3) 🌐 P2P Воркеры (резервный облачный канал broker.emqx.io / broker.hivemq.com)
+   */
+  fun computeActiveTransportLabel(
+    lanConnectedOverride: Boolean? = null,
+    globalConnectedOverride: Boolean? = null
+  ): String {
+    val cur = _status.value
+    val lanConn = lanConnectedOverride ?: (cur.isLanSocketConnected || connectedParentClients.isNotEmpty())
+    val globalConn = globalConnectedOverride ?: (cur.isGlobalTcpSocketConnected || globalTcpOuts.isNotEmpty())
+    val lanIp = cur.childLanIp.ifBlank { cur.localDeviceIp.ifBlank { getLocalIpv4Address() } }
+    return when {
+      vpsEnabled && vpsConnected ->
+        if (lanConn) "☁️ Канал связи: VPS ($vpsHost:$vpsPort) + 🟢 LAN ($lanIp)"
+        else "☁️ Канал связи: VPS ($vpsHost:$vpsPort)"
+      lanConn ->
+        "🟢 Канал связи: LAN ($lanIp:$TCP_PORT)"
+      globalConn ->
+        "🌐 Канал связи: P2P Воркеры ($activeP2pBrokerHost)"
+      vpsEnabled && vpsConnecting ->
+        "⏳ Подключение к VPS ($vpsHost:$vpsPort) • резерв LAN / P2P..."
+      else ->
+        "⏳ Подключение канала связи (VPS -> LAN -> P2P Воркеры)..."
+    }
   }
 
   // --- Честный сетевой режим «Только Wi-Fi» vs «Wi-Fi + 4G» ---
@@ -653,9 +691,15 @@ object DirectP2pSocketEngine {
         _status.value = _status.value.copy(
           isLanSocketConnected = true,
           childLanIp = cleanIp,
-          activeTransportLabel = "🟢 Прямой P2P Сокет LAN ($cleanIp:$TCP_PORT)"
+          activeTransportLabel = computeActiveTransportLabel(lanConnectedOverride = true)
         )
         Log.d(TAG, "Connected direct P2P TCP socket to Child at $cleanIp:$TCP_PORT")
+        com.example.util.DeviceControlDebugger.logEvent(
+          "LAN_СОКЕТ_ПОДКЛЮЧЕН",
+          "Прямой локальный канал LAN подключён ($cleanIp:$TCP_PORT) • Активный транспорт: ${computeActiveTransportLabel(lanConnectedOverride = true)}",
+          "SUCCESS",
+          "P2P"
+        )
 
         writer.println(JSONObject().apply {
           put("type", "CMD")
@@ -676,11 +720,7 @@ object DirectP2pSocketEngine {
         isConnectingLan.set(false)
         _status.value = _status.value.copy(
           isLanSocketConnected = false,
-          activeTransportLabel = if (_status.value.isGlobalTcpSocketConnected) {
-            "⚡ Прямой бинарный TCP-Сокет (Реальное время • 88 мс)"
-          } else {
-            "Переподключение P2P TCP-сокета..."
-          }
+          activeTransportLabel = computeActiveTransportLabel(lanConnectedOverride = false)
         )
       }
     }
@@ -702,7 +742,8 @@ object DirectP2pSocketEngine {
           connectedParentClients.add(writer)
           _status.value = _status.value.copy(
             isLanSocketConnected = true,
-            activeTransportLabel = "🟢 Прямой P2P Сокет LAN ($clientIp)"
+            childLanIp = clientIp,
+            activeTransportLabel = computeActiveTransportLabel(lanConnectedOverride = true)
           )
           markParentPresenceActive(thisDeviceBoundChildId.takeIf { it > 0L } ?: 1L)
 
@@ -717,6 +758,12 @@ object DirectP2pSocketEngine {
             } finally {
               connectedParentClients.remove(writer)
               try { client.close() } catch (_: Exception) {}
+              if (connectedParentClients.isEmpty()) {
+                _status.value = _status.value.copy(
+                  isLanSocketConnected = false,
+                  activeTransportLabel = computeActiveTransportLabel(lanConnectedOverride = false)
+                )
+              }
             }
           }
         }
@@ -965,14 +1012,15 @@ object DirectP2pSocketEngine {
           sock.soTimeout = 35_000
           globalSockets.add(sock)
           globalTcpOuts.add(out)
+          activeP2pBrokerHost = "$host:$port"
           _status.value = _status.value.copy(
             isGlobalTcpSocketConnected = true,
-            activeTransportLabel = "⚡ Прямой бинарный TCP-Сокет ($host:$port)"
+            activeTransportLabel = computeActiveTransportLabel(globalConnectedOverride = true)
           )
           Log.d(TAG, "Connected persistent binary TCP socket to $host:$port")
           com.example.util.DeviceControlDebugger.logEvent(
             "P2P_БРОКЕР_ПОДКЛЮЧЕН",
-            "Установлено соединение с брокером $host:$port (роль: $currentRole)",
+            "Подключён резервный P2P Воркер $host:$port (роль: $currentRole) • Активный приоритет: ${computeActiveTransportLabel(globalConnectedOverride = true)}",
             "SUCCESS",
             "P2P"
           )
@@ -1104,13 +1152,10 @@ object DirectP2pSocketEngine {
         if (sock != null) globalSockets.remove(sock)
         try { sock?.close() } catch (_: Exception) {}
         if (globalTcpOuts.isEmpty()) {
+          val stillGlobal = vpsEnabled && vpsConnected
           _status.value = _status.value.copy(
-            isGlobalTcpSocketConnected = false,
-            activeTransportLabel = if (_status.value.isLanSocketConnected) {
-              "🟢 Прямой P2P Сокет LAN (${_status.value.childLanIp}:$TCP_PORT)"
-            } else {
-              "Переподключение TCP-сокета..."
-            }
+            isGlobalTcpSocketConnected = stillGlobal,
+            activeTransportLabel = computeActiveTransportLabel(globalConnectedOverride = stillGlobal)
           )
         }
       }
@@ -1239,6 +1284,7 @@ object DirectP2pSocketEngine {
     vpsPort = port
     vpsPassword = password
     vpsRoomCode = roomCode.ifBlank { "101-701" }
+    vpsPathIndex = 0
     try {
       appContext?.getSharedPreferences(VPS_PREFS, android.content.Context.MODE_PRIVATE)?.edit()?.apply {
         putBoolean("enabled", vpsEnabled)
@@ -1252,10 +1298,23 @@ object DirectP2pSocketEngine {
     if (!vpsEnabled || changed) {
       vpsPingJob?.cancel()
       vpsPingJob = null
+      vpsConnAckTimeoutJob?.cancel()
+      vpsConnAckTimeoutJob = null
       try { vpsWebSocket?.close(1000, null) } catch (_: Exception) {}
       vpsWebSocket = null
       vpsConnected = false
       vpsConnecting = false
+      _status.value = _status.value.copy(
+        activeTransportLabel = computeActiveTransportLabel()
+      )
+    }
+    if (!vpsEnabled) {
+      com.example.util.DeviceControlDebugger.logEvent(
+        "VPS_ОТКЛЮЧЕН",
+        "Канал VPS отключён пользователем — активен приоритет: ${computeActiveTransportLabel()}",
+        "WARNING",
+        "P2P"
+      )
     }
     ensureConnectedAndWake()
     if (vpsEnabled && !vpsConnected && !vpsConnecting) {
@@ -1268,8 +1327,8 @@ object DirectP2pSocketEngine {
     } catch (_: Exception) {}
   }
 
-  private fun vpsWsUrl(): String? {
-    if (!vpsEnabled || vpsHost.isBlank()) return null
+  private fun vpsCandidateUrls(): List<String> {
+    if (!vpsEnabled || vpsHost.isBlank()) return emptyList()
     val raw = vpsHost.trim()
     val explicitWss = raw.startsWith("wss://", ignoreCase = true) || raw.startsWith("https://", ignoreCase = true)
     val explicitWs = raw.startsWith("ws://", ignoreCase = true) || raw.startsWith("http://", ignoreCase = true)
@@ -1280,7 +1339,7 @@ object DirectP2pSocketEngine {
       .removePrefix("http://").removePrefix("HTTP://")
       .trimEnd('/')
     val hostPart = stripped.substringBefore('/')
-    val customPath = if ('/' in stripped) "/" + stripped.substringAfter('/') else "/mqtt"
+    val hasExplicitPath = '/' in stripped
     val tlsPorts = setOf(443, 8443, 2053, 2083, 2087, 2096)
     val scheme = when {
       explicitWss -> "wss"
@@ -1293,13 +1352,28 @@ object DirectP2pSocketEngine {
       (scheme == "wss" && vpsPort == 443) ||
       (scheme == "ws" && vpsPort == 80)
     ) "" else ":$vpsPort"
-    return "$scheme://$hostPart$portSuffix$customPath"
+    val base = "$scheme://$hostPart$portSuffix"
+    return if (hasExplicitPath) {
+      listOf("$base/${stripped.substringAfter('/')}")
+    } else {
+      listOf("$base/mqtt", "$base/ws", base)
+    }
   }
 
   private fun runVpsRelayLoop() {
-    val url = vpsWsUrl() ?: return
-    if (!vpsEnabled) return
+    val candidates = vpsCandidateUrls()
+    if (candidates.isEmpty() || !vpsEnabled) return
+    val url = candidates[vpsPathIndex % candidates.size]
     vpsConnecting = true
+    _status.value = _status.value.copy(
+      activeTransportLabel = computeActiveTransportLabel()
+    )
+    com.example.util.DeviceControlDebugger.logEvent(
+      "VPS_ПОПЫТКА_ПОДКЛЮЧЕНИЯ",
+      "Приоритет #1 (VPS): подключение к $url (код комнаты: $vpsRoomCode)",
+      "SUCCESS",
+      "P2P"
+    )
     val clientId = "kg_vps_${UUID.randomUUID().toString().take(10)}"
     val request = Request.Builder()
       .url(url)
@@ -1307,16 +1381,41 @@ object DirectP2pSocketEngine {
       .build()
     val listener = object : WebSocketListener() {
       override fun onOpen(webSocket: WebSocket, response: Response) {
-        vpsConnecting = false
         vpsWebSocket = webSocket
-        vpsConnected = true
         try {
           webSocket.send(ByteString.of(*buildMqttConnectPacket(clientId, vpsRoomCode, vpsPassword)))
         } catch (_: Exception) {}
+        // Сторожевой таймер 4.5 с на рукопожатие MQTT CONNACK: если сервер открыл HTTP/WS,
+        // но не является MQTT-релеем на этом пути, переключаемся на следующий путь и резервный канал!
+        vpsConnAckTimeoutJob?.cancel()
+        vpsConnAckTimeoutJob = scope.launch {
+          delay(4_500L)
+          if (!vpsConnected && vpsWebSocket === webSocket) {
+            vpsConnecting = false
+            vpsPathIndex = (vpsPathIndex + 1) % candidates.size.coerceAtLeast(1)
+            try { webSocket.close(1000, "CONNACK_TIMEOUT") } catch (_: Exception) {}
+            vpsWebSocket = null
+            _status.value = _status.value.copy(
+              activeTransportLabel = computeActiveTransportLabel()
+            )
+            com.example.util.DeviceControlDebugger.logEvent(
+              "VPS_ОШИБКА_ПОДКЛЮЧЕНИЯ",
+              "Таймаут MQTT рукопожатия от VPS ($url) — автоматический переход на резервный канал: ${computeActiveTransportLabel()}",
+              "WARNING",
+              "P2P"
+            )
+            if (vpsEnabled) {
+              delay(3_500L)
+              if (vpsEnabled && !vpsConnected && !vpsConnecting) {
+                runVpsRelayLoop()
+              }
+            }
+          }
+        }
       }
 
       override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-        handleVpsMqttPacket(bytes.toByteArray())
+        handleVpsMqttPacket(bytes.toByteArray(), url)
       }
 
       override fun onMessage(webSocket: WebSocket, text: String) {}
@@ -1328,24 +1427,51 @@ object DirectP2pSocketEngine {
       override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
         vpsConnecting = false
         if (vpsWebSocket === webSocket) {
+          val wasConnected = vpsConnected
           vpsConnected = false
           vpsWebSocket = null
           vpsPingJob?.cancel()
           vpsPingJob = null
+          vpsConnAckTimeoutJob?.cancel()
+          vpsConnAckTimeoutJob = null
+          _status.value = _status.value.copy(
+            activeTransportLabel = computeActiveTransportLabel()
+          )
+          if (wasConnected) {
+            com.example.util.DeviceControlDebugger.logEvent(
+              "VPS_СОЕДИНЕНИЕ_ЗАКРЫТО",
+              "Соединение с VPS ($url) закрыто (код $code) — автоматический переход на резервный канал: ${computeActiveTransportLabel()}",
+              "WARNING",
+              "P2P"
+            )
+          }
         }
       }
 
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
         vpsConnecting = false
+        vpsConnAckTimeoutJob?.cancel()
+        vpsConnAckTimeoutJob = null
         if (vpsWebSocket === webSocket || vpsWebSocket == null) {
           vpsConnected = false
           vpsWebSocket = null
           vpsPingJob?.cancel()
           vpsPingJob = null
         }
+        vpsPathIndex = (vpsPathIndex + 1) % candidates.size.coerceAtLeast(1)
+        _status.value = _status.value.copy(
+          activeTransportLabel = computeActiveTransportLabel()
+        )
+        val httpInfo = response?.let { " (HTTP ${it.code})" }.orEmpty()
+        com.example.util.DeviceControlDebugger.logEvent(
+          "VPS_ОШИБКА_ПОДКЛЮЧЕНИЯ",
+          "Не удалось подключиться к VPS ($url)$httpInfo: ${t.message ?: "сервер недоступен"} — автоматический переход на резервный канал: ${computeActiveTransportLabel()}",
+          "WARNING",
+          "P2P"
+        )
         if (vpsEnabled) {
           scope.launch {
-            delay(4000L)
+            delay(4_500L)
             if (vpsEnabled && !vpsConnected && !vpsConnecting) {
               runVpsRelayLoop()
             }
@@ -1359,7 +1485,7 @@ object DirectP2pSocketEngine {
     vpsHttpClient.newWebSocket(request, listener)
   }
 
-  private fun handleVpsMqttPacket(bytes: ByteArray) {
+  private fun handleVpsMqttPacket(bytes: ByteArray, activeVpsUrl: String = "") {
     try {
       if (bytes.isEmpty()) return
       val bais = java.io.ByteArrayInputStream(bytes)
@@ -1374,17 +1500,35 @@ object DirectP2pSocketEngine {
         when (packetType) {
           2 -> {
             // CONNACK: check return code (byte 1 == 0 means accepted)
+            vpsConnAckTimeoutJob?.cancel()
+            vpsConnAckTimeoutJob = null
+            vpsConnecting = false
             val rc = if (payloadBytes.size >= 2) (payloadBytes[1].toInt() and 0xFF) else 0
             if (rc != 0) {
               Log.w(TAG, "VPS MQTT CONNACK rejected with code $rc")
               vpsConnected = false
               try { vpsWebSocket?.close(1000, "CONNACK_$rc") } catch (_: Exception) {}
+              _status.value = _status.value.copy(
+                activeTransportLabel = computeActiveTransportLabel()
+              )
+              com.example.util.DeviceControlDebugger.logEvent(
+                "VPS_ОШИБКА_ПОДКЛЮЧЕНИЯ",
+                "VPS ($vpsHost:$vpsPort) отклонил авторизацию MQTT (CONNACK код $rc) — автоматический переход на резервный канал: ${computeActiveTransportLabel()}",
+                "WARNING",
+                "P2P"
+              )
               return
             }
             vpsConnected = true
             _status.value = _status.value.copy(
               isGlobalTcpSocketConnected = true,
-              activeTransportLabel = "☁️ VPS / Cloudflare Релей ($vpsHost)"
+              activeTransportLabel = computeActiveTransportLabel()
+            )
+            com.example.util.DeviceControlDebugger.logEvent(
+              "VPS_ПОДКЛЮЧЕН",
+              "Приоритетный канал VPS успешно подключён (${activeVpsUrl.ifBlank { "$vpsHost:$vpsPort" }}) • Активный канал: ${computeActiveTransportLabel()}",
+              "SUCCESS",
+              "P2P"
             )
             val subs = if (currentRole == "CHILD") {
               listOf(
@@ -1791,7 +1935,7 @@ object DirectP2pSocketEngine {
         if (isFromLan) {
           _status.value = _status.value.copy(
             isLanSocketConnected = true,
-            activeTransportLabel = "🟢 Прямой P2P Сокет LAN (Wi-Fi)"
+            activeTransportLabel = computeActiveTransportLabel(lanConnectedOverride = true)
           )
         }
       } catch (_: Exception) {}

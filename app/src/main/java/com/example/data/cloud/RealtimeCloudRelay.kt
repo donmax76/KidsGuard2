@@ -634,33 +634,19 @@ object RealtimeCloudRelay {
           )
           return
         }
-        // Если профиль с этим ID уже существует у родителя (или родитель активно управляет этим ребёнком #id),
-        // а код в профиле был дефолтным (101-701) или отличался от детерминированного кода ребёнка (102-702) —
-        // автоматически синхронизируем код сопряжения, чтобы батарея и статус CHILD_STATE не блокировались!
+        // Строгая защита 6-значным кодом привязки на телефоне родителя (Мать и Отец):
+        // НИКОГДА автоматически не подменяем локальный 6-значный код чужим кодом из эфира только из-за совпадения ID (например, id=1 или id=2)!
+        // Подключение второго родителя к телефону ребёнка разрешено ТОЛЬКО при точном совпадении 6-значного кода привязки.
         if (DirectP2pSocketEngine.currentRole != "CHILD" && prev != null && isFromChild) {
           val localCode = prev.pairingCode.replace("-", "").replace(" ", "").uppercase()
-          val deterministicForId = "${100 + id}${700 + id}"
-          val deterministicForRawId = if (rawId > 0L) "${100 + rawId}${700 + rawId}" else ""
           if (localCode.length >= 6 && msgCodeClean.length >= 6 && localCode != msgCodeClean) {
-            if (isAuthorizedTarget || localCode == "101701" || msgCodeClean == deterministicForId || msgCodeClean == deterministicForRawId) {
-              val formattedNewCode = if (msgCodeClean.length == 6) "${msgCodeClean.take(3)}-${msgCodeClean.substring(3)}" else msgCodeRaw
-              prev = prev.copy(pairingCode = formattedNewCode, isPaired = true)
-              childrenCache[id] = prev
-              com.example.util.DeviceControlDebugger.logEvent(
-                "КОД_СИНХРОНИЗИРОВАН",
-                "Код профиля #$id автоматически синхронизирован с телефоном ребёнка ($formattedNewCode)",
-                "SUCCESS",
-                "P2P"
-              )
-            } else {
-              com.example.util.DeviceControlDebugger.logEvent(
-                "НЕСОВПАДЕНИЕ_КОДА",
-                "Отброшен пакет CHILD_STATE с чужим кодом $msgCodeClean (ожидался $localCode)",
-                "BLOCKED",
-                "P2P"
-              )
-              return
-            }
+            com.example.util.DeviceControlDebugger.logEvent(
+              "НЕСОВПАДЕНИЕ_КОДА",
+              "Отброшен пакет CHILD_STATE с чужим кодом $msgCodeClean (в профиле родителя код $localCode). Для подключения второго родителя введите 6-значный код ребёнка.",
+              "BLOCKED",
+              "P2P"
+            )
+            return
           }
         }
 
@@ -837,16 +823,8 @@ object RealtimeCloudRelay {
         }
         if (DirectP2pSocketEngine.currentRole != "CHILD" && existingPrev != null && isFromChild) {
           val localCode = existingPrev.pairingCode.replace("-", "").replace(" ", "").uppercase()
-          val deterministicForId = "${100 + id}${700 + id}"
-          val deterministicForRawId = if (rawId > 0L) "${100 + rawId}${700 + rawId}" else ""
           if (localCode.length >= 6 && msgCodeClean.length >= 6 && localCode != msgCodeClean) {
-            if (isAuthorizedTarget || localCode == "101701" || msgCodeClean == deterministicForId || msgCodeClean == deterministicForRawId) {
-              val formattedNewCode = if (msgCodeClean.length == 6) "${msgCodeClean.take(3)}-${msgCodeClean.substring(3)}" else msgCodeRaw
-              existingPrev = existingPrev.copy(pairingCode = formattedNewCode, isPaired = true)
-              childrenCache[id] = existingPrev
-            } else {
-              return
-            }
+            return
           }
         }
         if (isFromChild) {
@@ -1103,14 +1081,35 @@ object RealtimeCloudRelay {
         if (pkgKey.isNotBlank()) {
           authoritativeAppRules["${cid}_$pkgKey"] = Triple(blockedVal, limitVal, now)
         }
-        val current = appsCache[cid]?.toMutableList() ?: return
-        val idx = current.indexOfFirst { it.packageName.equals(pkg, ignoreCase = true) }
-        if (idx >= 0) {
-          var item = current[idx]
-          if (blockedVal != null) item = item.copy(isBlocked = blockedVal)
-          if (limitVal != null) item = item.copy(dailyLimitMinutes = limitVal)
-          current[idx] = item
-          appsCache[cid] = current
+        val current = appsCache[cid]?.toMutableList()
+        if (current != null) {
+          val idx = current.indexOfFirst { it.packageName.equals(pkg, ignoreCase = true) }
+          if (idx >= 0) {
+            var item = current[idx]
+            if (blockedVal != null) item = item.copy(isBlocked = blockedVal)
+            if (limitVal != null) item = item.copy(dailyLimitMinutes = limitVal)
+            current[idx] = item
+            appsCache[cid] = current
+          }
+        }
+        // Мгновенно синхронизируем изменение блокировки/лимита в Room DB (чтобы оба родителя — Мать и Отец —
+        // а также телефон ребёнка видели актуальный статус без задержки)
+        val ctx = DirectP2pSocketEngine.appContext
+        if (ctx != null && pkg.isNotBlank()) {
+          try {
+            val dao = com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+            val dbApps = dao.getAppsForChildOnce(cid)
+            val targetApp = dbApps.firstOrNull { it.packageName.trim().equals(pkg, ignoreCase = true) }
+            if (targetApp != null) {
+              val updatedApp = targetApp.copy(
+                isBlocked = blockedVal ?: targetApp.isBlocked,
+                dailyLimitMinutes = limitVal ?: targetApp.dailyLimitMinutes
+              )
+              if (updatedApp != targetApp) {
+                dao.updateApp(updatedApp)
+              }
+            }
+          } catch (_: Exception) {}
         }
       }
       "CHAT" -> {

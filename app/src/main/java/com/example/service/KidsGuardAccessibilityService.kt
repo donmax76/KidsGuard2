@@ -147,6 +147,18 @@ class KidsGuardAccessibilityService : AccessibilityService() {
   private var isDeviceLocked = false
 
   @Volatile
+  private var isOverlayForTotalDeviceLock: Boolean = false
+
+  @Volatile
+  private var currentBlockedOverlayPackage: String? = null
+
+  @Volatile
+  private var lastContentEventProcessedMs: Long = 0L
+
+  @Volatile
+  private var lastBlockedAppEjectMs: Long = 0L
+
+  @Volatile
   private var isChildDeviceRole = false
 
   @Volatile
@@ -187,6 +199,24 @@ class KidsGuardAccessibilityService : AccessibilityService() {
     startMinuteUsageTicking()
   }
 
+  fun getCurrentBlockedOverlayPackage(): String? = currentBlockedOverlayPackage
+
+  fun unblockPackageLocallyByPin(packageName: String) {
+    val cleanPkg = packageName.trim()
+    if (cleanPkg.isNotBlank()) {
+      blockedPackageNames = blockedPackageNames - cleanPkg
+      appLimitsMap = appLimitsMap - cleanPkg
+    }
+    if (currentBlockedOverlayPackage == cleanPkg) {
+      currentBlockedOverlayPackage = null
+    }
+    serviceScope.launch(Dispatchers.Main) {
+      if (!isDeviceLocked) {
+        hideLockOverlay()
+      }
+    }
+  }
+
   fun prepareForSilentUpdate() {
     serviceScope.launch(Dispatchers.Main) {
       hideLockOverlay()
@@ -194,15 +224,29 @@ class KidsGuardAccessibilityService : AccessibilityService() {
   }
 
   fun enforceTotalLockFromService(reason: String) {
-    val wasAlreadyShowing = overlayView != null
+    val wasAlreadyShowingTotal = overlayView != null && isOverlayForTotalDeviceLock
     isDeviceLocked = true
     serviceScope.launch(Dispatchers.Main) {
-      if (!wasAlreadyShowing) {
+      if (!wasAlreadyShowingTotal) {
         try {
           performGlobalAction(GLOBAL_ACTION_HOME)
         } catch (_: Exception) {}
       }
-      showLockOverlay(reason, isDeviceTotalLock = true)
+      showLockOverlay(reason, isDeviceTotalLock = true, blockedPackageName = null)
+    }
+  }
+
+  fun enforceAppOrLimitBlockFromService(reason: String, blockedPackage: String? = null) {
+    serviceScope.launch(Dispatchers.Main) {
+      try {
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        performGlobalAction(GLOBAL_ACTION_HOME)
+      } catch (_: Exception) {}
+      showLockOverlay(
+        reasonText = reason,
+        isDeviceTotalLock = false,
+        blockedPackageName = blockedPackage
+      )
     }
   }
 
@@ -447,8 +491,13 @@ class KidsGuardAccessibilityService : AccessibilityService() {
               appLimitsMap = appLimitsMap + (pkg to Pair(dailyLimit, newUsed))
               if (dailyLimit in 1..newUsed) {
                 launch(Dispatchers.Main) {
+                  performGlobalAction(GLOBAL_ACTION_BACK)
                   performGlobalAction(GLOBAL_ACTION_HOME)
-                  showLockOverlay("Лимит времени на сегодня ($dailyLimit мин) исчерпан!", isDeviceTotalLock = false)
+                  showLockOverlay(
+                    reasonText = "Лимит времени на сегодня ($dailyLimit мин) исчерпан!",
+                    isDeviceTotalLock = false,
+                    blockedPackageName = pkg
+                  )
                 }
               }
             }
@@ -508,7 +557,10 @@ class KidsGuardAccessibilityService : AccessibilityService() {
               launch(Dispatchers.Main) {
                 if (isDeviceLocked && isChildDeviceRole) {
                   enforceTotalLockFromService("Экран заблокирован родителем.\nРазблокируйте через телефон родителя или введите PIN-код ниже.")
-                } else {
+                } else if (isOverlayForTotalDeviceLock) {
+                  // CRITICAL FIX: Скрываем оверлей ТОЛЬКО если он был открыт для полной блокировки телефона!
+                  // Если сейчас открыто 3-кнопочное окно блокировки отдельного приложения (YouTube/игра),
+                  // фоновые обновления батареи/пинга ChildEntity НЕ должны закрывать его!
                   hideLockOverlay()
                 }
               }
@@ -536,6 +588,29 @@ class KidsGuardAccessibilityService : AccessibilityService() {
         }
         appLimitsMap = limits
         Log.d(TAG, "Loaded rules for child $activeChildId: blocked=${blocked.size}, withLimits=${limits.size}")
+
+        // Если текущее открытое приложение только что заблокировали — мгновенно выбрасываем на главный экран и показываем 3-кнопочное окно
+        val activePkg = currentForegroundPackage
+        if (isChildDeviceRole && !isDeviceLocked && !activePkg.isNullOrBlank() && blocked.contains(activePkg)) {
+          val friendly = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, activePkg)
+          launch(Dispatchers.Main) {
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            performGlobalAction(GLOBAL_ACTION_HOME)
+            showLockOverlay(
+              reasonText = "Приложение «$friendly» заблокировано родительским контролем KidsGuard.",
+              isDeviceTotalLock = false,
+              blockedPackageName = activePkg
+            )
+          }
+        } else if (!isDeviceLocked && !isOverlayForTotalDeviceLock && currentBlockedOverlayPackage != null) {
+          // Если заблокированное приложение было разблокировано родителем — сразу закрываем 3-кнопочное окно
+          val overlayPkg = currentBlockedOverlayPackage
+          if (overlayPkg != null && !blocked.contains(overlayPkg)) {
+            launch(Dispatchers.Main) {
+              hideLockOverlay()
+            }
+          }
+        }
       }
     }
 
@@ -655,8 +730,14 @@ class KidsGuardAccessibilityService : AccessibilityService() {
                       }
                       launch(Dispatchers.Main) {
                         if (currentForegroundPackage == pkg) {
+                          val friendly = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, pkg)
+                          performGlobalAction(GLOBAL_ACTION_BACK)
                           performGlobalAction(GLOBAL_ACTION_HOME)
-                          showLockOverlay("Приложение «$currentForegroundAppLabel» заблокировано родительским контролем KidsGuard.", isDeviceTotalLock = false)
+                          showLockOverlay(
+                            reasonText = "Приложение «$friendly» заблокировано родительским контролем KidsGuard.",
+                            isDeviceTotalLock = false,
+                            blockedPackageName = pkg
+                          )
                         }
                       }
                     }
@@ -673,7 +754,9 @@ class KidsGuardAccessibilityService : AccessibilityService() {
                         cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
                       }
                       launch(Dispatchers.Main) {
-                        hideLockOverlay()
+                        if (!isDeviceLocked && (currentBlockedOverlayPackage == pkg || !isOverlayForTotalDeviceLock)) {
+                          hideLockOverlay()
+                        }
                       }
                     }
                   }
@@ -767,16 +850,110 @@ class KidsGuardAccessibilityService : AccessibilityService() {
     if (!isChildDeviceRole || com.example.location.LiveLocationTracker.isEmulator()) return
 
     val packageName = event.packageName?.toString() ?: return
+    val nowMs = System.currentTimeMillis()
+
+    // 0. Auto-click "Обновить"/"Установить" when OTA update is running inside PackageInstaller
+    if (ApkUpdateInstaller.isInstallingUpdate && packageName.contains("packageinstaller", ignoreCase = true)) {
+      hideLockOverlay()
+      autoConfirmPackageInstallerUpdate(rootInActiveWindow)
+      return
+    }
+
+    val isSystemOrSelf = packageName == applicationContext.packageName ||
+      packageName.startsWith("com.android.systemui") ||
+      packageName.contains("inputmethod", ignoreCase = true)
+
+    val isCoreWhitelisted = DeviceUsageTracker.isWhitelistedCoreMdmPackage(applicationContext, packageName) ||
+      DeviceSecurityPermissionHelper.isSettingUpPermissions ||
+      ApkUpdateInstaller.isInstallingUpdate
+
+    // =========================================================================
+    // МГНОВЕННАЯ O(1) ПРОВЕРКА БЛОКИРОВОК (ДО ОБХОДА ДЕРЕВА ОКОН!)
+    // Выполняется за <1 мс, чтобы YouTube/игры не успевали запустить звук в фоне
+    // и не вызывали нагрузку на процессор при скролле.
+    // =========================================================================
+    if (!isSystemOrSelf && !isCoreWhitelisted) {
+      // 1. Полная блокировка телефона (2 кнопки: PIN и Экстренный вызов SOS)
+      if (isDeviceLocked) {
+        if (overlayView == null || !isOverlayForTotalDeviceLock) {
+          val friendlyName = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, packageName)
+          DeviceControlDebugger.logEvent("БЛОКИРОВКА_ТЕЛЕФОНА", "Перехвачена попытка открыть $friendlyName при заблокированном телефоне", "BLOCKED")
+          performGlobalAction(GLOBAL_ACTION_HOME)
+          showLockOverlay(
+            reasonText = "Экран заблокирован родителем.\nРазблокируйте через телефон родителя или введите PIN-код ниже.",
+            isDeviceTotalLock = true,
+            blockedPackageName = null
+          )
+        }
+        return
+      }
+
+      // 2. Мертвая блокировка запрещенного приложения (3 кнопки: Выйти на главный экран, PIN, SOS)
+      if (blockedPackageNames.contains(packageName)) {
+        val friendlyName = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, packageName)
+        currentForegroundPackage = packageName
+        currentForegroundAppLabel = friendlyName
+        if (overlayView == null || currentBlockedOverlayPackage != packageName || (nowMs - lastBlockedAppEjectMs) > 650L) {
+          lastBlockedAppEjectMs = nowMs
+          DeviceControlDebugger.logEvent("ЗАПРЕТ_ПРИЛОЖЕНИЯ", "Запуск заблокированной программы: $friendlyName", "INTERCEPTED")
+          Log.w(TAG, "Blocked application launched: $packageName -> Ejecting to Home immediately")
+          // Сворачиваем приложение на рабочий стол, чтобы YouTube/видео не играли в фоне под оверлеем!
+          performGlobalAction(GLOBAL_ACTION_BACK)
+          performGlobalAction(GLOBAL_ACTION_HOME)
+        }
+        showLockOverlay(
+          reasonText = "Приложение «$friendlyName» заблокировано родительским контролем KidsGuard.",
+          isDeviceTotalLock = false,
+          blockedPackageName = packageName
+        )
+        return
+      }
+
+      // 3. Проверка дневного лимита времени для приложения (3 кнопки)
+      val limitInfo = appLimitsMap[packageName]
+      if (limitInfo != null) {
+        val (limit, used) = limitInfo
+        if (limit in 1..used) {
+          val friendlyName = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, packageName)
+          currentForegroundPackage = packageName
+          currentForegroundAppLabel = friendlyName
+          if (overlayView == null || currentBlockedOverlayPackage != packageName || (nowMs - lastBlockedAppEjectMs) > 650L) {
+            lastBlockedAppEjectMs = nowMs
+            DeviceControlDebugger.logEvent("ЛИМИТ_ВРЕМЕНИ", "Исчерпан лимит для $friendlyName ($used/$limit мин)", "INTERCEPTED")
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            performGlobalAction(GLOBAL_ACTION_HOME)
+          }
+          showLockOverlay(
+            reasonText = "Дневной лимит времени для «$friendlyName» исчерпан ($limit мин).",
+            isDeviceTotalLock = false,
+            blockedPackageName = packageName
+          )
+          return
+        }
+      }
+    }
+
+    // =========================================================================
+    // ЗАЩИТА ОТ ЗАВИСАНИЯ И ПЕРЕГРЕВА ЧЕРЕЗ 1 ЧАС РАБОТЫ:
+    // События TYPE_WINDOW_CONTENT_CHANGED приходят до 50-100 раз в секунду при
+    // прокрутке ленты или видео. Так как проверку блокировки мы уже выполнили выше
+    // за O(1), пропускаем частые контент-события одного и того же пакета!
+    // =========================================================================
+    val prevPkg = currentForegroundPackage
+    if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
+        packageName == prevPkg &&
+        packageName != "com.android.settings" &&
+        !packageName.contains("packageinstaller", ignoreCase = true) &&
+        (nowMs - lastContentEventProcessedMs) < 1_500L) {
+      return
+    }
+    lastContentEventProcessedMs = nowMs
 
     // Track active foreground application package, watched video/page title & push if changed
-    val prevPkg = currentForegroundPackage
-    if (packageName != applicationContext.packageName &&
-        !packageName.startsWith("com.android.systemui") &&
-        !packageName.contains("inputmethod", ignoreCase = true)) {
+    if (!isSystemOrSelf) {
       currentForegroundPackage = packageName
       val friendlyName = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, packageName)
       currentForegroundAppLabel = friendlyName
-      val nowMs = System.currentTimeMillis()
       // Battery optimization: only walk Accessibility node tree on actual app switch or every 25s
       val shouldExtractContent = prevPkg != packageName || (nowMs - lastContentPushTimeMs > 25_000L)
       if (shouldExtractContent) {
@@ -805,21 +982,11 @@ class KidsGuardAccessibilityService : AccessibilityService() {
       }
     }
 
-    // 0. Auto-click "Обновить"/"Установить" when OTA update is running inside PackageInstaller
-    if (ApkUpdateInstaller.isInstallingUpdate && packageName.contains("packageinstaller", ignoreCase = true)) {
-      hideLockOverlay()
-      autoConfirmPackageInstallerUpdate(rootInActiveWindow)
+    if (isCoreWhitelisted) {
       return
     }
 
-    // ABSOLUTE EXEMPTION: Never block KidsGuard itself, core system UI, permission controller, or OTA updates!
-    if (DeviceUsageTracker.isWhitelistedCoreMdmPackage(applicationContext, packageName) ||
-        DeviceSecurityPermissionHelper.isSettingUpPermissions ||
-        ApkUpdateInstaller.isInstallingUpdate) {
-      return
-    }
-
-    // 1. Anti-Uninstall / Anti-Disable Protection in System Settings (with full-window check so in-place APK updates are NEVER blocked!)
+    // 4. Anti-Uninstall / Anti-Disable Protection in System Settings (with full-window check so in-place APK updates are NEVER blocked!)
     if (packageName == "com.android.settings" || packageName.contains("packageinstaller", ignoreCase = true)) {
       val eventText = event.text.joinToString(" ").lowercase()
       val fullWindowText = (eventText + " " + extractVisibleScreenContent("")).lowercase()
@@ -847,38 +1014,11 @@ class KidsGuardAccessibilityService : AccessibilityService() {
         DeviceControlDebugger.logEvent("ЗАЩИТА_ОТ_УДАЛЕНИЯ", "Попытка сброса в настройках: $eventText", "BLOCKED")
         Log.w(TAG, "Anti-uninstall triggered! Returning home.")
         performGlobalAction(GLOBAL_ACTION_HOME)
-        showLockOverlay("Попытка удаления или отключения KidsGuard заблокирована!\nЗащита активна.", isDeviceTotalLock = false)
-        return
-      }
-    }
-
-    // 2. Full Device Lockout: Intercept any app when phone is locked (without repeated GLOBAL_ACTION_HOME flickering when overlay is already visible!)
-    if (isDeviceLocked) {
-      if (overlayView == null) {
-        DeviceControlDebugger.logEvent("БЛОКИРОВКА_ТЕЛЕФОНА", "Перехвачена попытка открыть $currentForegroundAppLabel при заблокированном телефоне", "BLOCKED")
-        performGlobalAction(GLOBAL_ACTION_HOME)
-        showLockOverlay("Экран заблокирован родителем.\nРазблокируйте через телефон родителя или введите PIN-код ниже.", isDeviceTotalLock = true)
-      }
-      return
-    }
-
-    // 3. Blocked App Enforcer (Instant ejection)
-    if (blockedPackageNames.contains(packageName)) {
-      DeviceControlDebugger.logEvent("ЗАПРЕТ_ПРИЛОЖЕНИЯ", "Запуск заблокированной программы: $currentForegroundAppLabel", "INTERCEPTED")
-      Log.w(TAG, "Blocked application launched: $packageName -> Ejecting to Home immediately")
-      performGlobalAction(GLOBAL_ACTION_HOME)
-      showLockOverlay("Приложение «$currentForegroundAppLabel» заблокировано родительским контролем KidsGuard.", isDeviceTotalLock = false)
-      return
-    }
-
-    // 4. Daily Time Limit Enforcer
-    val limitInfo = appLimitsMap[packageName]
-    if (limitInfo != null) {
-      val (limit, used) = limitInfo
-      if (limit in 1..used) {
-        DeviceControlDebugger.logEvent("ЛИМИТ_ВРЕМЕНИ", "Исчерпан лимит для $currentForegroundAppLabel ($used/$limit мин)", "INTERCEPTED")
-        performGlobalAction(GLOBAL_ACTION_HOME)
-        showLockOverlay("Дневной лимит времени для «$currentForegroundAppLabel» исчерпан ($limit мин).", isDeviceTotalLock = false)
+        showLockOverlay(
+          reasonText = "Попытка удаления или отключения KidsGuard заблокирована!\nЗащита активна.",
+          isDeviceTotalLock = false,
+          blockedPackageName = null
+        )
         return
       }
     }
@@ -914,13 +1054,17 @@ class KidsGuardAccessibilityService : AccessibilityService() {
           DeviceControlDebugger.logEvent("ВЕБ_ФИЛЬТР", blockReason, "BLOCKED")
           performGlobalAction(GLOBAL_ACTION_BACK)
           performGlobalAction(GLOBAL_ACTION_HOME)
-          showLockOverlay("🌐 Веб-фильтр KidsGuard:\n$blockReason", isDeviceTotalLock = false)
+          showLockOverlay(
+            reasonText = "🌐 Веб-фильтр KidsGuard:\n$blockReason",
+            isDeviceTotalLock = false,
+            blockedPackageName = packageName
+          )
           return
         }
       }
     }
 
-    if (prevPkg != packageName && packageName != applicationContext.packageName && !packageName.startsWith("com.android.systemui")) {
+    if (prevPkg != packageName && !isSystemOrSelf) {
       DeviceControlDebugger.logEvent("ОТКРЫТИЕ_ПРОГРАММЫ", "Активное окно: $currentForegroundAppLabel", "SUCCESS")
     }
   }
@@ -966,18 +1110,34 @@ class KidsGuardAccessibilityService : AccessibilityService() {
   }
 
   @SuppressLint("InflateParams")
-  private fun showLockOverlay(reasonText: String, isDeviceTotalLock: Boolean) {
+  private fun showLockOverlay(
+    reasonText: String,
+    isDeviceTotalLock: Boolean,
+    blockedPackageName: String? = null
+  ) {
     if (!Settings.canDrawOverlays(applicationContext)) {
-      if (isDeviceTotalLock) {
-        com.example.ui.screens.ChildLockScreenActivity.launch(applicationContext, reasonText)
-      }
+      com.example.ui.screens.ChildLockScreenActivity.launch(
+        context = applicationContext,
+        reason = reasonText,
+        isDeviceTotalLock = isDeviceTotalLock,
+        blockedPackageName = blockedPackageName
+      )
       return
     }
 
+    // Если тип блокировки изменился (например, было 3-кнопочное окно приложения, а стала 2-кнопочная блокировка телефона или наоборот),
+    // либо изменился заблокированный пакет — пересоздаём оверлей с правильным набором кнопок.
     if (overlayView != null) {
-      overlayView?.findViewById<TextView>(android.R.id.text1)?.text = reasonText
-      return
+      if (isOverlayForTotalDeviceLock == isDeviceTotalLock && currentBlockedOverlayPackage == blockedPackageName) {
+        overlayView?.findViewById<TextView>(android.R.id.text1)?.text = reasonText
+        return
+      } else {
+        hideLockOverlay()
+      }
     }
+
+    isOverlayForTotalDeviceLock = isDeviceTotalLock
+    currentBlockedOverlayPackage = if (isDeviceTotalLock) null else blockedPackageName
 
     try {
       val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1007,6 +1167,7 @@ class KidsGuardAccessibilityService : AccessibilityService() {
         context = this,
         reasonText = reasonText,
         isDeviceTotalLock = isDeviceTotalLock,
+        blockedPackageName = blockedPackageName,
         onCloseToHome = if (!isDeviceTotalLock) {
           {
             performGlobalAction(GLOBAL_ACTION_HOME)
@@ -1014,9 +1175,11 @@ class KidsGuardAccessibilityService : AccessibilityService() {
           }
         } else null,
         onUnlocked = {
-          isDeviceLocked = false
+          if (isDeviceTotalLock) {
+            isDeviceLocked = false
+            DeviceTotalLockManager.releaseTotalLock(applicationContext)
+          }
           hideLockOverlay()
-          DeviceTotalLockManager.releaseTotalLock(applicationContext)
         }
       )
 
@@ -1036,13 +1199,18 @@ class KidsGuardAccessibilityService : AccessibilityService() {
       }, 45_000L)
     } catch (e: Exception) {
       Log.e(TAG, "Error displaying overlay: ${e.message}")
-      if (isDeviceTotalLock) {
-        com.example.ui.screens.ChildLockScreenActivity.launch(applicationContext, reasonText)
-      }
+      com.example.ui.screens.ChildLockScreenActivity.launch(
+        context = applicationContext,
+        reason = reasonText,
+        isDeviceTotalLock = isDeviceTotalLock,
+        blockedPackageName = blockedPackageName
+      )
     }
   }
 
   private fun hideLockOverlay() {
+    isOverlayForTotalDeviceLock = false
+    currentBlockedOverlayPackage = null
     overlayView?.let {
       try {
         windowManager?.removeView(it)

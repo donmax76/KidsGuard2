@@ -110,6 +110,7 @@ fun ParentDashboardScreen(
   alerts: List<AlertNotificationEntity>,
   onSelectChild: (Long) -> Unit,
   onAddNewChild: (name: String, age: Int, dailyLimit: Int) -> Unit,
+  onConnectSecondParentByCode: (pairingCode: String, customName: String) -> Unit = { _, _ -> },
   onDeleteChild: (ChildProfileEntity) -> Unit,
   onToggleRemoteLock: () -> Unit,
   onToggleStudyMode: () -> Unit,
@@ -2294,6 +2295,10 @@ fun ParentDashboardScreen(
       onDismiss = { isAddChildDialogVisible = false },
       onConfirm = { name, age, limit ->
         onAddNewChild(name, age, limit)
+        isAddChildDialogVisible = false
+      },
+      onConnectExistingByCode = { code, customName ->
+        onConnectSecondParentByCode(code, customName)
         isAddChildDialogVisible = false
       }
     )

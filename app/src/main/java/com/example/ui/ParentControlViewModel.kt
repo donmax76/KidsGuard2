@@ -632,6 +632,21 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     }
   }
 
+  fun connectSecondParentByCode(pairingCode: String, customName: String = "") {
+    viewModelScope.launch {
+      val linkedId = repository.connectSecondParentByCode(pairingCode, customName)
+      if (linkedId != null) {
+        _selectedChildId.value = linkedId
+        _isAddChildModalVisible.value = false
+        val digits = pairingCode.filter { it.isDigit() }
+        val formatted = if (digits.length == 6) "${digits.take(3)}-${digits.substring(3)}" else pairingCode
+        showToast("Подключено по коду $formatted! Загружаем текущие блокировки и приложения...")
+      } else {
+        showToast("Введите корректный 6-значный код привязки ребёнка")
+      }
+    }
+  }
+
   // Pillar 2: Восстановление всех исходных параметров и разрешений перед удалением ребенка
   fun deleteChild(child: ChildProfileEntity) {
     viewModelScope.launch {

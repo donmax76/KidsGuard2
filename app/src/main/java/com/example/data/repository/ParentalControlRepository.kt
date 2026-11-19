@@ -359,15 +359,7 @@ class ParentalControlRepository(private val context: Context) {
               else -> {
                 val byId = dao.getChildByIdOnce(cloudChild.id)
                 val byIdCode = byId?.pairingCode?.replace("-", "")?.replace(" ", "")?.uppercase().orEmpty()
-                val detCode = "${100 + cloudChild.id}${700 + cloudChild.id}"
-                val isAuth = com.example.data.cloud.RealtimeCloudRelay.isAuthorizedChild(cloudChild.id)
-                if (byId != null && (
-                    byIdCode == cloudCodeDigits ||
-                    isAuth ||
-                    byIdCode == "101701" ||
-                    cloudCodeDigits == detCode
-                  )
-                ) {
+                if (byId != null && (byIdCode == cloudCodeDigits || byIdCode.isBlank())) {
                   byId
                 } else null
               }
@@ -446,12 +438,6 @@ class ParentalControlRepository(private val context: Context) {
             }
 
             val resolvedPairingCode = when {
-              cloudChild.pairingCode.isNotBlank() && (
-                localExisting == null ||
-                localExisting.pairingCode.isBlank() ||
-                localExisting.pairingCode == "101-701" ||
-                cloudCodeDigits == "${100 + resolvedId}${700 + resolvedId}"
-              ) -> cloudChild.pairingCode
               localExisting != null && localExisting.pairingCode.isNotBlank() -> localExisting.pairingCode
               else -> cloudChild.pairingCode
             }
@@ -1113,6 +1099,102 @@ class ParentalControlRepository(private val context: Context) {
     )
 
     return newId
+  }
+
+  /**
+   * Подключение второго родителя (Мать и Отец) к уже настроенному телефону ребёнка
+   * строго по его 6-значному коду привязки с автоматической загрузкой всех текущих блокировок и лимитов.
+   */
+  suspend fun connectSecondParentByCode(pairingCodeInput: String, customNameInput: String = ""): Long? {
+    val numericDigits = pairingCodeInput.filter { it.isDigit() }
+    if (numericDigits.length != 6) return null
+    val formattedCode = "${numericDigits.take(3)}-${numericDigits.substring(3)}"
+
+    // 1. Проверяем, нет ли уже локально профиля с этим 6-значным кодом
+    val existingLocalByCode = dao.getAllChildrenOnce().firstOrNull {
+      it.pairingCode.replace("-", "").replace(" ", "").uppercase() == numericDigits
+    }
+    if (existingLocalByCode != null) {
+      val updated = if (customNameInput.isNotBlank()) {
+        existingLocalByCode.copy(name = customNameInput.trim(), isPaired = true)
+      } else {
+        existingLocalByCode.copy(isPaired = true)
+      }
+      dao.updateChild(updated)
+      dao.setActiveChildId(updated.id)
+      com.example.data.cloud.RealtimeCloudRelay.authorizeChildId(updated.id)
+      cloudSync.sendRemoteCommand(updated.id, "PING", "1")
+      cloudSync.sendRemoteCommand(updated.id, "REFRESH_APPS", "")
+      return updated.id
+    }
+
+    // 2. Ищем профиль ребёнка в P2P/VPS/LAN по 6-значному коду
+    val remoteChild = cloudSync.findChildByPairingCode(formattedCode)
+    val encodedIdDigit = numericDigits[2].digitToIntOrNull()?.toLong() ?: 2L
+    val targetId = remoteChild?.id ?: if (encodedIdDigit in 1L..9L) encodedIdDigit else 2L
+    val resolvedName = when {
+      customNameInput.isNotBlank() -> customNameInput.trim()
+      remoteChild != null && com.example.data.cloud.RealtimeCloudRelay.isRealCustomChildName(remoteChild.name) -> remoteChild.name
+      else -> "Ребёнок #$targetId"
+    }
+
+    val existingById = dao.getChildByIdOnce(targetId)
+    val finalId = if (existingById != null && existingById.pairingCode.replace("-", "").replace(" ", "") != numericDigits) {
+      val allIds = dao.getAllChildrenOnce().map { it.id }.toSet()
+      ((allIds.maxOrNull() ?: targetId) + 1L).coerceAtLeast(2L)
+    } else {
+      targetId
+    }
+
+    val profileToSave = (remoteChild ?: ChildProfileEntity(
+      id = finalId,
+      name = resolvedName,
+      age = 10,
+      deviceModel = "Синхронизация с телефоном ребёнка...",
+      pairingCode = formattedCode,
+      isPaired = true,
+      batteryLevel = -1,
+      dailyScreenLimitMinutes = 120,
+      usedScreenTimeMinutes = 0,
+      appVersion = com.example.BuildConfig.VERSION_NAME
+    )).copy(
+      id = finalId,
+      name = resolvedName,
+      pairingCode = formattedCode,
+      isPaired = true
+    )
+
+    if (dao.getChildByIdOnce(finalId) == null) {
+      dao.insertChild(profileToSave)
+    } else {
+      dao.updateChild(profileToSave)
+    }
+    dao.setActiveChildId(finalId)
+    com.example.data.cloud.RealtimeCloudRelay.authorizeChildId(finalId)
+    com.example.data.cloud.RealtimeCloudRelay.authorizeChildId(targetId)
+    com.example.data.cloud.RealtimeCloudRelay.publishChildProfile(profileToSave, false)
+
+    // 3. Запрашиваем у телефона ребёнка полный актуальный список приложений со всеми текущими блокировками и статус
+    cloudSync.sendRemoteCommand(targetId, "PING", "1")
+    cloudSync.sendRemoteCommand(targetId, "REFRESH_APPS", "")
+    if (finalId != targetId) {
+      cloudSync.sendRemoteCommand(finalId, "PING", "1")
+      cloudSync.sendRemoteCommand(finalId, "REFRESH_APPS", "")
+    }
+
+    com.example.util.DeviceControlDebugger.logEvent(
+      "ВТОРОЙ_РОДИТЕЛЬ_ПОДКЛЮЧЕН",
+      "Подключён профиль ребёнка «$resolvedName» по 6-значному коду $formattedCode. Запрошены текущие блокировки приложений.",
+      "SUCCESS",
+      "PARENT"
+    )
+    addAlert(
+      childId = finalId,
+      type = "SECOND_PARENT_LINKED",
+      title = "Подключен телефон ребёнка: $resolvedName",
+      message = "Второй родитель подключился по коду $formattedCode. Текущие блокировки приложений синхронизируются автоматически."
+    )
+    return finalId
   }
 
   suspend fun syncRealAppsForChild(childId: Long): List<AppControlEntity> {

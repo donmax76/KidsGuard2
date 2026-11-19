@@ -43,6 +43,7 @@ object UnifiedLockScreenViewBuilder {
     context: Context,
     reasonText: String,
     isDeviceTotalLock: Boolean,
+    blockedPackageName: String? = null,
     onCloseToHome: (() -> Unit)? = null,
     onUnlocked: () -> Unit
   ): View {
@@ -135,7 +136,11 @@ object UnifiedLockScreenViewBuilder {
     }
 
     val pinHintView = TextView(context).apply {
-      text = "Введите PIN-код родителя для разблокировки:"
+      text = if (isDeviceTotalLock) {
+        "Введите PIN-код родителя для разблокировки телефона:"
+      } else {
+        "Введите PIN-код родителя для полной разблокировки приложения:"
+      }
       setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
       setTextColor(Color.parseColor("#FF94A3B8"))
       gravity = Gravity.CENTER
@@ -178,7 +183,7 @@ object UnifiedLockScreenViewBuilder {
         return
       }
       val pinToVerify = currentPin
-      SosEmergencySender.verifyPinAndUnlockDevice(context, pinToVerify) { unlocked ->
+      SosEmergencySender.verifyPinAndUnlockDevice(context, pinToVerify, blockedPackageName) { unlocked ->
         if (unlocked) {
           onUnlocked()
         } else {
@@ -195,7 +200,7 @@ object UnifiedLockScreenViewBuilder {
         // Auto-check immediately if 4+ digits match the Parent PIN
         if (currentPin.length >= 4) {
           val candidate = currentPin
-          SosEmergencySender.verifyPinAndUnlockDevice(context, candidate) { unlocked ->
+          SosEmergencySender.verifyPinAndUnlockDevice(context, candidate, blockedPackageName) { unlocked ->
             if (unlocked) {
               onUnlocked()
             }
