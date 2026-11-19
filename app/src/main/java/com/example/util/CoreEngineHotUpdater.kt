@@ -172,9 +172,13 @@ object CoreEngineHotUpdater {
         val tempBundle = File(coreDir, "core_update_temp.pkg")
         if (tempBundle.exists()) tempBundle.delete()
 
+        val isSameLan = DirectP2pSocketEngine.status.value.isLanSocketConnected
         val candidateUrls = downloadUrlsRaw.split("|")
           .map { it.trim() }
           .filter { it.startsWith("http://") || it.startsWith("https://") }
+          .filter { url ->
+            !url.contains(":${ApkUpdateInstaller.PARENT_APK_HTTP_PORT}/") || isSameLan
+          }
 
         var extractedDexBytes = 0L
         for (urlStr in candidateUrls) {

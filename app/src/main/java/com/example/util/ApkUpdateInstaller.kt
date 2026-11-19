@@ -227,28 +227,96 @@ object ApkUpdateInstaller {
   }
 
   /**
-   * Automatically uploads the Parent's currently installed APK (`applicationInfo.sourceDir`)
-   * to a fresh cloud mirror if existing static links ever expire in the future.
-   * This guarantees that the Parent phone can ALWAYS update the Child phone over the Internet
-   * even months or years later!
+   * Выгружает реально установленный на телефоне родителя APK (`applicationInfo.sourceDir` текущей версии)
+   * в облачное P2P/VPS-зеркало для доставки на телефон ребёнка, находящийся в другой сети (мобильный интернет / другой Wi-Fi).
+   * Использует каскад независимых зеркал:
+   * 1) `tmpfiles.org/api/v1/upload` (преобразуется в прямую ссылку `https://tmpfiles.org/dl/...`)
+   * 2) `kappa.lol/api/upload` (резервное зеркало)
    */
   private fun uploadParentInstalledApkToCloudMirror(context: Context): String? {
-    return try {
-      val sourceApk = File(context.applicationInfo.sourceDir)
-      if (!sourceApk.exists() || sourceApk.length() < 100_000L) return null
+    val sourceApk = File(context.applicationInfo.sourceDir)
+    if (!sourceApk.exists() || sourceApk.length() < 100_000L) return null
+    val cleanVer = BuildConfig.VERSION_NAME.replace(" ", "-")
+
+    DeviceControlDebugger.logEvent(
+      "OTA_ВЫГРУЗКА_APK",
+      "Выгрузка установленного APK родителя (v${BuildConfig.VERSION_NAME}, ${sourceApk.length() / 1024} КБ) во внешний облачный канал для передачи ребёнку в другой сети...",
+      "INFO",
+      "P2P"
+    )
+
+    // 1. Основной внешний облачный релей: tmpfiles.org -> прямая ссылка /dl/
+    try {
+      val boundary = "----KidsGuardBoundary" + System.currentTimeMillis()
+      val conn = (URL("https://tmpfiles.org/api/v1/upload").openConnection() as HttpURLConnection).apply {
+        connectTimeout = 15000
+        readTimeout = 90000
+        doOutput = true
+        setChunkedStreamingMode(64 * 1024)
+        requestMethod = "POST"
+        setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+        setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36")
+      }
+      BufferedOutputStream(conn.outputStream).use { out ->
+        val header = buildString {
+          append("--$boundary\r\n")
+          append("Content-Disposition: form-data; name=\"file\"; filename=\"KidsGuard-v$cleanVer.apk\"\r\n")
+          append("Content-Type: application/vnd.android.package-archive\r\n\r\n")
+        }
+        out.write(header.toByteArray(Charsets.UTF_8))
+        sourceApk.inputStream().use { inp ->
+          val buf = ByteArray(32 * 1024)
+          var n: Int
+          while (inp.read(buf).also { n = it } != -1) {
+            out.write(buf, 0, n)
+          }
+        }
+        out.write("\r\n--$boundary--\r\n".toByteArray(Charsets.UTF_8))
+        out.flush()
+      }
+      if (conn.responseCode in 200..299) {
+        val resp = conn.inputStream.bufferedReader().use { it.readText() }
+        val json = JSONObject(resp)
+        val rawUrl = json.optJSONObject("data")?.optString("url", "").orEmpty()
+        if (rawUrl.isNotBlank()) {
+          val directDlUrl = rawUrl
+            .replace("http://tmpfiles.org/", "https://tmpfiles.org/dl/")
+            .replace("https://tmpfiles.org/", "https://tmpfiles.org/dl/")
+            .replace("/dl/dl/", "/dl/")
+          _latestCloudUrl.value = directDlUrl
+          context.getSharedPreferences(OTA_PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString("cached_parent_cloud_apk_url", directDlUrl)
+            .putInt("cached_parent_cloud_apk_ver", BuildConfig.VERSION_CODE)
+            .apply()
+          DeviceControlDebugger.logEvent(
+            "OTA_ВЫГРУЗКА_УСПЕХ",
+            "APK v${BuildConfig.VERSION_NAME} успешно выгружен во внешний канал: $directDlUrl",
+            "SUCCESS",
+            "P2P"
+          )
+          return directDlUrl
+        }
+      }
+    } catch (e: Exception) {
+      Log.w(TAG, "tmpfiles mirror upload notice: ${e.message}")
+    }
+
+    // 2. Резервный внешний релей: kappa.lol
+    try {
       val boundary = "----KidsGuardBoundary" + System.currentTimeMillis()
       val conn = (URL("https://kappa.lol/api/upload").openConnection() as HttpURLConnection).apply {
         connectTimeout = 15000
         readTimeout = 60000
         doOutput = true
+        setChunkedStreamingMode(64 * 1024)
         requestMethod = "POST"
         setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-        setRequestProperty("User-Agent", "KidsGuard-OTA/3.3.5")
+        setRequestProperty("User-Agent", "KidsGuard-OTA/3.3.35")
       }
       BufferedOutputStream(conn.outputStream).use { out ->
         val header = buildString {
           append("--$boundary\r\n")
-          append("Content-Disposition: form-data; name=\"file\"; filename=\"KidsGuard-v3.3.5.apk\"\r\n")
+          append("Content-Disposition: form-data; name=\"file\"; filename=\"KidsGuard-v$cleanVer.apk\"\r\n")
           append("Content-Type: application/vnd.android.package-archive\r\n\r\n")
         }
         out.write(header.toByteArray(Charsets.UTF_8))
@@ -274,45 +342,113 @@ object ApkUpdateInstaller {
             .putString("cached_parent_cloud_apk_url", freshUrl)
             .putInt("cached_parent_cloud_apk_ver", BuildConfig.VERSION_CODE)
             .apply()
-          Log.i(TAG, "Uploaded Parent installed APK to fresh mirror: $freshUrl")
+          DeviceControlDebugger.logEvent(
+            "OTA_ВЫГРУЗКА_УСПЕХ",
+            "APK v${BuildConfig.VERSION_NAME} выгружен на резервное зеркало: $freshUrl",
+            "SUCCESS",
+            "P2P"
+          )
           return freshUrl
         }
       }
-      null
     } catch (e: Exception) {
-      Log.w(TAG, "Auto-upload of Parent installed APK notice: ${e.message}")
-      null
+      Log.w(TAG, "kappa mirror upload notice: ${e.message}")
     }
+
+    DeviceControlDebugger.logEvent(
+      "OTA_ВЫГРУЗКА_ОШИБКА",
+      "Не удалось выгрузить APK во внешнее облако, используется резервный адрес сервера",
+      "WARNING",
+      "P2P"
+    )
+    return null
   }
 
   /**
-   * Prepares both local LAN P2P MDM update URL (`http://<Parent_IP>:49154/KidsGuard-latest.apk`)
-   * AND verified cloud relay URLs so the Child phone knows exactly where to download the update
-   * both on home Wi-Fi and over 4G/5G Internet, even if updated weeks/months after the Parent.
+   * Формирует список URL для обновления телефона ребёнка СТРОГО в зависимости от того,
+   * по какой сети сейчас работают родитель и ребёнок (VPS, P2P Воркеры или локальная сеть LAN):
+   * - Если устройства в РАЗНЫХ сетях (`isLanSocketConnected == false`), локальный адрес `http://192.168.x.x:49154/...`
+   *   ПОЛНОСТЬЮ ИСКЛЮЧАЕТСЯ, а установленный APK родителя автоматически выгружается во внешний канал!
+   * - Если устройства в ОДНОЙ локальной сети (`isLanSocketConnected == true`), используется прямой LAN-сокет
+   *   с облачным резервом.
    */
   suspend fun prepareParentApkUrlsForChildUpdate(context: Context): String = withContext(Dispatchers.IO) {
-    startParentLanApkServer(context)
+    val p2pStatus = DirectP2pSocketEngine.status.value
+    val isSameLanNetwork = p2pStatus.isLanSocketConnected && p2pStatus.childLanIp.isNotBlank()
+    val isVpsActive = DirectP2pSocketEngine.isVpsRelayConnected()
+
+    if (isSameLanNetwork) {
+      startParentLanApkServer(context)
+    }
+
     val prefs = context.getSharedPreferences(OTA_PREFS_NAME, Context.MODE_PRIVATE)
-    val cachedUrl = if (prefs.getInt("cached_parent_cloud_apk_ver", 0) == BuildConfig.VERSION_CODE) {
+    val cachedUrlForCurrentVer = if (prefs.getInt("cached_parent_cloud_apk_ver", 0) == BuildConfig.VERSION_CODE) {
       prefs.getString("cached_parent_cloud_apk_url", null)
     } else null
 
-    val primaryCloud = when {
-      !cachedUrl.isNullOrBlank() && isRemoteApkUrlAlive(cachedUrl) -> cachedUrl
-      isRemoteApkUrlAlive(PUBLIC_DIRECT_APK_URL) -> PUBLIC_DIRECT_APK_URL
-      else -> uploadParentInstalledApkToCloudMirror(context) ?: PUBLIC_DIRECT_APK_URL
+    // ВАЖНО: Никогда не используем старую зашитую ссылку PUBLIC_DIRECT_APK_URL вместо выгрузки свежего APK!
+    // Для текущей версии BuildConfig.VERSION_CODE обязательно берём либо уже выгруженный URL этой же версии,
+    // либо выгружаем свежий установленный APK родителя во внешний канал.
+    val uploadedOrCachedCloudUrl = when {
+      !cachedUrlForCurrentVer.isNullOrBlank() && isRemoteApkUrlAlive(cachedUrlForCurrentVer) -> cachedUrlForCurrentVer
+      else -> uploadParentInstalledApkToCloudMirror(context)
     }
+
+    val vpsApkUrl = if (isVpsActive) {
+      val hostOnly = DirectP2pSocketEngine.getVpsRelayHostLabel().substringBefore(":").trim()
+      if (hostOnly.isNotBlank()) "https://$hostOnly/KidsGuard-latest.apk" else null
+    } else null
+
+    val primaryCloud = uploadedOrCachedCloudUrl ?: AISTUDIO_SHARED_APK_URL
     _latestCloudUrl.value = primaryCloud
 
-    val urls = listOfNotNull(
-      getParentLanApkUrl(),
-      primaryCloud,
-      PUBLIC_DIRECT_APK_URL,
-      PRE_APK_URL,
-      BACKUP_DIRECT_APK_URL,
-      AISTUDIO_SHARED_APK_URL
-    ).distinct()
-    urls.joinToString("|")
+    val orderedUrls = when {
+      // 1. Устройства в РАЗНЫХ сетях + активен VPS: сначала внешний облачный пакет этой версии и VPS, БЕЗ локального IP!
+      isVpsActive && !isSameLanNetwork -> {
+        DeviceControlDebugger.logEvent(
+          "OTA_КАНАЛ_ВЫБРАН",
+          "Маршрут обновления: ☁️ VPS / Внешняя сеть (родитель и ребёнок в разных сетях — локальный IP отключён). URL: $primaryCloud",
+          "SUCCESS",
+          "P2P"
+        )
+        listOfNotNull(
+          uploadedOrCachedCloudUrl,
+          vpsApkUrl,
+          AISTUDIO_SHARED_APK_URL
+        )
+      }
+      // 2. Устройства в РАЗНЫХ сетях (P2P Воркеры / мобильный интернет): ТОЛЬКО внешние HTTPS-ссылки, БЕЗ локального IP!
+      !isSameLanNetwork -> {
+        DeviceControlDebugger.logEvent(
+          "OTA_КАНАЛ_ВЫБРАН",
+          "Маршрут обновления: 🌐 Глобальная сеть P2P (родитель и ребёнок в разных сетях — локальный IP отключён). URL: $primaryCloud",
+          "SUCCESS",
+          "P2P"
+        )
+        listOfNotNull(
+          uploadedOrCachedCloudUrl,
+          AISTUDIO_SHARED_APK_URL
+        )
+      }
+      // 3. Устройства в ОДНОЙ локальной сети Wi-Fi (LAN активен): сначала быстрый LAN-сокет, затем внешнее облако
+      else -> {
+        val lanUrl = getParentLanApkUrl()
+        DeviceControlDebugger.logEvent(
+          "OTA_КАНАЛ_ВЫБРАН",
+          "Маршрут обновления: 🟢 Локальная сеть LAN Wi-Fi ($lanUrl) + облачный резерв ($primaryCloud)",
+          "SUCCESS",
+          "P2P"
+        )
+        listOfNotNull(
+          lanUrl,
+          uploadedOrCachedCloudUrl,
+          vpsApkUrl,
+          AISTUDIO_SHARED_APK_URL
+        )
+      }
+    }.distinct()
+
+    orderedUrls.joinToString("|")
   }
 
   /**
@@ -543,19 +679,40 @@ object ApkUpdateInstaller {
           apkFile.delete()
         }
 
-        // Parse multiple pipe-separated URLs from customUrl (e.g. "http://lanIp:49154/...|https://cloud/...")
+        val isSameLanOnChild = DirectP2pSocketEngine.status.value.isLanSocketConnected
+
+        // Parse multiple pipe-separated URLs from customUrl (e.g. "https://cloud/...|http://lanIp:49154/...")
+        // If Child and Parent are in DIFFERENT networks (!isSameLanOnChild), strip out any local port 49154 LAN URLs!
         val candidateUrls = customUrl.split("|")
           .map { it.trim() }
           .filter { it.startsWith("http://") || it.startsWith("https://") }
+          .filter { url ->
+            val isLanApkUrl = url.contains(":$PARENT_APK_HTTP_PORT/")
+            if (isLanApkUrl && !isSameLanOnChild) {
+              DeviceControlDebugger.logEvent(
+                "OTA_ЛОКАЛЬНЫЙ_IP_ПРОПУЩЕН",
+                "Пропущен локальный адрес $url, так как телефон ребёнка находится в другой сети (активен канал: ${DirectP2pSocketEngine.status.value.activeTransportLabel})",
+                "INFO",
+                "CHILD"
+              )
+              false
+            } else {
+              true
+            }
+          }
 
         val urlsToTry = (
           candidateUrls + listOfNotNull(
-            PUBLIC_DIRECT_APK_URL,
-            PRE_APK_URL,
-            BACKUP_DIRECT_APK_URL,
             AISTUDIO_SHARED_APK_URL
           )
         ).distinct()
+
+        DeviceControlDebugger.logEvent(
+          "OTA_СКАЧИВАНИЕ",
+          "Скачивание обновления по активному каналу (${DirectP2pSocketEngine.status.value.activeTransportLabel}): ${urlsToTry.joinToString(", ")}",
+          "INFO",
+          "CHILD"
+        )
 
         var downloaded = false
         for (targetUrl in urlsToTry) {
