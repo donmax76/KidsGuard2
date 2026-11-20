@@ -764,7 +764,9 @@ class ParentalControlRepository(private val context: Context) {
                       stopDeviceLoudAlarm()
                     }
                     "START_LIVE_STREAM" -> {
-                      com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(120_000L)
+                      if (com.example.service.KidsGuardAccessibilityService.instance == null) {
+                        com.example.service.KidsGuardAccessibilityService.activateLiveStreamingWindow(120_000L)
+                      }
                     }
                     "STOP_LIVE_STREAM" -> {
                       com.example.service.KidsGuardAccessibilityService.stopLiveStreamingWindow()
@@ -885,44 +887,109 @@ class ParentalControlRepository(private val context: Context) {
   suspend fun getFamilyConfigOnce(): FamilyConfigEntity? = dao.getFamilyConfigOnce()
 
   suspend fun setDeviceRole(role: String, preferredChildId: Long = 0L) {
-    dao.setDeviceRole(role)
-    com.example.data.cloud.DirectP2pSocketEngine.updateRole(role)
+    val bootCfg = com.example.util.BootPrefs.load(context)
+    val cfg = dao.getFamilyConfigOnce()
+    val effectivePermanentRole = bootCfg.permanentHardwareRole.ifBlank {
+      when {
+        cfg?.selectedRole == "CHILD" && (cfg.thisDeviceChildId > 0L || bootCfg.childId > 0L) -> "CHILD"
+        cfg?.selectedRole == "PARENT" -> "PARENT"
+        else -> ""
+      }
+    }
+
     if (role == "CHILD") {
-      val cfg = dao.getFamilyConfigOnce()
-      // Prefer explicit preferredChildId or currentActiveChildId (e.g., when user selected "Тест Назрин" and tapped Child Mode)
       val activeId = preferredChildId.takeIf { it > 0 }
-        ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
+        ?: bootCfg.childId.takeIf { it > 0 }
         ?: cfg?.thisDeviceChildId?.takeIf { it > 0 }
+        ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
         ?: dao.getAllChildrenOnce().lastOrNull()?.id
         ?: 1L
+      dao.setDeviceRole("CHILD")
+      com.example.util.BootPrefs.save(context, "CHILD", activeId)
+      // If this phone's permanent hardware role is PARENT, never overwrite the Child's database with the Parent phone's hardware/apps!
+      if (effectivePermanentRole == "PARENT") {
+        com.example.data.cloud.DirectP2pSocketEngine.updateRole("CHILD", activeId)
+        return
+      }
+      com.example.util.BootPrefs.savePermanentHardwareRole(context, "CHILD", activeId)
+      com.example.data.cloud.DirectP2pSocketEngine.updateRole("CHILD", activeId)
       bindThisDeviceToChild(activeId)
-    } else {
-      // PARENT role: clear thisDeviceChildId, stop all child lock/monitoring services on Parent's phone,
-      // and strictly purge ALL locally-scanned Parent apps so only remote Child apps are ever stored!
+    } else if (role == "PARENT") {
+      dao.setDeviceRole("PARENT")
+      // If this physical phone is the CHILD's phone and the parent entered PIN for temporary admin inspection:
+      // DO NOT wipe thisDeviceChildId, DO NOT stop KidsGuardBackgroundService, and DO NOT overwrite BootPrefs role
+      // so closing/reopening the app on the child's phone always returns straight to Child mode!
+      if (effectivePermanentRole == "CHILD") {
+        val childId = bootCfg.childId.takeIf { it > 0L } ?: cfg?.thisDeviceChildId ?: 0L
+        com.example.util.BootPrefs.savePermanentHardwareRole(context, "CHILD", childId)
+        return
+      }
+      // Physical PARENT phone:
+      com.example.util.BootPrefs.savePermanentHardwareRole(context, "PARENT", 0L)
+      com.example.util.BootPrefs.save(context, "PARENT", 0L)
+      com.example.data.cloud.DirectP2pSocketEngine.updateRole("PARENT", 0L)
       dao.setThisDeviceChildId(0L)
       com.example.service.LockOverlayService.stop(context)
       com.example.service.KidsGuardBackgroundService.stop(context)
-      dao.clearAllApps()
       for (child in dao.getAllChildrenOnce()) {
         cloudSync.sendRemoteCommand(child.id, "REFRESH_APPS", "")
       }
     }
   }
 
+  suspend fun restoreChildRoleOnLaunchIfPermanentChild(): Boolean {
+    val bootCfg = com.example.util.BootPrefs.load(context)
+    val cfg = dao.getFamilyConfigOnce()
+    if (cfg != null && cfg.parentMasterPin.length in 4..8) {
+      com.example.util.BootPrefs.saveMasterPin(context, cfg.parentMasterPin)
+    }
+    val isPermanentChild = bootCfg.permanentHardwareRole == "CHILD" ||
+      (bootCfg.permanentHardwareRole.isBlank() && (cfg?.selectedRole == "CHILD" || bootCfg.role == "CHILD"))
+    if (isPermanentChild) {
+      val boundId = bootCfg.childId.takeIf { it > 0L }
+        ?: cfg?.thisDeviceChildId?.takeIf { it > 0L }
+        ?: cfg?.currentActiveChildId?.takeIf { it > 0L }
+        ?: dao.getAllChildrenOnce().firstOrNull()?.id
+        ?: 1L
+      com.example.util.BootPrefs.savePermanentHardwareRole(context, "CHILD", boundId)
+      com.example.util.BootPrefs.save(context, "CHILD", boundId)
+      if (cfg?.selectedRole != "CHILD" || cfg.thisDeviceChildId <= 0L) {
+        dao.setDeviceRole("CHILD")
+        dao.setThisDeviceChildId(boundId)
+        dao.setActiveChildId(boundId)
+      }
+      com.example.data.cloud.DirectP2pSocketEngine.updateRole("CHILD", boundId)
+      return true
+    }
+    if (bootCfg.permanentHardwareRole == "PARENT" || cfg?.selectedRole == "PARENT") {
+      com.example.util.BootPrefs.savePermanentHardwareRole(context, "PARENT", 0L)
+      com.example.util.BootPrefs.save(context, "PARENT", 0L)
+    }
+    return false
+  }
+
   suspend fun setActiveChild(childId: Long) {
     dao.setActiveChildId(childId)
     val cfg = dao.getFamilyConfigOnce()
-    if (cfg?.selectedRole == "CHILD" && childId > 0L && cfg.thisDeviceChildId != childId) {
+    val bootCfg = com.example.util.BootPrefs.load(context)
+    if (cfg?.selectedRole == "CHILD" && bootCfg.permanentHardwareRole != "PARENT" && childId > 0L && cfg.thisDeviceChildId != childId) {
       bindThisDeviceToChild(childId)
     }
   }
 
   suspend fun bindThisDeviceToChild(childId: Long) {
     if (childId <= 0L) return
+    val bootCfg = com.example.util.BootPrefs.load(context)
+    // HARD GUARD: Never allow a Parent phone to overwrite a Child profile with the Parent phone's model/battery/apps!
+    if (bootCfg.permanentHardwareRole == "PARENT") {
+      return
+    }
     val prevCfg = dao.getFamilyConfigOnce()
     val prevBoundId = prevCfg?.thisDeviceChildId ?: 0L
     dao.setThisDeviceChildId(childId)
     dao.setActiveChildId(childId)
+    com.example.util.BootPrefs.savePermanentHardwareRole(context, "CHILD", childId)
+    com.example.util.BootPrefs.save(context, "CHILD", childId)
 
     // Ensure phone is unlocked when binding to Child mode unless parent explicitly locks it later
     dao.setChildDeviceLocked(childId, false)
@@ -949,15 +1016,33 @@ class ParentalControlRepository(private val context: Context) {
       cloudSync.syncChildAppVersion(childId, apkVer)
       val realApps = com.example.util.DeviceAppsProvider.getInstalledLaunchableApps(context, childId)
       if (realApps.isNotEmpty()) {
+        val prevApps = dao.getAppsForChildOnce(childId).associateBy { it.packageName.trim().lowercase() }
+        val mergedApps = realApps.map { app ->
+          val prev = prevApps[app.packageName.trim().lowercase()]
+          if (prev != null) {
+            app.copy(
+              isBlocked = prev.isBlocked,
+              dailyLimitMinutes = prev.dailyLimitMinutes,
+              usedMinutesToday = maxOf(app.usedMinutesToday, prev.usedMinutesToday)
+            )
+          } else app
+        }
         dao.deleteAppsForChild(childId)
-        dao.insertApps(realApps)
-        cloudSync.uploadChildApps(childId, realApps)
+        dao.insertApps(mergedApps)
+        cloudSync.uploadChildApps(childId, mergedApps)
       }
     }
   }
 
   suspend fun updateMasterPin(pin: String) {
-    dao.updateMasterPin(pin)
+    val cleanPin = pin.filter { it.isDigit() }
+    if (cleanPin.length !in 4..8) return
+    dao.updateMasterPin(cleanPin)
+    dao.updateChildUninstallPin(cleanPin)
+    com.example.util.BootPrefs.saveMasterPin(context, cleanPin)
+    for (child in dao.getAllChildrenOnce()) {
+      cloudSync.sendRemoteCommand(child.id, "SET_MASTER_PIN", cleanPin)
+    }
   }
 
   suspend fun deduplicateLocalChildrenInDb() {
@@ -1342,6 +1427,8 @@ class ParentalControlRepository(private val context: Context) {
       dao.setThisDeviceChildId(pairedProfile.id)
       dao.setActiveChildId(pairedProfile.id)
       dao.setDeviceRole("CHILD")
+      com.example.util.BootPrefs.savePermanentHardwareRole(context, "CHILD", pairedProfile.id)
+      com.example.util.BootPrefs.save(context, "CHILD", pairedProfile.id)
       com.example.data.cloud.DirectP2pSocketEngine.updateRole("CHILD", pairedProfile.id)
 
       // Scan REAL installed applications on CHILD'S PHONE and upload to Cloud for Parent!
@@ -1844,12 +1931,21 @@ class ParentalControlRepository(private val context: Context) {
 
   // --- Pillar 1: Защита от удаления и проверка PIN-кода на устройстве ребенка ---
   suspend fun verifyChildUninstallPin(inputPin: String): Boolean {
-    val config = dao.getFamilyConfigOnce() ?: return inputPin == "1234"
-    return inputPin == config.childUninstallPin || inputPin == config.parentMasterPin
+    val cleanInput = inputPin.trim()
+    if (cleanInput.length !in 4..8) return false
+    val bootPin = com.example.util.BootPrefs.getMasterPin(context)
+    val config = dao.getFamilyConfigOnce() ?: return cleanInput == bootPin
+    val masterPin = config.parentMasterPin.takeIf { it.isNotBlank() } ?: bootPin
+    val uninstallPin = config.childUninstallPin.takeIf { it.isNotBlank() } ?: masterPin
+    return cleanInput == masterPin || cleanInput == uninstallPin
   }
 
   suspend fun updateChildUninstallPin(newPin: String) {
-    dao.updateChildUninstallPin(newPin)
+    val cleanPin = newPin.filter { it.isDigit() }
+    if (cleanPin.length in 4..8) {
+      dao.updateChildUninstallPin(cleanPin)
+      com.example.util.BootPrefs.saveMasterPin(context, cleanPin)
+    }
   }
 
   suspend fun updateAntiUninstall(enabled: Boolean) {

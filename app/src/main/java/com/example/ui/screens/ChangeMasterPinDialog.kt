@@ -69,10 +69,11 @@ fun ChangeMasterPinDialog(
         OutlinedTextField(
           value = oldPinInput,
           onValueChange = {
-            if (it.length <= 8) oldPinInput = it.filter { ch -> ch.isDigit() }
+            val digits = it.filter { ch -> ch.isDigit() }
+            if (digits.length <= 8) oldPinInput = digits
             errorMessage = null
           },
-          label = { Text("Текущий PIN-код (по умолч. 1234)", color = Slate400, fontSize = 12.sp) },
+          label = { Text("Текущий PIN-код", color = Slate400, fontSize = 12.sp) },
           visualTransformation = PasswordVisualTransformation(),
           keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
           singleLine = true,

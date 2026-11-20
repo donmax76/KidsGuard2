@@ -73,6 +73,7 @@ fun MultiChildSelector(
   onShowPairingCode: (ChildProfileEntity) -> Unit,
   onDeleteChild: (ChildProfileEntity) -> Unit,
   onAddChildClick: () -> Unit,
+  onConnectExistingChildClick: () -> Unit = onAddChildClick,
   modifier: Modifier = Modifier
 ) {
   var childToDelete by remember { mutableStateOf<ChildProfileEntity?>(null) }
@@ -92,17 +93,24 @@ fun MultiChildSelector(
         fontSize = 15.sp
       )
 
-      TextButton(onClick = onAddChildClick, modifier = Modifier.testTag("add_child_header_button")) {
-        Icon(Icons.Default.Add, contentDescription = null, tint = CyanLight, modifier = Modifier.size(16.dp))
-        Spacer(modifier = Modifier.width(4.dp))
-        Text("Добавить ребенка", color = CyanLight, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+      Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        TextButton(onClick = onConnectExistingChildClick, modifier = Modifier.testTag("connect_existing_child_header_button")) {
+          Icon(Icons.Default.QrCode, contentDescription = null, tint = EmeraldShieldLight, modifier = Modifier.size(15.dp))
+          Spacer(modifier = Modifier.width(4.dp))
+          Text("По коду", color = EmeraldShieldLight, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+        TextButton(onClick = onAddChildClick, modifier = Modifier.testTag("add_child_header_button")) {
+          Icon(Icons.Default.Add, contentDescription = null, tint = CyanLight, modifier = Modifier.size(16.dp))
+          Spacer(modifier = Modifier.width(3.dp))
+          Text("Новый", color = CyanLight, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        }
       }
     }
 
     Spacer(modifier = Modifier.height(4.dp))
 
     if (children.isEmpty()) {
-      // Clean Empty State when no children added yet
+      // Clean Empty State when no children added yet or after Parent app reinstall
       Card(
         modifier = Modifier
           .fillMaxWidth()
@@ -117,24 +125,39 @@ fun MultiChildSelector(
         ) {
           Icon(Icons.Default.PersonAdd, contentDescription = null, tint = CyanLight, modifier = Modifier.size(36.dp))
           Spacer(modifier = Modifier.height(10.dp))
-          Text("У вас пока нет добавленных детей", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+          Text("Подключите или добавьте ребёнка", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
           Spacer(modifier = Modifier.height(4.dp))
           Text(
-            "Нажмите «Добавить ребенка», чтобы создать профиль, настроить лимиты и получить персональный код для телефона ребенка.",
+            "Если телефон ребёнка уже был настроен ранее, нажмите «Подключиться по 6-значному коду ребёнка», чтобы восстановить связь без смены кода на телефоне ребёнка.",
             color = Slate400,
             fontSize = 12.sp,
             textAlign = TextAlign.Center
           )
           Spacer(modifier = Modifier.height(14.dp))
           Button(
-            onClick = onAddChildClick,
-            colors = ButtonDefaults.buttonColors(containerColor = CyanLight, contentColor = Slate950),
+            onClick = onConnectExistingChildClick,
+            colors = ButtonDefaults.buttonColors(containerColor = EmeraldShieldLight, contentColor = Slate950),
             shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.testTag("empty_add_child_button")
+            modifier = Modifier
+              .fillMaxWidth()
+              .testTag("empty_connect_existing_child_button")
           ) {
-            Icon(Icons.Default.Add, contentDescription = null)
+            Icon(Icons.Default.QrCode, contentDescription = null)
             Spacer(modifier = Modifier.width(6.dp))
-            Text("Добавить первого ребенка", fontWeight = FontWeight.Bold)
+            Text("Подключиться по 6-значному коду ребёнка", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+          }
+          Spacer(modifier = Modifier.height(8.dp))
+          OutlinedButton(
+            onClick = onAddChildClick,
+            shape = RoundedCornerShape(12.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, CyanLight),
+            modifier = Modifier
+              .fillMaxWidth()
+              .testTag("empty_add_child_button")
+          ) {
+            Icon(Icons.Default.Add, contentDescription = null, tint = CyanLight)
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Создать новый профиль ребёнка", color = CyanLight, fontWeight = FontWeight.Bold, fontSize = 12.sp)
           }
         }
       }
@@ -365,9 +388,10 @@ fun PairingCodeDialog(
 fun AddChildDialog(
   onDismiss: () -> Unit,
   onConfirm: (name: String, age: Int, dailyLimit: Int) -> Unit,
-  onConnectExistingByCode: (pairingCode: String, customName: String) -> Unit = { _, _ -> }
+  onConnectExistingByCode: (pairingCode: String, customName: String) -> Unit = { _, _ -> },
+  initialConnectByCodeMode: Boolean = false
 ) {
-  var isSecondParentMode by remember { mutableStateOf(false) }
+  var isSecondParentMode by remember(initialConnectByCodeMode) { mutableStateOf(initialConnectByCodeMode) }
   var name by remember { mutableStateOf("") }
   var ageText by remember { mutableStateOf("10") }
   var limitMinutesText by remember { mutableStateOf("120") }
@@ -377,7 +401,7 @@ fun AddChildDialog(
     onDismissRequest = onDismiss,
     title = {
       Text(
-        text = if (isSecondParentMode) "Подключить по 6-значному коду" else "Добавить ребенка в семью",
+        text = if (isSecondParentMode) "Подключиться к текущему ребёнку по коду" else "Добавить нового ребёнка",
         color = Color.White,
         fontSize = 17.sp,
         fontWeight = FontWeight.Bold
@@ -385,7 +409,7 @@ fun AddChildDialog(
     },
     text = {
       Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        // Переключатель режима: Новый профиль ИЛИ 2-й родитель по 6-значному коду
+        // Переключатель режима: Новый профиль ИЛИ подключение к существующему коду ребёнка
         Row(
           modifier = Modifier
             .fillMaxWidth()
@@ -420,7 +444,7 @@ fun AddChildDialog(
             contentAlignment = Alignment.Center
           ) {
             Text(
-              text = "По коду (2-й родитель)",
+              text = "По коду ребёнка",
               color = if (isSecondParentMode) Slate950 else Slate200,
               fontSize = 12.sp,
               fontWeight = FontWeight.Bold
@@ -430,7 +454,7 @@ fun AddChildDialog(
 
         if (isSecondParentMode) {
           Text(
-            text = "Для подключения второго родителя (Мать и Отец) введите 6-значный код привязки уже настроенного телефона ребенка. Все текущие блокировки и лимиты загрузятся автоматически.",
+            text = "Введите 6-значный код комнаты уже настроенного телефона ребёнка (после переустановки программы у родителя или для второго родителя). Менять код на телефоне ребёнка не нужно — все блокировки и приложения загрузятся автоматически.",
             color = Slate400,
             fontSize = 12.sp,
             lineHeight = 16.sp

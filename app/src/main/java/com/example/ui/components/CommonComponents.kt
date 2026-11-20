@@ -921,7 +921,7 @@ fun SecurityPinDialog(
     text = {
       Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text(
-          text = "Для доступа к настройкам родителя введите PIN-код (по умолчанию 1234):",
+          text = "Для доступа к настройкам родителя введите PIN-код (от 4 до 8 цифр):",
           color = Slate400,
           fontSize = 14.sp
         )
@@ -931,18 +931,22 @@ fun SecurityPinDialog(
         OutlinedTextField(
           value = pinInput,
           onValueChange = {
-            if (it.length <= 6) {
-              pinInput = it
+            val digits = it.filter { ch -> ch.isDigit() }
+            if (digits.length <= 8) {
+              pinInput = digits
               isError = false
             }
           },
           visualTransformation = PasswordVisualTransformation(),
+          keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+            keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword
+          ),
           singleLine = true,
           isError = isError,
           modifier = Modifier
             .fillMaxWidth()
             .testTag("pin_input_field"),
-          placeholder = { Text("••••") }
+          placeholder = { Text("Введите PIN-код") }
         )
 
         if (isError) {

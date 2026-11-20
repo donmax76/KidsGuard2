@@ -134,6 +134,7 @@ fun ParentDashboardScreen(
 ) {
   var selectedPairingChild by remember { mutableStateOf<ChildProfileEntity?>(null) }
   var isAddChildDialogVisible by remember { mutableStateOf(false) }
+  var addChildInitialConnectMode by remember { mutableStateOf(false) }
   var isTrafficDialogVisible by remember { mutableStateOf(false) }
   var isScreenshotsViewerVisible by remember { mutableStateOf(false) }
   var isLiveStreamVisible by remember { mutableStateOf(false) }
@@ -183,7 +184,14 @@ fun ParentDashboardScreen(
         onSelectChild = onSelectChild,
         onShowPairingCode = { selectedPairingChild = it },
         onDeleteChild = onDeleteChild,
-        onAddChildClick = { isAddChildDialogVisible = true }
+        onAddChildClick = {
+          addChildInitialConnectMode = false
+          isAddChildDialogVisible = true
+        },
+        onConnectExistingChildClick = {
+          addChildInitialConnectMode = true
+          isAddChildDialogVisible = true
+        }
       )
     }
 
@@ -2300,7 +2308,8 @@ fun ParentDashboardScreen(
       onConnectExistingByCode = { code, customName ->
         onConnectSecondParentByCode(code, customName)
         isAddChildDialogVisible = false
-      }
+      },
+      initialConnectByCodeMode = addChildInitialConnectMode
     )
   }
 

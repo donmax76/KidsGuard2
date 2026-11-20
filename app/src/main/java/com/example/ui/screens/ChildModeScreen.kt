@@ -136,7 +136,6 @@ fun ChildModeScreen(
 
   androidx.compose.runtime.LaunchedEffect(Unit) {
     com.example.util.ScreenShotManager.restorePersistentLiveStreamState(context)
-    (context as? com.example.MainActivity)?.requestChildLocationPermissionsIfNeeded()
   }
 
   androidx.compose.runtime.LaunchedEffect(isLocked) {

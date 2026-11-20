@@ -61,7 +61,7 @@ class LiveLocationTracker(
     const val DEFAULT_BAKU_ADDRESS = "Ожидание точного GPS-сигнала с телефона ребёнка..."
 
     @Volatile
-    var isGpsTrackingAllowed: Boolean = false
+    var isGpsTrackingAllowed: Boolean = true
 
     private val activeInstances = java.util.Collections.synchronizedSet(java.util.LinkedHashSet<LiveLocationTracker>())
 
@@ -511,10 +511,9 @@ class LiveLocationTracker(
         }.also { activeListener = it }
 
         var anyActive = false
-        // Режим трекинга зависит от того, смотрит ли родитель карту прямо сейчас.
-        // Раньше ВСЕГДА запрашивался PRIORITY_HIGH_ACCURACY каждые 3–8 секунд — GPS-радио
-        // не спало никогда, и телефон ребёнка разряжался за несколько часов.
         val parentViewing = com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()
+        val hasInitialFix = _locationState.value.hasGpsFix && _locationState.value.latitude != 0.0
+        val shouldActivelyRequest = parentViewing || !hasInitialFix
         lastTrackingHighAccuracy = parentViewing
         // 1. Primary Google Play Services FusedLocationProviderClient
         try {
@@ -525,9 +524,7 @@ class LiveLocationTracker(
                 processNewLocation(loc)
               }
             }
-            // Активный GPS-фикс — тоже только когда родитель смотрит карту; иначе
-            // читаем лишь пассивный кэш (lastLocation), не будя GNSS-радио.
-            if (parentViewing) {
+            if (shouldActivelyRequest) {
               val currentReq = CurrentLocationRequest.Builder()
                 .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
                 .setMaxUpdateAgeMillis(10_000L)
@@ -540,10 +537,7 @@ class LiveLocationTracker(
                   }
                 }
             }
-            // Непрерывные обновления координат включаем ТОЛЬКО пока родитель смотрит карту.
-            // Иначе (приложение свёрнуто / родитель на другом экране) GPS-радио не должно
-            // просыпаться каждые 90 секунд — это и был главный фоновый расход батареи.
-            if (parentViewing) {
+            if (shouldActivelyRequest) {
               fusedLocationCallback?.let { prevCb ->
                 try { fused.removeLocationUpdates(prevCb) } catch (_: Exception) {}
               }
@@ -563,13 +557,16 @@ class LiveLocationTracker(
                 }
               }
               fusedLocationCallback = cb
+              val intervalMs = if (parentViewing) 12_000L else 45_000L
+              val minDistanceM = if (parentViewing) 10f else 25f
+              val priority = if (parentViewing) Priority.PRIORITY_HIGH_ACCURACY else Priority.PRIORITY_BALANCED_POWER_ACCURACY
               val fusedReq = com.google.android.gms.location.LocationRequest.Builder(
-                Priority.PRIORITY_HIGH_ACCURACY,
-                12_000L
+                priority,
+                intervalMs
               )
                 .setMinUpdateIntervalMillis(8_000L)
-                .setMinUpdateDistanceMeters(25f)
-                .setWaitForAccurateLocation(true)
+                .setMinUpdateDistanceMeters(minDistanceM)
+                .setWaitForAccurateLocation(false)
                 .build()
               fused.requestLocationUpdates(fusedReq, cb, Looper.getMainLooper())
               anyActive = true
@@ -577,14 +574,14 @@ class LiveLocationTracker(
           }
         } catch (_: Exception) {}
 
-        // 2. Hardware LocationManager fallback — тоже только пока родитель смотрит карту.
-        if (parentViewing) {
+        // 2. Hardware LocationManager fallback
+        if (shouldActivelyRequest && !anyActive) {
           for (provider in providers) {
             try {
               if (lm.allProviders.contains(provider)) {
                 val isSatelliteGps = provider == LocationManager.GPS_PROVIDER
                 val intervalMs = if (isSatelliteGps) 15_000L else 20_000L
-                val minDistanceM = 25f
+                val minDistanceM = 15f
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                   val quality = if (isSatelliteGps) {
                     android.location.LocationRequest.QUALITY_HIGH_ACCURACY
@@ -634,18 +631,14 @@ class LiveLocationTracker(
     }
 
     val nowMs = System.currentTimeMillis()
-    // Переключаем режим GPS при появлении/пропадании родителя на карте (не чаще раза в 30 с).
     val parentViewingNow = com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()
-    if (parentViewingNow != lastTrackingHighAccuracy && nowMs - lastTrackingModeSwitchMs > 30_000L) {
+    if (parentViewingNow != lastTrackingHighAccuracy && nowMs - lastTrackingModeSwitchMs > 15_000L) {
       lastTrackingModeSwitchMs = nowMs
       startRealLocationUpdates()
     }
 
-    // Геокодинг — только при заметном перемещении или раз в 2 минуты (сеть/Geocoder дорогие).
-    val needGeocode = lastGeocodeAddress.isBlank() || movedMeters > 60.0 || nowMs - lastGeocodeMs > 120_000L
-    // Запись маршрута в SQLite — ТОЛЬКО при реальном перемещении ≥25 м.
-    // Без движения никаких записей координат не делаем (0% лишнего расхода).
-    val needPersist = movedMeters >= 25.0
+    val needGeocode = lastGeocodeAddress.isBlank() || movedMeters > 45.0 || nowMs - lastGeocodeMs > 90_000L
+    val needPersist = movedMeters >= 15.0 || lastPersistMs == 0L || (nowMs - lastPersistMs) > 25_000L || parentViewingNow
 
     scope.launch(Dispatchers.IO) {
       val effectiveLat = loc.latitude
@@ -702,31 +695,34 @@ class LiveLocationTracker(
         val db = com.example.data.local.KidsGuardDatabase.getDatabase(context)
         val dao = db.kidsGuardDao()
         val cfg = dao.getFamilyConfigOnce()
-        if (cfg?.selectedRole == "CHILD") {
+        val bootCfg = com.example.util.BootPrefs.load(context)
+        val isChildDevice = cfg?.selectedRole == "CHILD" || bootCfg.permanentHardwareRole == "CHILD"
+        if (isChildDevice) {
           val targetChildId = when {
-            cfg.thisDeviceChildId > 0 -> cfg.thisDeviceChildId
-            cfg.currentActiveChildId > 0 -> cfg.currentActiveChildId
+            (cfg?.thisDeviceChildId ?: 0L) > 0L -> cfg!!.thisDeviceChildId
+            bootCfg.childId > 0L -> bootCfg.childId
+            (cfg?.currentActiveChildId ?: 0L) > 0L -> cfg!!.currentActiveChildId
             else -> dao.getAllChildrenOnce().firstOrNull()?.id ?: 1L
           }
           dao.updateChildLocation(targetChildId, effectiveLat, effectiveLng, realAddress, nowMs)
-          // Save into local Room OfflineStoreAndForward queue so even if parent is offline, full route is preserved!
-          com.example.data.cloud.OfflineStoreAndForwardManager.recordChildLocationOffline(
-            context = context,
-            childId = targetChildId,
-            lat = effectiveLat,
-            lng = effectiveLng,
-            address = realAddress,
-            speedKmh = speed,
-            accuracyMeters = accuracy
-          )
-          // Battery Saver: Only transmit real-time network packets when Parent is actively connected
-          if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) {
-            com.example.data.cloud.CloudSyncManager(context).updateLocation(
+          if (movedMeters >= 15.0) {
+            com.example.data.cloud.OfflineStoreAndForwardManager.recordChildLocationOffline(
+              context = context,
               childId = targetChildId,
               lat = effectiveLat,
               lng = effectiveLng,
-              address = realAddress
+              address = realAddress,
+              speedKmh = speed,
+              accuracyMeters = accuracy
             )
+          }
+          com.example.data.cloud.CloudSyncManager(context).updateLocation(
+            childId = targetChildId,
+            lat = effectiveLat,
+            lng = effectiveLng,
+            address = realAddress
+          )
+          if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) {
             com.example.data.cloud.OfflineStoreAndForwardManager.flushUnsyncedHistoryToParent(context, targetChildId)
           }
         }

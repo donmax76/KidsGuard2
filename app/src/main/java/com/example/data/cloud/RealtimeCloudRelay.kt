@@ -292,6 +292,9 @@ object RealtimeCloudRelay {
         if (childrenCache.containsKey(mapped)) return mapped
       }
     }
+    if (childrenCache.size == 1) {
+      return childrenCache.keys.first()
+    }
     return if (rawId > 0L) rawId else 1L
   }
 
@@ -1708,10 +1711,11 @@ object RealtimeCloudRelay {
   }
 
   suspend fun publishScreenSnapshot(childId: Long, activeAppName: String, base64Bitmap: String) {
+    if (base64Bitmap.isBlank()) return
     val targetId = if (childId > 0L) childId else 1L
     val now = System.currentTimeMillis()
     val prevMs = lastScreenPublishByChild[targetId] ?: 0L
-    if (now - prevMs < 500L) return
+    if (now - prevMs < 250L) return
     lastScreenPublishByChild[targetId] = now
     DirectP2pSocketEngine.pushDirectScreenFrame(targetId, activeAppName, base64Bitmap)
   }

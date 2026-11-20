@@ -173,10 +173,10 @@ object SosEmergencySender {
         val db = KidsGuardDatabase.getDatabase(appContext)
         val dao = db.kidsGuardDao()
         val cfg = dao.getFamilyConfigOnce()
-        val masterPin = cfg?.parentMasterPin?.trim()?.takeIf { it.isNotBlank() } ?: "1234"
-        val uninstallPin = cfg?.childUninstallPin?.trim()?.takeIf { it.isNotBlank() } ?: "1234"
+        val masterPin = cfg?.parentMasterPin?.trim()?.takeIf { it.isNotBlank() }
+          ?: BootPrefs.getMasterPin(appContext)
 
-        val isValid = cleanPin == masterPin || cleanPin == uninstallPin || cleanPin == "1234"
+        val isValid = cleanPin == masterPin
         if (isValid) {
           val allChildren = dao.getAllChildrenOnce()
           val boundId = cfg?.thisDeviceChildId?.takeIf { it > 0L }

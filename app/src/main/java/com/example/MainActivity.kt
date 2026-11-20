@@ -101,9 +101,12 @@ class MainActivity : ComponentActivity() {
       try {
         val dao = KidsGuardDatabase.getDatabase(applicationContext).kidsGuardDao()
         val cfg = dao.getFamilyConfigOnce()
-        if (cfg?.selectedRole == "CHILD") {
-          val childId = cfg.thisDeviceChildId.takeIf { it > 0 }
-            ?: cfg.currentActiveChildId.takeIf { it > 0 }
+        val bootCfg = com.example.util.BootPrefs.load(applicationContext)
+        val isChildPhone = cfg?.selectedRole == "CHILD" || bootCfg.permanentHardwareRole == "CHILD"
+        if (isChildPhone) {
+          val childId = cfg?.thisDeviceChildId?.takeIf { it > 0 }
+            ?: bootCfg.childId.takeIf { it > 0 }
+            ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
             ?: 1L
           com.example.util.ScreenShotManager.restorePersistentLiveStreamState(applicationContext)
           KidsGuardBackgroundService.start(
@@ -114,9 +117,7 @@ class MainActivity : ComponentActivity() {
           window?.decorView?.postDelayed({
             com.example.util.ScreenShotManager.captureActivityDecorView(this@MainActivity)
           }, 400L)
-        } else if (cfg?.selectedRole == "PARENT") {
-          // This device is in PARENT mode: ensure child lock & child background services are stopped,
-          // but preserve persisted live stream preference in case user switches back to Child mode
+        } else if (cfg?.selectedRole == "PARENT" || bootCfg.permanentHardwareRole == "PARENT") {
           com.example.util.ScreenShotManager.stopMediaProjection(applicationContext, disablePreference = false)
           LockOverlayService.stop(applicationContext)
           KidsGuardBackgroundService.stop(applicationContext)

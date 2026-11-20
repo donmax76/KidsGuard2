@@ -762,16 +762,26 @@ class KidsGuardBackgroundService : Service() {
                         } catch (_: Exception) {}
                         cloudSync.clearRemoteCommand(activeChildId)
                       }
-                      "PARENT_ONLINE_HEARTBEAT", "REQUEST_GPS_NOW", "REQUEST_OFFLINE_SYNC" -> {
+                      "SET_MASTER_PIN" -> {
+                        val cleanPin = payload.filter { it.isDigit() }
+                        if (cleanPin.length in 4..8) {
+                          dao.updateMasterPin(cleanPin)
+                          dao.updateChildUninstallPin(cleanPin)
+                          com.example.util.BootPrefs.saveMasterPin(applicationContext, cleanPin)
+                        }
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
+                      "PARENT_ONLINE_HEARTBEAT", "REQUEST_GPS_NOW", "REQUEST_OFFLINE_SYNC", "MAP_VIEWING" -> {
                         com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
+                        val isImmediateGpsRequest = (cmd == "REQUEST_GPS_NOW" || cmd == "MAP_VIEWING")
                         val freshBatt = readBatteryLevel()
                         dao.updateChildBattery(activeChildId, freshBatt)
                         cloudSync.upsertBatteryLevel(activeChildId, freshBatt)
                         if (com.example.location.LiveLocationTracker.isGpsTrackingAllowed) {
                           launch(Dispatchers.Main) {
-                            startGpsTracking(requestImmediateFix = cmd == "REQUEST_GPS_NOW")
+                            startGpsTracking(requestImmediateFix = isImmediateGpsRequest)
                           }
-                          val freshLoc = if (cmd == "REQUEST_GPS_NOW") {
+                          val freshLoc = if (isImmediateGpsRequest) {
                             com.example.location.LiveLocationTracker.awaitHighAccuracyLocation(applicationContext, 4_000L)
                               ?: com.example.location.LiveLocationTracker.getBestImmediateLocation(applicationContext)
                           } else {
@@ -840,8 +850,8 @@ class KidsGuardBackgroundService : Service() {
                         }
                       }
                       "START_LIVE_STREAM" -> {
-                        KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
                         if (KidsGuardAccessibilityService.instance == null) {
+                          KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
                           val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
                           ScreenShotManager.triggerHardwareScreenCapture(appLabel, false) { item ->
                             serviceScope.launch(Dispatchers.IO) {
@@ -855,11 +865,8 @@ class KidsGuardBackgroundService : Service() {
                         }
                       }
                       "TAKE_SCREENSHOT" -> {
-                        KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
-                        val accSvc = KidsGuardAccessibilityService.instance
-                        if (accSvc != null) {
-                          accSvc.triggerImmediateCaptureNow()
-                        } else {
+                        if (KidsGuardAccessibilityService.instance == null) {
+                          KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
                           val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
                           ScreenShotManager.triggerHardwareScreenCapture(appLabel, false) { item ->
                             serviceScope.launch(Dispatchers.IO) {
@@ -965,7 +972,9 @@ class KidsGuardBackgroundService : Service() {
     // реально смотрит карту (команда MAP_VIEWING). В остальное время GNSS-радио должно
     // спать — фоновый GPS каждые 25–60 секунд был главной причиной разряда и нагрева.
     val parentOnMap = com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()
-    if (!parentOnMap && isGpsTrackingStarted) {
+    val hasInitialFix = lastBgLocation != null
+    val shouldStartUpdates = parentOnMap || requestImmediateFix || !hasInitialFix
+    if (!shouldStartUpdates && isGpsTrackingStarted) {
       stopGpsTracking()
       return
     }
@@ -977,12 +986,10 @@ class KidsGuardBackgroundService : Service() {
         try {
           fc.lastLocation.addOnSuccessListener { loc ->
             if (loc != null && !com.example.location.LiveLocationTracker.isEmulatorSyntheticUsLocation(loc.latitude, loc.longitude)) {
-              onNewLocation(loc)
+              onNewLocation(loc, forceUpload = requestImmediateFix || !hasInitialFix)
             }
           }
-          // Разовый точный фикс — только по явному запросу (REQUEST_GPS_NOW) или пока
-          // родитель на карте; без этого только пассивный кэш lastLocation.
-          if (requestImmediateFix || parentOnMap) {
+          if (requestImmediateFix || parentOnMap || !hasInitialFix) {
             val highAccReq = com.google.android.gms.location.CurrentLocationRequest.Builder()
               .setPriority(com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY)
               .setMaxUpdateAgeMillis(10_000L)
@@ -995,7 +1002,7 @@ class KidsGuardBackgroundService : Service() {
                 }
               }
           }
-          if (parentOnMap && !isGpsTrackingStarted) {
+          if (shouldStartUpdates && !isGpsTrackingStarted) {
             fusedCallback?.let { prev -> try { fc.removeLocationUpdates(prev) } catch (_: Exception) {} }
             val cb = object : com.google.android.gms.location.LocationCallback() {
               override fun onLocationResult(result: com.google.android.gms.location.LocationResult) {
@@ -1015,7 +1022,7 @@ class KidsGuardBackgroundService : Service() {
             )
               .setMinUpdateIntervalMillis(8_000L)
               .setMinUpdateDistanceMeters(10f)
-              .setWaitForAccurateLocation(true)
+              .setWaitForAccurateLocation(false)
               .build()
             fc.requestLocationUpdates(req, cb, android.os.Looper.getMainLooper())
             isGpsTrackingStarted = true
@@ -1024,8 +1031,8 @@ class KidsGuardBackgroundService : Service() {
         } catch (_: Exception) {}
       }
 
-      // 2. Fallback LocationManager — только пока родитель смотрит карту.
-      if (!parentOnMap) return
+      // 2. Fallback LocationManager
+      if (!shouldStartUpdates) return
       val lm = locationManager ?: return
       val listener = bgLocationListener ?: object : LocationListener {
         override fun onLocationChanged(location: Location) {
@@ -1041,11 +1048,11 @@ class KidsGuardBackgroundService : Service() {
       }.also { bgLocationListener = it }
 
       val bestImmediate = com.example.location.LiveLocationTracker.getBestImmediateLocation(this)
-      bestImmediate?.let { onNewLocation(it, forceUpload = requestImmediateFix) }
+      bestImmediate?.let { onNewLocation(it, forceUpload = requestImmediateFix || !hasInitialFix) }
 
       if (!isGpsTrackingStarted) {
         try { lm.removeUpdates(listener) } catch (_: Exception) {}
-        val bgProviders = listOf(LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+        val bgProviders = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
         for (provider in bgProviders) {
           try {
             if (lm.allProviders.contains(provider)) {
@@ -1085,10 +1092,10 @@ class KidsGuardBackgroundService : Service() {
         if ((loc.time - prev.time) < 60_000L && loc.accuracy > prev.accuracy + 35f) {
           return
         }
-        // Stationary deduplication: ignore <15m GPS drift within 5 minutes unless new fix is significantly more accurate
         val movedMeters = try { loc.distanceTo(prev) } catch (_: Exception) { 100f }
         val isMuchMoreAccurate = loc.accuracy > 0f && prev.accuracy > 0f && (prev.accuracy - loc.accuracy) >= 25f
-        if (movedMeters < 15f && !isMuchMoreAccurate && (nowMs - lastLocationUploadTimeMs) < 300_000L) {
+        val heartbeatIntervalMs = if (com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()) 20_000L else 120_000L
+        if (movedMeters < 15f && !isMuchMoreAccurate && (nowMs - lastLocationUploadTimeMs) < heartbeatIntervalMs) {
           return
         }
       }
@@ -1101,9 +1108,11 @@ class KidsGuardBackgroundService : Service() {
         val database = KidsGuardDatabase.getDatabase(applicationContext)
         val dao = database.kidsGuardDao()
         val cfg = dao.getFamilyConfigOnce()
-        if (cfg?.selectedRole != "CHILD") return@launch
-        val childId = cfg.thisDeviceChildId.takeIf { it > 0 }
-          ?: cfg.currentActiveChildId.takeIf { it > 0 }
+        val bootCfg = com.example.util.BootPrefs.load(applicationContext)
+        if (cfg?.selectedRole != "CHILD" && bootCfg.permanentHardwareRole != "CHILD") return@launch
+        val childId = cfg?.thisDeviceChildId?.takeIf { it > 0 }
+          ?: bootCfg.childId.takeIf { it > 0 }
+          ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
           ?: activeChildId.takeIf { it > 0 }
           ?: 1L
         activeChildId = childId
@@ -1118,10 +1127,8 @@ class KidsGuardBackgroundService : Service() {
           speedKmh = (loc.speed * 3.6f).coerceAtLeast(0f),
           accuracyMeters = if (loc.accuracy > 0f) loc.accuracy else 10f
         )
-        if (forceUpload || com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) {
-          cloudSync.updateLocation(childId, loc.latitude, loc.longitude, address)
-          Log.d(TAG, "Real Child Location synced: ${loc.latitude}, ${loc.longitude} ($address)")
-        }
+        cloudSync.updateLocation(childId, loc.latitude, loc.longitude, address)
+        Log.d(TAG, "Real Child Location synced: ${loc.latitude}, ${loc.longitude} ($address)")
       } catch (e: Exception) {
         Log.e(TAG, "onNewLocation error: ${e.message}")
       }

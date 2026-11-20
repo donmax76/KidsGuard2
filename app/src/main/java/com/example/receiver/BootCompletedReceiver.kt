@@ -196,11 +196,17 @@ class BootCompletedReceiver : BroadcastReceiver() {
 
         val database = KidsGuardDatabase.getDatabase(appContext)
         val dao = database.kidsGuardDao()
-        val config = dao.getFamilyConfigOnce()
+        val bootCfg = com.example.util.BootPrefs.load(appContext)
+        var config = dao.getFamilyConfigOnce()
+        if (bootCfg.permanentHardwareRole == "CHILD" && config != null && config.selectedRole != "CHILD") {
+          dao.setDeviceRole("CHILD")
+          config = config.copy(selectedRole = "CHILD")
+        }
 
-        if (config != null && config.selectedRole == "CHILD") {
-          val childId = config.thisDeviceChildId.takeIf { it > 0 }
-            ?: config.currentActiveChildId.takeIf { it > 0 }
+        if ((config != null && config.selectedRole == "CHILD") || bootCfg.permanentHardwareRole == "CHILD") {
+          val childId = config?.thisDeviceChildId?.takeIf { it > 0 }
+            ?: bootCfg.childId.takeIf { it > 0 }
+            ?: config?.currentActiveChildId?.takeIf { it > 0 }
             ?: dao.getAllChildrenOnce().firstOrNull()?.id
             ?: 1L
 
@@ -212,7 +218,9 @@ class BootCompletedReceiver : BroadcastReceiver() {
               role = "CHILD",
               childId = childId,
               allowMobileData = bootChild?.allowMobileData ?: true,
-              familyId = config.familyId
+              familyId = config?.familyId.orEmpty(),
+              permanentHardwareRole = "CHILD",
+              masterPin = config?.parentMasterPin
             )
           } catch (_: Exception) {}
 
@@ -231,17 +239,9 @@ class BootCompletedReceiver : BroadcastReceiver() {
           dao.updateChildAppVersion(childId, apkVer)
           dao.setChildUpdatePending(childId, false)
 
-          // 3. Restart 24/7 Background service immediately with all persisted permissions (including live stream)
+          // 3. Restart 24/7 Background service immediately with all persisted permissions (without opening any Settings screens!)
           val liveStreamEnabled = com.example.util.ScreenShotManager.isLiveStreamEnabled(appContext)
           KidsGuardBackgroundService.start(appContext, childId, enableProjectionFgs = liveStreamEnabled)
-
-          // 3b. Снятие ограничений оптимизации батареи: иначе после разряда ниже 15%
-          // Android переводит приложение в Restricted Bucket и убивает фоновую связь.
-          try {
-            if (!com.example.util.DeviceSecurityPermissionHelper.isBatteryOptimizationIgnored(appContext)) {
-              com.example.util.DeviceSecurityPermissionHelper.requestIgnoreBatteryOptimization(appContext)
-            }
-          } catch (_: Exception) {}
 
           // 4. Push updated APK version, battery, and completion alert to Parent phone
           try {

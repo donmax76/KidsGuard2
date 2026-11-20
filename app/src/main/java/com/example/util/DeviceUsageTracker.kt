@@ -347,8 +347,17 @@ object DeviceUsageTracker {
         lower == "com.miui.securitycenter"
   }
 
-  suspend fun syncRealUsageStats(context: Context, childId: Long) {
+  @Volatile
+  private var lastUsageStatsSyncMs: Long = 0L
+
+  @Volatile
+  private var cachedHomePkg: String? = null
+
+  suspend fun syncRealUsageStats(context: Context, childId: Long, force: Boolean = false) {
     if (childId <= 0) return
+    val now = System.currentTimeMillis()
+    if (!force && (now - lastUsageStatsSyncMs) < 45_000L) return
+    lastUsageStatsSyncMs = now
     withContext(Dispatchers.IO) {
       try {
         ensureDailyMidnightReset(context, childId)
@@ -356,13 +365,15 @@ object DeviceUsageTracker {
         val dao = database.kidsGuardDao()
         // CRITICAL (Phase 4B): Never scan local UsageStatsManager or insert local apps on the Parent's phone!
         val cfg = dao.getFamilyConfigOnce()
-        if (cfg?.selectedRole != "CHILD") return@withContext
+        val bootCfg = BootPrefs.load(context)
+        if (cfg?.selectedRole != "CHILD" && bootCfg.permanentHardwareRole != "CHILD") return@withContext
+        if (bootCfg.permanentHardwareRole == "PARENT") return@withContext
 
         val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return@withContext
-        val pm = context.packageManager
-        val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-        val homePkg = try {
-          pm.resolveActivity(homeIntent, 0)?.activityInfo?.packageName
+        val homePkg = cachedHomePkg ?: try {
+          val pm = context.packageManager
+          val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+          pm.resolveActivity(homeIntent, 0)?.activityInfo?.packageName?.also { cachedHomePkg = it }
         } catch (_: Exception) {
           null
         }

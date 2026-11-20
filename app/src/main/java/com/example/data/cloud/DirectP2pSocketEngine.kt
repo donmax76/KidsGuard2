@@ -297,9 +297,13 @@ object DirectP2pSocketEngine {
   fun getLatestDirectFrameForChild(childId: Long): Triple<String, String, Long>? {
     val now = System.currentTimeMillis()
     val map = _framesByChild.value
-    val raw = map[childId] ?: map[RealtimeCloudRelay.resolveCanonicalChildId(childId)] ?: return null
-    // Если картинке больше 20 секунд — никогда не выдаём старый скриншот за живой экран!
-    return if (raw.second.isNotBlank() && kotlin.math.abs(now - raw.third) > 20_000L) {
+    val canonId = RealtimeCloudRelay.resolveCanonicalChildId(childId)
+    val raw = map[childId]
+      ?: map[canonId]
+      ?: (if (map.size == 1) map.values.firstOrNull() else null)
+      ?: return null
+    // Если картинке больше 45 секунд — не выдаём старый скриншот за живой экран!
+    return if (raw.second.isNotBlank() && kotlin.math.abs(now - raw.third) > 45_000L) {
       Triple(raw.first, "", raw.third)
     } else {
       raw
@@ -1735,15 +1739,11 @@ object DirectP2pSocketEngine {
             if (directB64.isBlank() && key.isBlank() && appName.isBlank()) {
               return@launch
             }
-            // Принимаем только реально свежие кадры экрана (не старше 25 секунд!)
+            // Кадры DIRECT_SCREEN_FRAME отправляются с retain=false (только в реальном времени).
+            // Не отбрасываем живые кадры из-за разницы системных часов между телефоном ребёнка и родителя!
+            // Отсекаем только заведомо архивные пакеты старше 10 минут.
             val ageMs = now - packetTs
-            if (ageMs > 25_000L) {
-              com.example.util.DeviceControlDebugger.logEvent(
-                "СТАРЫЙ_КАДР_ОТБРОШЕН",
-                "Отброшен устаревший пакет экрана для #$cid (возраст ${ageMs / 1000} с)",
-                "WARNING",
-                "P2P"
-              )
+            if (ageMs > 600_000L) {
               return@launch
             }
 
@@ -1753,8 +1753,8 @@ object DirectP2pSocketEngine {
             val currentMap = _framesByChild.value.toMutableMap()
             val prevEntry = currentMap[cid] ?: currentMap[rawCid]
             if (directB64.isNotBlank()) {
-              // Дедупликация одинакового кадра со второго брокера в пределах 350 мс
-              if (prevEntry != null && (now - prevEntry.third) < 350L && prevEntry.second.length == directB64.length) {
+              // Дедупликация одинакового кадра со второго брокера в пределах 300 мс
+              if (prevEntry != null && (now - prevEntry.third) < 300L && prevEntry.second.length == directB64.length) {
                 return@launch
               }
               val entry = Triple(displayAppName, directB64, now)
@@ -1776,8 +1776,9 @@ object DirectP2pSocketEngine {
                 _framesByChild.value = currentMap
               }
             } else if (appName.isNotBlank()) {
-              // КРИТИЧНО: никогда не подставляем старый скриншот (старше 15 с) к новому имени оболочки/приложения!
-              val freshPrevB64 = prevEntry?.takeIf { it.second.isNotBlank() && (now - it.third <= 15_000L) }?.second.orEmpty()
+              // Пакет с названием приложения (без картинки) обновляет заголовок,
+              // НЕ затирая текущий снимок экрана в течение 45 секунд!
+              val freshPrevB64 = prevEntry?.takeIf { it.second.isNotBlank() && (now - it.third <= 45_000L) }?.second.orEmpty()
               val entryTs = prevEntry?.takeIf { freshPrevB64.isNotBlank() }?.third ?: now
               val entry = Triple(displayAppName, freshPrevB64, entryTs)
               currentMap[cid] = entry
@@ -1947,7 +1948,7 @@ object DirectP2pSocketEngine {
     val cid = if (childId > 0L) childId else 1L
     val currentMap = _framesByChild.value.toMutableMap()
     val prevEntry = currentMap[cid]
-    val freshPrevB64 = prevEntry?.takeIf { it.second.isNotBlank() && (now - it.third <= 15_000L) }?.second.orEmpty()
+    val freshPrevB64 = prevEntry?.takeIf { it.second.isNotBlank() && (now - it.third <= 45_000L) }?.second.orEmpty()
     val resolvedB64 = base64Bitmap.ifBlank { freshPrevB64 }
     val resolvedTs = if (base64Bitmap.isNotBlank()) now else (prevEntry?.takeIf { freshPrevB64.isNotBlank() }?.third ?: now)
     currentMap[cid] = Triple(activeAppName.ifBlank { "Экран ребёнка" }, resolvedB64, resolvedTs)
@@ -1986,6 +1987,14 @@ object DirectP2pSocketEngine {
     val sentLan = pushDirectLanPacket(packet)
     // НЕ retain: иначе брокер часами хранит старый кадр и присылает его при реконнекте.
     val sentCloud = publishTcpSocketPacket("$TOPIC_SCREEN/$cid", packet, retain = false)
+    if (base64Bitmap.isNotBlank()) {
+      com.example.util.DeviceControlDebugger.logEvent(
+        "КАДР_ЭКРАНА_ОТПРАВЛЕН",
+        "Отправлен снимок экрана #$cid: «${activeAppName.take(40)}» (${base64Bitmap.length / 1024} КБ)",
+        "SUCCESS",
+        "P2P"
+      )
+    }
     return sentLan || sentCloud
   }
 

@@ -220,8 +220,30 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     }
   }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-  // Current Device Role
-  private val _deviceRole = MutableStateFlow(AppRole.UNCONFIGURED)
+  private val initialBootCfg = com.example.util.BootPrefs.load(application)
+
+  private val _isPermanentChildPhone = MutableStateFlow(
+    initialBootCfg.permanentHardwareRole == "CHILD" || initialBootCfg.role == "CHILD"
+  )
+  val isPermanentChildPhone: StateFlow<Boolean> = _isPermanentChildPhone.asStateFlow()
+
+  private val _isPermanentParentPhone = MutableStateFlow(
+    initialBootCfg.permanentHardwareRole == "PARENT" ||
+      (initialBootCfg.permanentHardwareRole.isBlank() && initialBootCfg.role == "PARENT")
+  )
+  val isPermanentParentPhone: StateFlow<Boolean> = _isPermanentParentPhone.asStateFlow()
+
+  private val _isTemporaryParentSessionOnChildPhone = MutableStateFlow(false)
+  val isTemporaryParentSessionOnChildPhone: StateFlow<Boolean> = _isTemporaryParentSessionOnChildPhone.asStateFlow()
+
+  // Current Device Role (initialized synchronously from BootPrefs so RoleSelectionScreen never flashes on configured phones)
+  private val _deviceRole = MutableStateFlow(
+    when {
+      initialBootCfg.permanentHardwareRole == "CHILD" || initialBootCfg.role == "CHILD" -> AppRole.CHILD
+      initialBootCfg.permanentHardwareRole == "PARENT" || initialBootCfg.role == "PARENT" -> AppRole.PARENT
+      else -> AppRole.UNCONFIGURED
+    }
+  )
   val deviceRole: StateFlow<AppRole> = _deviceRole.asStateFlow()
 
   // Active Parent tab
@@ -497,28 +519,63 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     }
 
     viewModelScope.launch {
+      val restoredAsChild = repository.restoreChildRoleOnLaunchIfPermanentChild()
+      val refreshedBoot = com.example.util.BootPrefs.load(getApplication())
+      _isPermanentChildPhone.value = restoredAsChild || refreshedBoot.permanentHardwareRole == "CHILD"
+      _isPermanentParentPhone.value = !restoredAsChild && refreshedBoot.permanentHardwareRole == "PARENT"
+      if (restoredAsChild) {
+        _isTemporaryParentSessionOnChildPhone.value = false
+        _deviceRole.value = AppRole.CHILD
+      }
+    }
+
+    viewModelScope.launch {
       combine(familyConfig, activeChild) { config, child ->
         Pair(config, child)
       }.collect { (config, child) ->
         config?.let {
+          if (it.parentMasterPin.length in 4..8) {
+            com.example.util.BootPrefs.saveMasterPin(getApplication(), it.parentMasterPin)
+          }
           if (_selectedChildId.value == null && it.currentActiveChildId > 0) {
             _selectedChildId.value = it.currentActiveChildId
           }
-          val role = when (it.selectedRole) {
-            "CHILD" -> AppRole.CHILD
-            "UNCONFIGURED" -> AppRole.UNCONFIGURED
-            else -> AppRole.PARENT
+          val bootNow = com.example.util.BootPrefs.load(getApplication())
+          val permanentChild = bootNow.permanentHardwareRole == "CHILD" ||
+            (bootNow.permanentHardwareRole.isBlank() && it.selectedRole == "CHILD" && it.thisDeviceChildId > 0L)
+          if (permanentChild) {
+            _isPermanentChildPhone.value = true
+            _isPermanentParentPhone.value = false
+          } else if (bootNow.permanentHardwareRole == "PARENT" || it.selectedRole == "PARENT") {
+            _isPermanentParentPhone.value = true
+          }
+
+          val role = when {
+            permanentChild && !_isTemporaryParentSessionOnChildPhone.value -> AppRole.CHILD
+            permanentChild && _isTemporaryParentSessionOnChildPhone.value -> AppRole.PARENT
+            it.selectedRole == "CHILD" -> AppRole.CHILD
+            it.selectedRole == "PARENT" || bootNow.permanentHardwareRole == "PARENT" -> AppRole.PARENT
+            bootNow.role == "CHILD" -> AppRole.CHILD
+            bootNow.role == "PARENT" -> AppRole.PARENT
+            else -> AppRole.UNCONFIGURED
           }
           _deviceRole.value = role
-          val gpsAllowed = child?.gpsTrackingEnabled ?: false
+          val gpsAllowed = child?.gpsTrackingEnabled ?: true
           com.example.location.LiveLocationTracker.setGpsTrackingAllowed(gpsAllowed)
-          if (role == AppRole.CHILD && !com.example.location.LiveLocationTracker.isEmulator() && gpsAllowed) {
+          if ((role == AppRole.CHILD || permanentChild) && !com.example.location.LiveLocationTracker.isEmulator() && gpsAllowed) {
             locationTracker.startRealLocationUpdates()
-          } else {
+          } else if (!permanentChild) {
             locationTracker.stopLocationUpdates()
           }
         }
       }
+    }
+  }
+
+  fun restoreChildModeIfTemporarySession() {
+    if (_isPermanentChildPhone.value && _isTemporaryParentSessionOnChildPhone.value) {
+      _isTemporaryParentSessionOnChildPhone.value = false
+      setDeviceRole(AppRole.CHILD)
     }
   }
 
@@ -548,7 +605,7 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
   }
 
   fun requestFreshChildGps() {
-    if (_deviceRole.value == AppRole.CHILD && !com.example.location.LiveLocationTracker.isEmulator()) {
+    if ((_deviceRole.value == AppRole.CHILD || _isPermanentChildPhone.value) && !com.example.location.LiveLocationTracker.isEmulator()) {
       locationTracker.startRealLocationUpdates()
     }
     val childId = activeChild.value?.id ?: allChildren.value.firstOrNull()?.id ?: return
@@ -559,8 +616,17 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
 
   // Device Role switching
   fun setDeviceRole(role: AppRole) {
+    if (role == AppRole.CHILD && _isPermanentParentPhone.value && !_isPermanentChildPhone.value) {
+      showToast("Этот телефон настроен как телефон Родителя. Чтобы подключить ребёнка, используйте 6-значный код.")
+      return
+    }
+    if (role == AppRole.CHILD) {
+      _isTemporaryParentSessionOnChildPhone.value = false
+    } else if (role == AppRole.PARENT && !_isPermanentChildPhone.value) {
+      _isPermanentParentPhone.value = true
+    }
     _deviceRole.value = role
-    if (role != AppRole.CHILD) {
+    if (role != AppRole.CHILD && !_isPermanentChildPhone.value) {
       locationTracker.stopLocationUpdates()
       com.example.service.LockOverlayService.stop(getApplication())
       com.example.service.KidsGuardBackgroundService.stop(getApplication())
@@ -580,12 +646,21 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
   }
 
   fun verifyPin(pin: String): Boolean {
-    val masterPin = familyConfig.value?.parentMasterPin ?: "1234"
-    return if (pin == masterPin) {
+    val cleanInput = pin.trim()
+    val bootPin = com.example.util.BootPrefs.getMasterPin(getApplication())
+    val masterPin = familyConfig.value?.parentMasterPin?.takeIf { it.isNotBlank() } ?: bootPin
+    val uninstallPin = familyConfig.value?.childUninstallPin?.takeIf { it.isNotBlank() } ?: masterPin
+    return if (cleanInput.length in 4..8 && (cleanInput == masterPin || cleanInput == uninstallPin)) {
       _isPinDialogVisible.value = false
+      if (_isPermanentChildPhone.value) {
+        _isTemporaryParentSessionOnChildPhone.value = true
+      }
       com.example.util.DeviceSecurityPermissionHelper.setUninstallBlocked(getApplication(), false)
       setDeviceRole(AppRole.PARENT)
-      showToast("Вход выполнен")
+      showToast(
+        if (_isPermanentChildPhone.value) "Временный вход родителя на телефоне ребёнка"
+        else "Вход выполнен"
+      )
       true
     } else {
       false
@@ -860,9 +935,12 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
       val model = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
       val pairedChild = repository.pairChildDevice(pairingCode, model)
       if (pairedChild != null) {
+        _isPermanentChildPhone.value = true
+        _isPermanentParentPhone.value = false
+        _isTemporaryParentSessionOnChildPhone.value = false
         _selectedChildId.value = pairedChild.id
         _deviceRole.value = AppRole.CHILD
-        repository.setDeviceRole(AppRole.CHILD.name)
+        repository.setDeviceRole(AppRole.CHILD.name, pairedChild.id)
         repository.setActiveChild(pairedChild.id)
         // Версию APK ребёнка сообщит сам ребёнок; версию родителя сюда писать нельзя.
         val curBatt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(getApplication())

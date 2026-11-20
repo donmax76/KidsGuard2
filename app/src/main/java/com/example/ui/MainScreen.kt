@@ -129,8 +129,11 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
   val filteredPcProcs by viewModel.filteredPcProcs.collectAsState()
   val filteredPcTitles by viewModel.filteredPcTitles.collectAsState()
   val filteredPcTotalSeconds by viewModel.filteredPcTotalSeconds.collectAsState()
+  val isPermanentChildPhone by viewModel.isPermanentChildPhone.collectAsState()
+  val isTemporaryParentSessionOnChildPhone by viewModel.isTemporaryParentSessionOnChildPhone.collectAsState()
 
   var isPairingScreenVisible by remember { mutableStateOf(false) }
+  var isConnectExistingChildByCodeVisible by remember { mutableStateOf(false) }
   var isChangePinDialogVisible by remember { mutableStateOf(false) }
   var isDebugLogsDialogVisible by remember { mutableStateOf(false) }
 
@@ -148,11 +151,15 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
     viewModel.setActiveParentTab(ParentTab.DASHBOARD)
   }
 
+  BackHandler(enabled = deviceRole == AppRole.PARENT && activeTab == ParentTab.DASHBOARD && isPermanentChildPhone) {
+    viewModel.setDeviceRole(AppRole.CHILD)
+  }
+
   BackHandler(enabled = deviceRole == AppRole.CHILD) {
     viewModel.requestSwitchToParentRole()
   }
 
-  // 1. Pairing Screen Overlay (can be opened anytime from unconfigured state, or from Child mode, or from Parent mode)
+  // 1. Pairing Screen Overlay (ONLY for configuring a Child phone!)
   if (isPairingScreenVisible) {
     ChildPairingScreen(
       onPairWithCode = { code, callback ->
@@ -168,7 +175,7 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
     return
   }
 
-  // 2. Initial Role Selection if unconfigured
+  // 2. Initial Role Selection if unconfigured (shown ONLY once on first install before role is chosen)
   if (deviceRole == AppRole.UNCONFIGURED) {
     RoleSelectionScreen(
       onSelectParent = { viewModel.setDeviceRole(AppRole.PARENT) },
@@ -205,7 +212,9 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
     }
 
     if (isChangePinDialogVisible) {
-      val currentMasterPin = viewModel.familyConfig.value?.parentMasterPin ?: "1234"
+      val currentMasterPin = viewModel.familyConfig.value?.parentMasterPin
+        ?.takeIf { it.isNotBlank() }
+        ?: com.example.util.BootPrefs.getMasterPin(context)
       ChangeMasterPinDialog(
         currentMasterPin = currentMasterPin,
         onDismiss = { isChangePinDialogVisible = false },
@@ -238,7 +247,7 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
     return
   }
 
-  // 3. Parent Mode View
+  // 4. Parent Mode View
   Scaffold(
     snackbarHost = { SnackbarHost(snackbarHostState) },
     topBar = {
@@ -273,9 +282,13 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
               )
               Text(
-                text = "v${com.example.BuildConfig.VERSION_NAME} • Родитель",
+                text = if (isPermanentChildPhone) {
+                  "v${com.example.BuildConfig.VERSION_NAME} • Админ на тел. ребёнка"
+                } else {
+                  "v${com.example.BuildConfig.VERSION_NAME} • Родитель"
+                },
                 fontSize = 10.sp,
-                color = Slate400,
+                color = if (isPermanentChildPhone) AmberWarning else Slate400,
                 maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
               )
@@ -346,46 +359,48 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
               )
             }
 
-            // Pair Child Device Code shortcut
-            IconButton(
-              onClick = { isPairingScreenVisible = true },
-              modifier = Modifier
-                .size(34.dp)
-                .testTag("top_bar_pair_code_button")
-            ) {
-              Icon(
-                Icons.Default.PhoneAndroid,
-                contentDescription = "Подключить телефон ребенка",
-                tint = EmeraldShieldLight,
-                modifier = Modifier.size(18.dp)
-              )
-            }
-
-            // Switch to Child Device / Companion preview
-            Button(
-              onClick = { viewModel.setDeviceRole(AppRole.CHILD) },
-              colors = ButtonDefaults.buttonColors(containerColor = Slate800, contentColor = CyanLight),
-              shape = RoundedCornerShape(50),
-              contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-              modifier = Modifier
-                .height(32.dp)
-                .testTag("switch_to_child_mode_button")
-            ) {
-              Icon(
-                Icons.Default.Smartphone,
-                contentDescription = null,
-                tint = CyanLight,
-                modifier = Modifier.size(14.dp)
-              )
-              Spacer(modifier = Modifier.width(4.dp))
-              Text(
-                text = "Ребёнок",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = CyanLight,
-                maxLines = 1,
-                softWrap = false
-              )
+            if (isPermanentChildPhone || isTemporaryParentSessionOnChildPhone) {
+              // ONLY on the Child's physical phone when Parent entered PIN: show button to return to Child mode
+              Button(
+                onClick = { viewModel.setDeviceRole(AppRole.CHILD) },
+                colors = ButtonDefaults.buttonColors(containerColor = AmberWarning, contentColor = Slate950),
+                shape = RoundedCornerShape(50),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                modifier = Modifier
+                  .height(32.dp)
+                  .testTag("switch_to_child_mode_button")
+              ) {
+                Icon(
+                  Icons.Default.Smartphone,
+                  contentDescription = null,
+                  tint = Slate950,
+                  modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                  text = "К ребёнку",
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = Slate950,
+                  maxLines = 1,
+                  softWrap = false
+                )
+              }
+            } else {
+              // On the Parent's physical phone: open dialog to connect to an existing child's 6-digit code
+              IconButton(
+                onClick = { isConnectExistingChildByCodeVisible = true },
+                modifier = Modifier
+                  .size(34.dp)
+                  .testTag("top_bar_pair_code_button")
+              ) {
+                Icon(
+                  Icons.Default.PhoneAndroid,
+                  contentDescription = "Подключиться к существующему ребёнку по 6-значному коду",
+                  tint = EmeraldShieldLight,
+                  modifier = Modifier.size(18.dp)
+                )
+              }
             }
           }
         },
@@ -487,11 +502,39 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
         .padding(innerPadding),
       contentAlignment = Alignment.TopCenter
     ) {
-      Box(
+      Column(
         modifier = Modifier
           .fillMaxSize()
           .widthIn(max = 640.dp)
       ) {
+        if (isPermanentChildPhone || isTemporaryParentSessionOnChildPhone) {
+          Row(
+            modifier = Modifier
+              .fillMaxWidth()
+              .background(Color(0xFF451A03))
+              .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+          ) {
+            Text(
+              text = "🔒 Временный вход родителя на телефоне ребёнка",
+              color = AmberWarning,
+              fontSize = 11.sp,
+              fontWeight = FontWeight.Bold,
+              modifier = Modifier.weight(1f)
+            )
+            Button(
+              onClick = { viewModel.setDeviceRole(AppRole.CHILD) },
+              colors = ButtonDefaults.buttonColors(containerColor = AmberWarning, contentColor = Slate950),
+              shape = RoundedCornerShape(8.dp),
+              contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+              modifier = Modifier.height(28.dp)
+            ) {
+              Text("Вернуться в режим ребёнка", fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+            }
+          }
+        }
+        Box(modifier = Modifier.fillMaxSize()) {
       when (activeTab) {
         ParentTab.DASHBOARD -> {
           ParentDashboardScreen(
@@ -620,8 +663,24 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
           )
         }
       }
+        }
       }
     }
+  }
+
+  if (isConnectExistingChildByCodeVisible) {
+    com.example.ui.components.AddChildDialog(
+      onDismiss = { isConnectExistingChildByCodeVisible = false },
+      onConfirm = { name, age, limit ->
+        viewModel.addNewChild(name, age, limit)
+        isConnectExistingChildByCodeVisible = false
+      },
+      onConnectExistingByCode = { code, customName ->
+        viewModel.connectSecondParentByCode(code, customName)
+        isConnectExistingChildByCodeVisible = false
+      },
+      initialConnectByCodeMode = true
+    )
   }
 
   // Security PIN Dialog
@@ -633,7 +692,9 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
   }
 
   if (isChangePinDialogVisible) {
-    val currentMasterPin = viewModel.familyConfig.value?.parentMasterPin ?: "1234"
+    val currentMasterPin = viewModel.familyConfig.value?.parentMasterPin
+      ?.takeIf { it.isNotBlank() }
+      ?: com.example.util.BootPrefs.getMasterPin(context)
     com.example.ui.screens.ChangeMasterPinDialog(
       currentMasterPin = currentMasterPin,
       onDismiss = { isChangePinDialogVisible = false },

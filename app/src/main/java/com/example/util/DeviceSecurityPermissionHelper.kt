@@ -254,29 +254,22 @@ object DeviceSecurityPermissionHelper {
       Log.w(TAG, "Secure settings accessibility restore warning: ${e.message}")
     }
 
-    // 3. Kickstart Android AccessibilityManagerService rebind by toggling ComponentEnabledSetting (DONT_KILL_APP)
-    // When an APK is replaced via OTA, AccessibilityManagerService can leave the service unbound even when
-    // the setting is enabled; toggling DISABLED -> ENABLED forces AccessibilityManagerService to rebind immediately.
+    // 3. Ensure KidsGuardAccessibilityService component is enabled in PackageManager without EVER setting
+    // COMPONENT_ENABLED_STATE_DISABLED (disabling the component causes Android AccessibilityManagerService
+    // to revoke the user's Accessibility permission in Settings on APK update!).
     try {
       val pm = appCtx.packageManager
-      if (com.example.service.KidsGuardAccessibilityService.instance == null) {
+      val currentState = pm.getComponentEnabledSetting(componentName)
+      if (currentState == PackageManager.COMPONENT_ENABLED_STATE_DISABLED ||
+          currentState == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER) {
         pm.setComponentEnabledSetting(
           componentName,
-          PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+          PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
           PackageManager.DONT_KILL_APP
         )
-        try {
-          Thread.sleep(120L)
-        } catch (_: InterruptedException) {}
       }
-      pm.setComponentEnabledSetting(
-        componentName,
-        PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-        PackageManager.DONT_KILL_APP
-      )
-      Log.i(TAG, "Triggered PackageManager component rebind for KidsGuardAccessibilityService")
     } catch (e: Exception) {
-      Log.w(TAG, "Component rebind error: ${e.message}")
+      Log.w(TAG, "Component state check warning: ${e.message}")
     }
 
     val restored = isAccessibilityServiceEnabled(appCtx)

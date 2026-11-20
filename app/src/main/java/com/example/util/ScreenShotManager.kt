@@ -378,10 +378,12 @@ object ScreenShotManager {
   fun triggerHardwareScreenCapture(
     appName: String,
     saveToDeviceGallery: Boolean = false,
-    onCaptured: (CapturedScreenItem) -> Unit = {}
+    onCaptured: ((CapturedScreenItem) -> Unit)? = null
   ) {
     val nowMs = System.currentTimeMillis()
-    pendingCallbacks.add(onCaptured)
+    if (onCaptured != null) {
+      pendingCallbacks.add(onCaptured)
+    }
 
     // 1. Свежий кадр MediaProjection (не старше 2.5 с) берём сразу, без повторного захвата.
     val projBmp = latestProjectionBitmap
@@ -406,9 +408,9 @@ object ScreenShotManager {
       return
     }
 
-    // 2. Если только что (< 750 мс) уже сняли реальный аппаратный кадр — отдаём его всем ожидающим
+    // 2. Если только что (< 850 мс) уже сняли реальный аппаратный кадр — сразу отдаём его всем ожидающим
     val recentHw = lastHardwareBitmap
-    if (recentHw != null && !recentHw.isRecycled && (nowMs - lastHardwareBitmapMs < 750L)) {
+    if (recentHw != null && !recentHw.isRecycled && (nowMs - lastHardwareBitmapMs < 850L)) {
       screenshotExecutor.execute {
         val b64 = bitmapToBase64(recentHw)
         val item = CapturedScreenItem(
@@ -442,22 +444,16 @@ object ScreenShotManager {
         }
       }
       val elapsedSinceLastAttempt = nowMs - lastAttemptTimeMs
-      if (elapsedSinceLastAttempt < 1050L) {
+      if (elapsedSinceLastAttempt < 1100L) {
         // Android 11+ лимитирует takeScreenshot до ~1 раза в секунду.
-        // Планируем захват сразу после окончания кулдауна, чтобы не отдавать пустой/старый кадр!
+        // Планируем захват сразу после окончания кулдауна, сохраняя все pendingCallbacks!
         if (!isDelayedCaptureScheduled) {
           isDelayedCaptureScheduled = true
-          val waitMs = (1080L - elapsedSinceLastAttempt).coerceIn(120L, 1100L)
+          val waitMs = (1120L - elapsedSinceLastAttempt).coerceIn(150L, 1120L)
           mainHandler.postDelayed({
             isDelayedCaptureScheduled = false
-            val cbList = ArrayList(pendingCallbacks)
-            pendingCallbacks.clear()
-            if (cbList.isNotEmpty()) {
-              triggerHardwareScreenCapture(appName, saveToDeviceGallery) { captured ->
-                for (cb in cbList) {
-                  try { cb(captured) } catch (_: Exception) {}
-                }
-              }
+            if (pendingCallbacks.isNotEmpty()) {
+              triggerHardwareScreenCapture(appName, saveToDeviceGallery, null)
             }
           }, waitMs)
         }
@@ -486,35 +482,43 @@ object ScreenShotManager {
           object : AccessibilityService.TakeScreenshotCallback {
             override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
               isTakingScreenshot = false
+              var softBmp: Bitmap? = null
+              val hwBuffer = try { screenshot.hardwareBuffer } catch (_: Exception) { null }
               try {
-                val hwBuffer = screenshot.hardwareBuffer
-                val colorSpace = screenshot.colorSpace
-                val wrapped = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
-                hwBuffer.close()
-                if (wrapped != null) {
-                  val softBmp = wrapped.copy(Bitmap.Config.ARGB_8888, false)
-                  wrapped.recycle()
-                  if (softBmp != null) {
-                    val capturedAt = System.currentTimeMillis()
-                    lastHardwareBitmap = softBmp
-                    lastHardwareBitmapMs = capturedAt
-                    lastCaptureDeliveredMs = capturedAt
-                    val b64 = bitmapToBase64(softBmp)
-                    val item = CapturedScreenItem(
-                      activeAppName = appName,
-                      timestamp = capturedAt,
-                      statusNote = "Реальный экран устройства ($appName)",
-                      base64Bitmap = b64
-                    )
-                    addCapturedItem(item)
-                    if (saveToDeviceGallery) {
-                      saveBitmapToGallery(svc.applicationContext, softBmp, "KidsGuard_${capturedAt}")
-                    }
-                    deliverToPendingCallbacks(item)
-                    return
+                if (hwBuffer != null) {
+                  val colorSpace = try { screenshot.colorSpace } catch (_: Exception) { null }
+                  val wrapped = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+                  if (wrapped != null) {
+                    // КРИТИЧНО: копируем пиксели ДО закрытия hwBuffer!
+                    softBmp = wrapped.copy(Bitmap.Config.ARGB_8888, false)
+                    wrapped.recycle()
                   }
                 }
-              } catch (_: Exception) {}
+              } catch (e: Exception) {
+                Log.e(TAG, "HardwareBuffer copy error: ${e.message}")
+              } finally {
+                try { hwBuffer?.close() } catch (_: Exception) {}
+              }
+
+              if (softBmp != null) {
+                val capturedAt = System.currentTimeMillis()
+                lastHardwareBitmap = softBmp
+                lastHardwareBitmapMs = capturedAt
+                lastCaptureDeliveredMs = capturedAt
+                val b64 = bitmapToBase64(softBmp)
+                val item = CapturedScreenItem(
+                  activeAppName = appName,
+                  timestamp = capturedAt,
+                  statusNote = "Реальный экран устройства ($appName)",
+                  base64Bitmap = b64
+                )
+                addCapturedItem(item)
+                if (saveToDeviceGallery) {
+                  saveBitmapToGallery(svc.applicationContext, softBmp, "KidsGuard_${capturedAt}")
+                }
+                deliverToPendingCallbacks(item)
+                return
+              }
               fallbackToCachedBitmapOrText(appName, saveToDeviceGallery)
             }
 
@@ -525,18 +529,17 @@ object ScreenShotManager {
                 isDelayedCaptureScheduled = true
                 mainHandler.postDelayed({
                   isDelayedCaptureScheduled = false
-                  val cbList = ArrayList(pendingCallbacks)
-                  pendingCallbacks.clear()
-                  if (cbList.isNotEmpty()) {
-                    triggerHardwareScreenCapture(appName, saveToDeviceGallery) { captured ->
-                      for (cb in cbList) {
-                        try { cb(captured) } catch (_: Exception) {}
-                      }
-                    }
+                  if (pendingCallbacks.isNotEmpty()) {
+                    triggerHardwareScreenCapture(appName, saveToDeviceGallery, null)
                   }
                 }, 950L)
                 return
               }
+              DeviceControlDebugger.logEvent(
+                "СКРИНШОТ_СИСТЕМНЫЙ_КОД",
+                "Системный захват вернул код $errorCode — используем резервный кадр экрана",
+                "WARNING"
+              )
               fallbackToCachedBitmapOrText(appName, saveToDeviceGallery)
             }
           }
@@ -709,13 +712,17 @@ object ScreenShotManager {
 
   fun bitmapToBase64(bitmap: Bitmap): String {
     val stream = ByteArrayOutputStream()
-    val scaled = if (bitmap.width > 420) {
-      val ratio = 420f / bitmap.width
-      Bitmap.createScaledBitmap(bitmap, 420, (bitmap.height * ratio).toInt().coerceAtLeast(1), true)
+    val targetWidth = 480
+    val scaled = if (bitmap.width > targetWidth) {
+      val ratio = targetWidth.toFloat() / bitmap.width
+      Bitmap.createScaledBitmap(bitmap, targetWidth, (bitmap.height * ratio).toInt().coerceAtLeast(1), true)
     } else {
       bitmap
     }
-    scaled.compress(Bitmap.CompressFormat.JPEG, 55, stream)
+    scaled.compress(Bitmap.CompressFormat.JPEG, 65, stream)
+    if (scaled !== bitmap) {
+      try { scaled.recycle() } catch (_: Exception) {}
+    }
     return Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
   }
 

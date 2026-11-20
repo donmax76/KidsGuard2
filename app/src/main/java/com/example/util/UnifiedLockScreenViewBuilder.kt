@@ -197,8 +197,9 @@ object UnifiedLockScreenViewBuilder {
       if (currentPin.length < 8) {
         currentPin += digit
         updatePinDisplay()
-        // Auto-check immediately if 4+ digits match the Parent PIN
-        if (currentPin.length >= 4) {
+        // Автоматическая проверка только при достижении длины установленного PIN-кода родителя (от 4 до 8 цифр)
+        val expectedLen = BootPrefs.getMasterPin(context).length.coerceIn(4, 8)
+        if (currentPin.length >= expectedLen) {
           val candidate = currentPin
           SosEmergencySender.verifyPinAndUnlockDevice(context, candidate, blockedPackageName) { unlocked ->
             if (unlocked) {
