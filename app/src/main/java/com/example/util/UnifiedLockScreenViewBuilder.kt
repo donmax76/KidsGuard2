@@ -86,7 +86,7 @@ object UnifiedLockScreenViewBuilder {
     }
 
     val titleView = TextView(context).apply {
-      text = if (isDeviceTotalLock) "ЭКРАН ЗАБЛОКИРОВАН" else "ДОСТУП ОГРАНИЧЕН"
+      text = if (isDeviceTotalLock) "ЭКРАН ЗАБЛОКИРОВАН" else "ПРОГРАММА ЗАБЛОКИРОВАНА"
       setTextSize(TypedValue.COMPLEX_UNIT_SP, 19f)
       setTextColor(Color.parseColor(if (isDeviceTotalLock) "#FFF43F5E" else "#FF38BDF8"))
       gravity = Gravity.CENTER
@@ -120,10 +120,10 @@ object UnifiedLockScreenViewBuilder {
       }
     }
 
-    // Inline PIN Container (hidden until user taps "РАЗБЛОКИРОВАТЬ ЭКРАН")
+    // Inline PIN Container (immediately visible for App Block PIN Gate so Parent can enter PIN right away)
     val pinContainer = LinearLayout(context).apply {
       orientation = LinearLayout.VERTICAL
-      visibility = View.GONE
+      visibility = if (isDeviceTotalLock) View.GONE else View.VISIBLE
       gravity = Gravity.CENTER_HORIZONTAL
       background = roundedBg("#FF0B1324", "#FF334155", 1, 16f, context)
       setPadding(dp(context, 14), dp(context, 12), dp(context, 14), dp(context, 12))
@@ -139,7 +139,7 @@ object UnifiedLockScreenViewBuilder {
       text = if (isDeviceTotalLock) {
         "Введите PIN-код родителя для разблокировки телефона:"
       } else {
-        "Введите PIN-код родителя для полной разблокировки приложения:"
+        "Программа закрыта в фоне. Введите PIN-код родителя, чтобы открыть программу:"
       }
       setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
       setTextColor(Color.parseColor("#FF94A3B8"))

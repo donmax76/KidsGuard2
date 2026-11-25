@@ -59,7 +59,7 @@ object DeviceSecurityPermissionHelper {
   }
 
   fun canInstallUnknownApps(context: Context): Boolean {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    val sysGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       try {
         context.packageManager.canRequestPackageInstalls()
       } catch (_: Exception) {
@@ -67,6 +67,48 @@ object DeviceSecurityPermissionHelper {
       }
     } else {
       true
+    }
+    if (sysGranted) {
+      autoConfirmUpdatesViaAccessibility = true
+      BootPrefs.setAutoUpdateGranted(context, true)
+    }
+    return sysGranted
+  }
+
+  fun isAutoUpdatePermissionActive(context: Context): Boolean {
+    if (canInstallUnknownApps(context)) return true
+    if (BootPrefs.isAutoUpdateGranted(context)) {
+      autoConfirmUpdatesViaAccessibility = true
+      return true
+    }
+    return autoConfirmUpdatesViaAccessibility
+  }
+
+  fun collectChildPermissionsStatusJson(context: Context): org.json.JSONObject {
+    val a11y = isAccessibilityServiceEnabled(context)
+    val gps = hasLocationPermission(context)
+    val installUpdates = isAutoUpdatePermissionActive(context)
+    val liveStream = ScreenShotManager.isLiveStreamEnabled(context) || ScreenShotManager.isLiveCaptureReady()
+    val usageStats = hasUsageStatsPermission(context)
+    val overlay = isOverlayPermissionGranted(context)
+    val deviceAdmin = isDeviceAdminActive(context)
+    val batteryOpt = isBatteryOptimizationIgnored(context)
+
+    val list = listOf(a11y, gps, installUpdates, liveStream, usageStats, overlay, deviceAdmin, batteryOpt)
+    val grantedCount = list.count { it }
+
+    return org.json.JSONObject().apply {
+      put("a11y", a11y)
+      put("gps", gps)
+      put("installUpdates", installUpdates)
+      put("liveStream", liveStream)
+      put("usageStats", usageStats)
+      put("overlay", overlay)
+      put("deviceAdmin", deviceAdmin)
+      put("batteryOpt", batteryOpt)
+      put("grantedCount", grantedCount)
+      put("totalCount", 8)
+      put("updatedAtMs", System.currentTimeMillis())
     }
   }
 

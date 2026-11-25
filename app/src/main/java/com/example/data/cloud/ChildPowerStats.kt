@@ -23,8 +23,20 @@ object ChildPowerStats {
 
   fun ingest(msg: JSONObject) {
     if (DirectP2pSocketEngine.currentRole == "CHILD") return
-    val id = msg.optLong("childId", msg.optLong("id", 0L))
+    val rawId = msg.optLong("childId", msg.optLong("id", 0L))
+    val pktPairingCode = msg.optString("pairingCode", "").trim()
+    val resolvedId = RealtimeCloudRelay.resolveCanonicalChildId(rawId, pktPairingCode)
+    val id = if (resolvedId > 0L) resolvedId else rawId
     if (id <= 0L) return
+    // Проверяем совпадение 6-значного кода с профилем родителя, если код передан
+    val cachedParentChild = RealtimeCloudRelay.getCachedChild(id)
+    if (cachedParentChild != null && pktPairingCode.isNotBlank()) {
+      val localCode = cachedParentChild.pairingCode.replace("-", "").replace(" ", "").uppercase()
+      val msgCode = pktPairingCode.replace("-", "").replace(" ", "").uppercase()
+      if (localCode.length >= 6 && msgCode.length >= 6 && localCode != msgCode) {
+        return
+      }
+    }
     val rawPercent = msg.optInt("appEnergyPercent", -1)
     if (rawPercent !in -1..100) return
     val rawMahPerHour = msg.optDouble("appMahPerHour", 0.0).toFloat()
@@ -41,7 +53,7 @@ object ChildPowerStats {
     )
     val canonical = msg.optLong("canonicalChildId", id)
     var updated = _byChild.value + (id to snapshot)
-    // ID ребёнка на телефоне и канонический ID в семье могут отличаться — кладём под оба.
+    if (rawId > 0L && rawId != id) updated = updated + (rawId to snapshot)
     if (canonical > 0L && canonical != id) updated = updated + (canonical to snapshot)
     _byChild.value = updated
   }

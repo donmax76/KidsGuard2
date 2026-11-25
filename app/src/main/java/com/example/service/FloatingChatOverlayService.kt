@@ -634,6 +634,30 @@ class FloatingChatOverlayService : Service() {
       setOnClickListener {
         enableKeyboardFocus(true)
       }
+      addTextChangedListener(object : android.text.TextWatcher {
+        private var lastTypingSentAt = 0L
+        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+          val now = System.currentTimeMillis()
+          val hasText = !s.isNullOrBlank()
+          if (hasText && now - lastTypingSentAt >= 2000L) {
+            lastTypingSentAt = now
+            com.example.data.cloud.RealtimeCloudRelay.publishChatTypingStatus(
+              childId = activeChildId,
+              senderRole = currentDeviceRole,
+              isTyping = true
+            )
+          } else if (!hasText && lastTypingSentAt > 0L) {
+            lastTypingSentAt = 0L
+            com.example.data.cloud.RealtimeCloudRelay.publishChatTypingStatus(
+              childId = activeChildId,
+              senderRole = currentDeviceRole,
+              isTyping = false
+            )
+          }
+        }
+        override fun afterTextChanged(s: android.text.Editable?) {}
+      })
       setOnEditorActionListener { _, actionId, _ ->
         if (actionId == EditorInfo.IME_ACTION_SEND) {
           val txt = text?.toString()?.trim().orEmpty()
@@ -734,6 +758,16 @@ class FloatingChatOverlayService : Service() {
       messagesScrollView?.post {
         messagesScrollView?.fullScroll(View.FOCUS_DOWN)
       }
+      serviceScope.launch(Dispatchers.IO) {
+        try {
+          val dao = KidsGuardDatabase.getDatabase(applicationContext).kidsGuardDao()
+          dao.markChatMessagesRead(childId = activeChildId, role = currentDeviceRole)
+          com.example.data.cloud.RealtimeCloudRelay.publishChatReadReceipt(
+            childId = activeChildId,
+            readerRole = currentDeviceRole
+          )
+        } catch (_: Exception) {}
+      }
     } else {
       expandedCardView?.visibility = View.GONE
       bubbleView?.visibility = View.VISIBLE
@@ -771,6 +805,16 @@ class FloatingChatOverlayService : Service() {
     messagesCollectJob = serviceScope.launch(Dispatchers.IO) {
       val dao = KidsGuardDatabase.getDatabase(applicationContext).kidsGuardDao()
       dao.getChatMessagesForChild(childId).collectLatest { messages ->
+        if (isExpanded) {
+          val hasUnreadFromOther = messages.any { !it.isRead && !it.senderRole.equals(currentDeviceRole, ignoreCase = true) }
+          if (hasUnreadFromOther) {
+            dao.markChatMessagesRead(childId = childId, role = currentDeviceRole)
+          }
+          com.example.data.cloud.RealtimeCloudRelay.publishChatReadReceipt(
+            childId = childId,
+            readerRole = currentDeviceRole
+          )
+        }
         val recent = messages.takeLast(15)
         launch(Dispatchers.Main) {
           renderMessagesList(recent)
@@ -826,9 +870,12 @@ class FloatingChatOverlayService : Service() {
         }
       }
 
+      val ticksSuffix = if (isMine) {
+        if (msg.isRead) " • ✓✓" else " • ✓"
+      } else ""
       val senderTv = TextView(this).apply {
-        text = "${msg.senderName} • ${timeFmt.format(Date(msg.timestamp))}"
-        setTextColor(Color.parseColor("#94A3B8"))
+        text = "${msg.senderName} • ${timeFmt.format(Date(msg.timestamp))}$ticksSuffix"
+        setTextColor(Color.parseColor(if (isMine && msg.isRead) "#A7F3D0" else "#94A3B8"))
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
       }
 

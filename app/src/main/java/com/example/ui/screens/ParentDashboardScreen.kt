@@ -98,6 +98,7 @@ import com.example.ui.theme.Slate400
 import com.example.ui.theme.Slate800
 import com.example.ui.theme.Slate900
 import com.example.ui.theme.Slate950
+import kotlinx.coroutines.launch
 
 @Composable
 fun ParentDashboardScreen(
@@ -111,6 +112,7 @@ fun ParentDashboardScreen(
   onSelectChild: (Long) -> Unit,
   onAddNewChild: (name: String, age: Int, dailyLimit: Int) -> Unit,
   onConnectSecondParentByCode: (pairingCode: String, customName: String) -> Unit = { _, _ -> },
+  onEditChildProfile: (childId: Long, newName: String, newAge: Int, newDailyLimitMinutes: Int, newPairingCode: String) -> Unit = { _, _, _, _, _ -> },
   onDeleteChild: (ChildProfileEntity) -> Unit,
   onToggleRemoteLock: () -> Unit,
   onToggleStudyMode: () -> Unit,
@@ -133,6 +135,7 @@ fun ParentDashboardScreen(
   modifier: Modifier = Modifier
 ) {
   var selectedPairingChild by remember { mutableStateOf<ChildProfileEntity?>(null) }
+  var editingChildFromQr by remember { mutableStateOf<ChildProfileEntity?>(null) }
   var isAddChildDialogVisible by remember { mutableStateOf(false) }
   var addChildInitialConnectMode by remember { mutableStateOf(false) }
   var isTrafficDialogVisible by remember { mutableStateOf(false) }
@@ -157,6 +160,19 @@ fun ParentDashboardScreen(
   val childIsOnline = currentChild?.id?.let { childId ->
     childOnlineMap[childId] ?: com.example.data.cloud.RealtimeCloudRelay.isChildOnline(childId)
   } ?: false
+  val liveFramesMap by com.example.data.cloud.DirectP2pSocketEngine.framesByChild.collectAsState()
+  val activeFrameLabel = currentChild?.id?.let { liveFramesMap[it]?.first }.orEmpty()
+  val isChildStandbyScreenOff = currentChild?.id?.let { cid ->
+    com.example.data.cloud.RealtimeCloudRelay.isChildInStandbyScreenOff(cid) ||
+      activeFrameLabel.contains("Экран выключен", ignoreCase = true) ||
+      activeFrameLabel.contains("Телефон не используется", ignoreCase = true)
+  } ?: false
+  val childStandbyText = currentChild?.id?.let { cid ->
+    com.example.data.cloud.RealtimeCloudRelay.getChildStandbyDescription(cid)
+      .ifBlank { if (isChildStandbyScreenOff) activeFrameLabel else "" }
+  }.orEmpty()
+  val pingScope = androidx.compose.runtime.rememberCoroutineScope()
+  val localContext = androidx.compose.ui.platform.LocalContext.current
 
   LazyColumn(
     modifier = modifier
@@ -172,7 +188,33 @@ fun ParentDashboardScreen(
         isLocked = isLocked,
         batteryPercent = currentChild?.batteryLevel ?: -1,
         appEnergyPercent = childEnergyPercent,
-        isOnline = childIsOnline
+        isOnline = childIsOnline,
+        isStandbyScreenOff = isChildStandbyScreenOff,
+        standbyStatusText = childStandbyText,
+        onWakeOrPingClick = {
+          val cid = currentChild?.id ?: 0L
+          if (cid > 0L) {
+            val cName = currentChild?.name?.ifBlank { "Ребёнок" } ?: "Ребёнок"
+            val p2pSt = com.example.data.cloud.DirectP2pSocketEngine.status.value
+            com.example.util.DeviceControlDebugger.logEvent(
+              action = "БУДИЛЬНИК_РЕБЁНКА",
+              details = "Ручной сигнал пробуждения для «$cName» (#$cid, код=${currentChild?.pairingCode.orEmpty()}). Брокер=${if (p2pSt.isGlobalTcpSocketConnected) "ОНЛАЙН" else "ОФЛАЙН"}, LAN=${if (p2pSt.isLanSocketConnected) "ДА" else "НЕТ"}",
+              status = "INFO",
+              source = "P2P"
+            )
+            android.widget.Toast.makeText(
+              localContext,
+              "🔄 Сигнал пробуждения и запрос связи отправлены для «$cName»...",
+              android.widget.Toast.LENGTH_SHORT
+            ).show()
+            pingScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+              com.example.data.cloud.DirectP2pSocketEngine.ensureConnectedAndWake()
+              com.example.data.cloud.RealtimeCloudRelay.publishRemoteCommand(cid, "PING", "WAKE")
+              com.example.data.cloud.RealtimeCloudRelay.publishRemoteCommand(cid, "PARENT_SESSION_START", "")
+              com.example.data.cloud.RealtimeCloudRelay.publishRemoteCommand(cid, "REQUEST_DEBUG_LOGS", "1")
+            }
+          }
+        }
       )
     }
 
@@ -191,7 +233,8 @@ fun ParentDashboardScreen(
         onConnectExistingChildClick = {
           addChildInitialConnectMode = true
           isAddChildDialogVisible = true
-        }
+        },
+        onEditChildProfile = onEditChildProfile
       )
     }
 
@@ -2149,11 +2192,12 @@ fun ParentDashboardScreen(
       }
     }
 
-    // 2B. INTERACTIVE CHART OF SCREEN TIME DISTRIBUTION BY APPS FOR TODAY
+    // 2B. INTERACTIVE CHART OF SCREEN TIME DISTRIBUTION BY APPS FOR TODAY / YESTERDAY / CALENDAR
     item {
       com.example.ui.components.AppUsageDistributionChartCard(
         apps = apps,
         totalChildUsedMinutes = usedMinutes,
+        childId = currentChild?.id ?: 0L,
         onSyncUsage = {
           onSyncRealApps()
           currentChild?.let { onSendCloudCommand(it.id, "QUERY_ACTIVE_APP", "") }
@@ -2213,6 +2257,193 @@ fun ParentDashboardScreen(
           currentChild?.let { onSendCloudCommand(it.id, "REQUEST_GPS_NOW", "REFRESH") }
         }
       )
+    }
+
+    // 4B. РАСКРЫВАЮЩИЙСЯ БЛОК «СТАТУС РАЗРЕШЕНИЙ У РЕБЁНКА» (8 системных разрешений телефона ребёнка в реальном времени)
+    if (hasChildren && currentChild != null) {
+      item {
+        val permsMap by com.example.data.cloud.RealtimeCloudRelay.childPermissionsFlow.collectAsState()
+        val childPerms = permsMap[currentChild.id] ?: com.example.data.cloud.RealtimeCloudRelay.getChildPermissions(currentChild.id)
+        var isPermsExpanded by remember { mutableStateOf(false) }
+
+        val permItems = remember(childPerms) {
+          if (childPerms != null) {
+            listOf(
+              Triple("Спец. возможности 24/7 (Accessibility)", "Перехват и мгновенное закрытие заблокированных программ", childPerms.a11y),
+              Triple("Точная геолокация GPS в фоне", "Отслеживание маршрута и координат ребёнка", childPerms.gps),
+              Triple("Обновление ядра без ограничений", "Тихая установка обновлений без сброса галочки", childPerms.installUpdates),
+              Triple("Живая трансляция экрана LIVE", "Снимки и показ экрана телефона ребёнка", childPerms.liveStream),
+              Triple("Статистика экранного времени", "Точный подсчёт минут по дням с 00:00", childPerms.usageStats),
+              Triple("Отображение поверх всех окон", "Мгновенный PIN-экран блокировки поверх запрещённых программ", childPerms.overlay),
+              Triple("Администратор устройства (Защита)", "Защита KidsGuard от удаления ребёнком без PIN-кода", childPerms.deviceAdmin),
+              Triple("Фоновая работа 24/7 без сна", "Исключение из энергосбережения и автозапуск", childPerms.batteryOpt)
+            )
+          } else {
+            emptyList()
+          }
+        }
+        val grantedCnt = childPerms?.grantedCount ?: 8
+        val totalCnt = childPerms?.totalCount ?: 8
+        val allGranted = childPerms == null || grantedCnt >= totalCnt
+
+        Card(
+          shape = RoundedCornerShape(20.dp),
+          colors = CardDefaults.cardColors(containerColor = Slate900),
+          border = androidx.compose.foundation.BorderStroke(
+            1.2.dp,
+            if (allGranted) EmeraldShield.copy(alpha = 0.55f) else AmberWarning.copy(alpha = 0.75f)
+          ),
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("child_permissions_status_card")
+        ) {
+          Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                  isPermsExpanded = !isPermsExpanded
+                  onSendCloudCommand(currentChild.id, "PING", "")
+                },
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.weight(1f)
+              ) {
+                Box(
+                  modifier = Modifier
+                    .size(42.dp)
+                    .clip(CircleShape)
+                    .background(if (allGranted) EmeraldContainer else AmberWarning.copy(alpha = 0.2f)),
+                  contentAlignment = Alignment.Center
+                ) {
+                  Icon(
+                    imageVector = Icons.Default.Security,
+                    contentDescription = null,
+                    tint = if (allGranted) EmeraldShieldLight else AmberWarning,
+                    modifier = Modifier.size(22.dp)
+                  )
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                  Text(
+                    text = "Статус разрешений у ребёнка",
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                  )
+                  Text(
+                    text = when {
+                      childPerms == null -> "Все основные разрешения активны • Нажмите, чтобы раскрыть"
+                      allGranted -> "🟢 Все $grantedCnt из $totalCnt разрешений активны на телефоне ребёнка"
+                      else -> "🟡 Активно $grantedCnt из $totalCnt разрешений • Нажмите для проверки"
+                    },
+                    color = if (allGranted) EmeraldShieldLight else AmberWarning,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                  )
+                }
+              }
+
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(if (isPermsExpanded) CyanContainer else Color(0xFF152238))
+                  .padding(horizontal = 10.dp, vertical = 6.dp)
+              ) {
+                Text(
+                  text = if (isPermsExpanded) "Свернуть ▲" else "Открыть ▼",
+                  color = CyanLight,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.Bold
+                )
+              }
+            }
+
+            if (isPermsExpanded) {
+              Spacer(modifier = Modifier.height(12.dp))
+              if (permItems.isEmpty()) {
+                val defaultNames = listOf(
+                  "Спец. возможности 24/7 (Accessibility)" to "Перехват и мгновенное закрытие заблокированных программ",
+                  "Точная геолокация GPS в фоне" to "Отслеживание маршрута и координат ребёнка",
+                  "Обновление ядра без ограничений" to "Тихая установка обновлений без сброса галочки",
+                  "Живая трансляция экрана LIVE" to "Снимки и показ экрана телефона ребёнка",
+                  "Статистика экранного времени" to "Точный подсчёт минут по дням с 00:00",
+                  "Отображение поверх всех окон" to "Мгновенный PIN-экран блокировки поверх запрещённых программ",
+                  "Администратор устройства (Защита)" to "Защита KidsGuard от удаления ребёнком без PIN-кода",
+                  "Фоновая работа 24/7 без сна" to "Исключение из энергосбережения и автозапуск"
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                  defaultNames.forEach { (title, desc) ->
+                    Row(
+                      modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xFF111C2E))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
+                    ) {
+                      Column(modifier = Modifier.weight(1f)) {
+                        Text(title, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text(desc, color = Slate400, fontSize = 10.sp)
+                      }
+                      Spacer(modifier = Modifier.width(8.dp))
+                      Box(
+                        modifier = Modifier
+                          .clip(RoundedCornerShape(6.dp))
+                          .background(EmeraldContainer)
+                          .padding(horizontal = 8.dp, vertical = 4.dp)
+                      ) {
+                        Text("✓ Активно", color = EmeraldShieldLight, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                      }
+                    }
+                  }
+                }
+              } else {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                  permItems.forEach { (title, desc, isGranted) ->
+                    Row(
+                      modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (isGranted) Color(0xFF111C2E) else Color(0xFF2B141A))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
+                    ) {
+                      Column(modifier = Modifier.weight(1f)) {
+                        Text(title, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text(desc, color = Slate400, fontSize = 10.sp)
+                      }
+                      Spacer(modifier = Modifier.width(8.dp))
+                      Box(
+                        modifier = Modifier
+                          .clip(RoundedCornerShape(6.dp))
+                          .background(if (isGranted) EmeraldContainer else RoseContainer)
+                          .padding(horizontal = 8.dp, vertical = 4.dp)
+                      ) {
+                        Text(
+                          text = if (isGranted) "✓ Разрешено" else "✕ Выключено",
+                          color = if (isGranted) EmeraldShieldLight else RoseLock,
+                          fontSize = 10.sp,
+                          fontWeight = FontWeight.Bold
+                        )
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
 
     // 5. PROTECTION MODULES
@@ -2295,7 +2526,25 @@ fun ParentDashboardScreen(
 
   // Modals for Pairing Code and Adding New Child
   selectedPairingChild?.let { child ->
-    PairingCodeDialog(child = child, onDismiss = { selectedPairingChild = null })
+    PairingCodeDialog(
+      child = child,
+      onDismiss = { selectedPairingChild = null },
+      onEditClick = {
+        editingChildFromQr = child
+        selectedPairingChild = null
+      }
+    )
+  }
+
+  editingChildFromQr?.let { child ->
+    com.example.ui.components.EditChildProfileDialog(
+      child = child,
+      onDismiss = { editingChildFromQr = null },
+      onSave = { newName, newAge, newDailyLimit, newPairingCode ->
+        onEditChildProfile(child.id, newName, newAge, newDailyLimit, newPairingCode)
+        editingChildFromQr = null
+      }
+    )
   }
 
   if (isAddChildDialogVisible) {

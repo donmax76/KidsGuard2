@@ -183,7 +183,12 @@ class FirebaseSyncService(context: Context) {
     val emitDedup: (String, String, Long) -> Unit = { cmd, payload, ts ->
       val now = System.currentTimeMillis()
       val sig = "${cmd}_${payload.trim()}"
-      val dedupWindow = if (cmd == "LOUD_RING") 10_000L else 4_000L
+      val dedupWindow = when (cmd) {
+        "LOUD_RING" -> 8_000L
+        "TAKE_SCREENSHOT", "START_LIVE_STREAM", "STOP_LIVE_STREAM", "QUERY_ACTIVE_APP" -> 600L
+        "PING", "PARENT_SESSION_START", "PARENT_ONLINE_HEARTBEAT", "MAP_VIEWING" -> 1_100L
+        else -> 1_500L
+      }
       if (cmd.isNotBlank() && kotlin.math.abs(now - ts) < 35_000L && (sig != lastHandledSig || (now - lastHandledAt) > dedupWindow)) {
         lastHandledSig = sig
         lastHandledAt = now

@@ -41,6 +41,8 @@ import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Pause
@@ -48,11 +50,13 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -137,6 +141,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+private fun android.content.Context.findHostActivity(): android.app.Activity? {
+  var ctx: android.content.Context? = this
+  while (ctx is android.content.ContextWrapper) {
+    if (ctx is android.app.Activity) return ctx
+    ctx = ctx.baseContext
+  }
+  return null
+}
+
 private fun formatPcTimestamp(ms: Long): String =
   if (ms <= 0L) "" else SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(ms))
 
@@ -154,20 +167,48 @@ private fun formatDurationRu(totalSeconds: Long): String {
 
 private fun cleanPcWindowTitle(rawTitle: String): String {
   var t = rawTitle.trim()
+  // Убираем счётчики уведомлений в начале вкладки: "(1) ", "(25) ", "[3] ", "• "
+  t = t.replace(Regex("^([(\\[\\{]\\d+[)\\]\\}]\\s*|•\\s*)+"), "").trim()
   val suffixes = listOf(
     " - Google Chrome", " — Google Chrome",
-    " - Microsoft​ Edge", " - Microsoft Edge", " — Microsoft Edge",
-    " — Яндекс Браузер", " - Yandex",
-    " - Opera", " — Opera",
+    " - Microsoft\u200B Edge", " - Microsoft Edge", " — Microsoft Edge",
+    " — Яндекс Браузер", " - Яндекс Браузер", " — Яндекс.Браузер", " - Яндекс.Браузер",
+    " - Yandex", " — Yandex", " - Yandex Browser", " — Yandex Browser",
+    " - Opera", " — Opera", " - Opera GX", " — Opera GX",
     " - Mozilla Firefox", " — Mozilla Firefox",
-    " - Brave", " — Brave"
+    " - Brave", " — Brave", " - Vivaldi", " — Vivaldi"
   )
-  for (s in suffixes) {
-    if (t.endsWith(s, ignoreCase = true)) {
-      t = t.dropLast(s.length).trim()
+  var stripped = true
+  while (stripped) {
+    stripped = false
+    for (s in suffixes) {
+      if (t.endsWith(s, ignoreCase = true)) {
+        t = t.dropLast(s.length).trim()
+        stripped = true
+      }
     }
   }
-  return t
+  // Если в заголовке длинного произведения/манги/сериала указаны номер главы/серии/страницы в хвосте, убираем хвост для чистого названия
+  val chapterRegex = Regex("(?i)^(.{10,}?)\\s*(?:[-—|/:•]\\s*)?(?:глава|гл\\.|том|часть|серия|сезон|эпизод|стр\\.|страница|chapter|ep\\.|episode|ch\\.|vol\\.)\\s*\\d+.*$")
+  val chapterMatch = chapterRegex.find(t)
+  if (chapterMatch != null) {
+    t = chapterMatch.groupValues[1].trim().trimEnd('-', '—', '|', ':', '/', '•', ',')
+  }
+  return t.replace(Regex("\\s+"), " ").trim()
+}
+
+private fun buildPcWindowTitleGroupKey(userName: String, rawTitle: String): String {
+  val cleaned = cleanPcWindowTitle(rawTitle).lowercase()
+  // Если заголовок содержит разделитель сайта (" — Читать...", " | Манга...") после длинного названия (>= 16 символов), берём основную часть
+  val primaryPart = cleaned
+    .split(Regex("\\s+[-—|]\\s+"))
+    .firstOrNull()
+    ?.trim()
+    ?.takeIf { it.length >= 16 }
+    ?: cleaned
+  // Карточка на экране вмещает ~25-28 символов: объединяем длинные одинаковые префиксы одной страницы/книги за день
+  val stem = if (primaryPart.length > 24) primaryPart.take(24).trim() else primaryPart
+  return "${userName.lowercase().trim()}|$stem"
 }
 
 private fun buildWatchUrlForTitle(rawTitle: String): String {
@@ -204,6 +245,7 @@ fun PcControlScreen(
   onSelectYesterdayFilter: () -> Unit = {},
   onSelectCustomDateRange: (Long, Long) -> Unit = { _, _ -> },
   onBack: (() -> Unit)? = null,
+  onFullscreenChanged: (Boolean) -> Unit = {},
   modifier: Modifier = Modifier
 ) {
   val context = LocalContext.current
@@ -213,10 +255,108 @@ fun PcControlScreen(
   var showFullLockSchedule by remember { mutableStateOf(false) }
   var showAddRuleDialog by remember { mutableStateOf(false) }
   var showFullPcScreenDialog by rememberSaveable { mutableStateOf(false) }
+  var pcStretchToFillScreen by rememberSaveable { mutableStateOf(false) }
+  // Если пользователь вручную закрыл фулскрин, пока телефон ещё лежит горизонтально,
+  // не открываем его повторно до следующего поворота в портрет и обратно.
+  var dismissedWhileLandscape by rememberSaveable { mutableStateOf(false) }
+  var forceLandscapeInFullscreen by rememberSaveable { mutableStateOf(false) }
   var showCustomDateRangeDialog by remember { mutableStateOf(false) }
   var expandedEntryName by remember { mutableStateOf<String?>(null) }
   // История ПК не должна смешивать пользователей Windows: "" = все, иначе выбранная учётка.
   var selectedHistoryUser by rememberSaveable { mutableStateOf("") }
+
+  LaunchedEffect(showFullPcScreenDialog) {
+    onFullscreenChanged(showFullPcScreenDialog)
+  }
+  DisposableEffect(Unit) {
+    onDispose {
+      onFullscreenChanged(false)
+    }
+  }
+
+  val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+  val isDeviceLandscape =
+    configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE ||
+      configuration.screenWidthDp > configuration.screenHeightDp
+
+  // Автоматический переход в полный экран при повороте телефона горизонтально
+  // (даже если системная авторотация сначала открыла экран или пользователь повернул телефон на вкладке ПК).
+  LaunchedEffect(isDeviceLandscape) {
+    if (isDeviceLandscape) {
+      if (!showFullPcScreenDialog && !dismissedWhileLandscape) {
+        PcBlockerClient.requestPcScreenshot()
+        showFullPcScreenDialog = true
+      }
+    } else {
+      dismissedWhileLandscape = false
+    }
+  }
+
+  // Также слушаем физический датчик наклона (OrientationEventListener), чтобы поворот телефона
+  // на 90° открывал горизонтальный полный экран монитора ПК даже при выключенной авторотации в шторке Android!
+  DisposableEffect(context) {
+    val act = context.findHostActivity()
+    val listener = object : android.view.OrientationEventListener(context) {
+      override fun onOrientationChanged(orientation: Int) {
+        if (orientation == ORIENTATION_UNKNOWN) return
+        val isHorizontalTilt = (orientation in 65..115) || (orientation in 245..295)
+        val isVerticalTilt = (orientation in 0..25) || (orientation in 335..360) || (orientation in 155..205)
+        if (isHorizontalTilt) {
+          if (!showFullPcScreenDialog && !dismissedWhileLandscape) {
+            PcBlockerClient.requestPcScreenshot()
+            showFullPcScreenDialog = true
+            forceLandscapeInFullscreen = true
+          } else if (showFullPcScreenDialog && !forceLandscapeInFullscreen) {
+            forceLandscapeInFullscreen = true
+          }
+        } else if (isVerticalTilt) {
+          dismissedWhileLandscape = false
+          if (showFullPcScreenDialog && forceLandscapeInFullscreen) {
+            // Разрешаем свободный поворот обратно в портрет, не закрывая сам полноэкранный режим
+            forceLandscapeInFullscreen = false
+            act?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+          }
+        }
+      }
+    }
+    if (listener.canDetectOrientation()) {
+      listener.enable()
+    }
+    onDispose {
+      listener.disable()
+      act?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+  }
+
+  // Управление ориентацией Activity и скрытием системных баров (Immersive Fullscreen) при открытом полном экране ПК
+  DisposableEffect(showFullPcScreenDialog, forceLandscapeInFullscreen) {
+    val act = context.findHostActivity()
+    val window = act?.window
+    val insetsController = if (window != null) {
+      androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
+    } else null
+
+    if (showFullPcScreenDialog) {
+      act?.requestedOrientation = if (forceLandscapeInFullscreen) {
+        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+      } else {
+        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+      }
+      insetsController?.systemBarsBehavior =
+        androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+      insetsController?.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+    } else {
+      act?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+      insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+    }
+
+    onDispose {
+      if (!showFullPcScreenDialog) {
+        act?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+      }
+    }
+  }
 
   var ipInput by remember(pcState.lanIp) { mutableStateOf(pcState.lanIp) }
   var portInput by remember(pcState.port) { mutableStateOf(pcState.port.toString()) }
@@ -399,6 +539,7 @@ fun PcControlScreen(
     unfocusedLabelColor = Slate400
   )
 
+  if (!showFullPcScreenDialog) {
   LazyColumn(
     modifier = modifier
       .fillMaxSize()
@@ -1093,6 +1234,75 @@ fun PcControlScreen(
                 fontWeight = FontWeight.ExtraBold
               )
             }
+            // Явные кнопки «Во весь экран» и «Горизонтально (альбомный режим)» прямо поверх превью монитора ПК
+            Row(
+              modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(8.dp),
+              horizontalArrangement = Arrangement.spacedBy(6.dp),
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(Color.Black.copy(alpha = 0.78f))
+                  .border(1.dp, CyanLight.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                  .clickable {
+                    PcBlockerClient.requestPcScreenshot()
+                    dismissedWhileLandscape = false
+                    forceLandscapeInFullscreen = true
+                    showFullPcScreenDialog = true
+                  }
+                  .padding(horizontal = 8.dp, vertical = 5.dp)
+              ) {
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                  Icon(
+                    imageVector = Icons.Default.ScreenRotation,
+                    contentDescription = "Горизонтальный полный экран",
+                    tint = CyanLight,
+                    modifier = Modifier.size(14.dp)
+                  )
+                  Text(
+                    text = "Альбомный",
+                    color = CyanLight,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold
+                  )
+                }
+              }
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(CyanLight.copy(alpha = 0.92f))
+                  .clickable {
+                    PcBlockerClient.requestPcScreenshot()
+                    dismissedWhileLandscape = false
+                    showFullPcScreenDialog = true
+                  }
+                  .padding(horizontal = 9.dp, vertical = 5.dp)
+              ) {
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                  Icon(
+                    imageVector = Icons.Default.Fullscreen,
+                    contentDescription = "Полный экран ПК",
+                    tint = Slate950,
+                    modifier = Modifier.size(15.dp)
+                  )
+                  Text(
+                    text = "Полный экран",
+                    color = Slate950,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold
+                  )
+                }
+              }
+            }
             streamStatus.error?.let { err ->
               Box(
                 modifier = Modifier
@@ -1508,10 +1718,10 @@ fun PcControlScreen(
       }
 
       val displayTitles: List<PcActivityItem> = remember(filteredSqlTitles, fallbackDatedUsers, fallbackTitleStart) {
-        if (filteredSqlTitles.isNotEmpty()) {
+        val rawItems = if (filteredSqlTitles.isNotEmpty()) {
           filteredSqlTitles.map {
             PcActivityItem(
-              label = it.windowTitle,
+              label = cleanPcWindowTitle(it.windowTitle),
               seconds = it.totalDurationSeconds.toInt(),
               startedAtMs = it.startedAtMs.takeIf { s -> s > 0L }
                 ?: fallbackTitleStart[it.windowTitle.lowercase().trim()]
@@ -1521,19 +1731,21 @@ fun PcControlScreen(
           }
         } else {
           fallbackDatedUsers
-            .flatMap { u -> u.titles.map { t -> t.copy(userName = u.user) } }
-            .groupBy { it.userName.lowercase().trim() + "|" + it.label.lowercase().trim() }
-            .map { (_, items) ->
-              PcActivityItem(
-                label = items.first().label,
-                seconds = items.sumOf { it.seconds },
-                startedAtMs = items.mapNotNull { i -> i.startedAtMs.takeIf { it > 0L } }.minOrNull() ?: 0L,
-                userName = items.first().userName
-              )
-            }
-            .filter { it.seconds > 0 }
-            .sortedByDescending { it.seconds }
+            .flatMap { u -> u.titles.map { t -> t.copy(label = cleanPcWindowTitle(t.label), userName = u.user) } }
         }
+        rawItems
+          .filter { it.label.isNotBlank() && it.seconds > 0 }
+          .groupBy { buildPcWindowTitleGroupKey(it.userName, it.label) }
+          .map { (_, items) ->
+            val bestLabel = items.minByOrNull { it.label.length }?.label ?: items.first().label
+            PcActivityItem(
+              label = bestLabel,
+              seconds = items.sumOf { it.seconds },
+              startedAtMs = items.mapNotNull { i -> i.startedAtMs.takeIf { it > 0L } }.maxOrNull() ?: 0L,
+              userName = items.first().userName
+            )
+          }
+          .sortedByDescending { it.seconds }
       }
 
       val historyUsers = remember(
@@ -1956,6 +2168,7 @@ fun PcControlScreen(
                   TextButton(
                     onClick = {
                       PcBlockerClient.requestPcScreenshot()
+                      dismissedWhileLandscape = false
                       showFullPcScreenDialog = true
                     },
                     modifier = Modifier.height(36.dp)
@@ -1972,6 +2185,7 @@ fun PcControlScreen(
       }
     }
   }
+  }
 
   if (showCustomDateRangeDialog) {
     CustomPcDateRangeDialog(
@@ -1986,249 +2200,433 @@ fun PcControlScreen(
   }
 
   if (showFullPcScreenDialog) {
-    androidx.compose.ui.window.Dialog(
-      onDismissRequest = { showFullPcScreenDialog = false },
-      properties = androidx.compose.ui.window.DialogProperties(
-        usePlatformDefaultWidth = false,
-        decorFitsSystemWindows = false
+    val fallbackBmp = remember(pcState.pcName, currentPcSummary) {
+      val timeNow = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+      renderWatchedContentFrameBitmap(
+        childName = "Компьютер (${pcState.pcName})",
+        rawAppSummary = currentPcSummary,
+        timeStr = timeNow
       )
-    ) {
-      val fallbackBmp = remember(pcState.pcName, currentPcSummary) {
-        val timeNow = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-        renderWatchedContentFrameBitmap(
-          childName = "Компьютер (${pcState.pcName})",
-          rawAppSummary = currentPcSummary,
-          timeStr = timeNow
-        )
+    }
+    val fullBmp = liveFrame?.bitmap ?: pcScreenBitmap ?: fallbackBmp
+    val liveTs = liveFrame?.timestampMs
+      ?: pcState.screenReceivedAtMs.takeIf { it > 0L }
+      ?: pcState.screenTimestampMs
+    val frameTimeStr = remember(liveTs) {
+      if (liveTs > 0L) {
+        SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(liveTs))
+      } else {
+        SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
       }
-      val fullBmp = liveFrame?.bitmap ?: pcScreenBitmap ?: fallbackBmp
-      val liveTs = liveFrame?.timestampMs
-        ?: pcState.screenReceivedAtMs.takeIf { it > 0L }
-        ?: pcState.screenTimestampMs
-      val frameTimeStr = remember(liveTs) {
-        if (liveTs > 0L) {
-          SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(liveTs))
-        } else {
-          SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-        }
-      }
+    }
 
-      // Полноэкранный режим: кадр ПК занимает весь экран, элементы управления —
-      // полупрозрачные оверлеи. Щипок = зум 1…5x, два пальца = панорама,
-      // одиночный тап = показать/скрыть меню, бездействие 3 с = автоскрытие.
-      var viewportSize by remember { mutableStateOf(IntSize.Zero) }
-      val closeFullscreen = {
-        showFullPcScreenDialog = false
+    // Полноэкранный режим: рендерим ПРЯМО В КОРНЕВОМ ОКНЕ Activity поверх всего приложения
+    // (без PopupWindow / Dialog и без TopAppBar / NavigationBar), чтобы при повороте телефона
+    // на 90°/180°/270° экран ПК никогда не урезался и занимал 100% физического дисплея!
+    var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+    val closeFullscreen = {
+      if (isDeviceLandscape) {
+        dismissedWhileLandscape = true
+      }
+      forceLandscapeInFullscreen = false
+      showFullPcScreenDialog = false
+      onFullscreenChanged(false)
+      pcZoom = 1f
+      pcPanX = 0f
+      pcPanY = 0f
+      pcHudVisible = true
+      val act = context.findHostActivity()
+      act?.requestedOrientation =
+        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+      val win = act?.window
+      if (win != null) {
+        androidx.core.view.WindowCompat.getInsetsController(win, win.decorView)
+          .show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+      }
+    }
+
+    androidx.activity.compose.BackHandler(enabled = showFullPcScreenDialog) {
+      if (pcZoom > 1.05f) {
         pcZoom = 1f
         pcPanX = 0f
         pcPanY = 0f
-        pcHudVisible = true
+      } else {
+        closeFullscreen()
       }
-      Box(
-        modifier = Modifier
-          .fillMaxSize()
-          .background(Color.Black)
-          .onSizeChanged { viewportSize = it }
-          .pointerInput(Unit) {
-            detectTransformGestures { _, pan, zoom, _ ->
-              val newScale = (pcZoom * zoom).coerceIn(1f, 5f)
-              val maxX = (viewportSize.width * (newScale - 1f)) / 2f
-              val maxY = (viewportSize.height * (newScale - 1f)) / 2f
-              pcZoom = newScale
-              if (newScale <= 1.02f) {
+    }
+
+    // Сбрасываем смещение панорамы при смене ориентации экрана (портрет <-> ландшафт),
+    // чтобы картинка монитора ПК всегда стояла строго по центру нового размера экрана.
+    LaunchedEffect(configuration.orientation, configuration.screenWidthDp, configuration.screenHeightDp) {
+      if (pcZoom <= 1.05f) {
+        pcPanX = 0f
+        pcPanY = 0f
+      }
+      val act = context.findHostActivity()
+      val win = act?.window
+      if (win != null) {
+        val ctrl = androidx.core.view.WindowCompat.getInsetsController(win, win.decorView)
+        ctrl.systemBarsBehavior =
+          androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        ctrl.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+      }
+    }
+
+    Box(
+      modifier = Modifier
+        .fillMaxSize()
+        .background(Color.Black)
+        .onSizeChanged { viewportSize = it }
+        .pointerInput(Unit) {
+          detectTransformGestures { _, pan, zoom, _ ->
+            val newScale = (pcZoom * zoom).coerceIn(1f, 5f)
+            val maxX = (viewportSize.width * (newScale - 1f)) / 2f
+            val maxY = (viewportSize.height * (newScale - 1f)) / 2f
+            pcZoom = newScale
+            if (newScale <= 1.02f) {
+              pcPanX = 0f
+              pcPanY = 0f
+            } else {
+              pcPanX = (pcPanX + pan.x).coerceIn(-maxX, maxX)
+              pcPanY = (pcPanY + pan.y).coerceIn(-maxY, maxY)
+            }
+            pcHudInteraction++
+          }
+        }
+        .pointerInput(Unit) {
+          detectTapGestures(
+            onTap = {
+              pcHudVisible = !pcHudVisible
+              pcHudInteraction++
+            },
+            onDoubleTap = {
+              if (pcZoom > 1.05f) {
+                pcZoom = 1f
                 pcPanX = 0f
                 pcPanY = 0f
               } else {
-                pcPanX = (pcPanX + pan.x).coerceIn(-maxX, maxX)
-                pcPanY = (pcPanY + pan.y).coerceIn(-maxY, maxY)
+                pcZoom = 2.5f
               }
+              pcHudVisible = true
               pcHudInteraction++
             }
+          )
+        },
+      contentAlignment = Alignment.Center
+    ) {
+      Image(
+        bitmap = fullBmp.asImageBitmap(),
+        contentDescription = "Полный экран ПК",
+        contentScale = if (pcStretchToFillScreen) ContentScale.FillBounds else ContentScale.Fit,
+        modifier = Modifier
+          .fillMaxSize()
+          .graphicsLayer {
+            scaleX = pcZoom
+            scaleY = pcZoom
+            translationX = pcPanX
+            translationY = pcPanY
           }
-          .pointerInput(Unit) {
-            detectTapGestures(
-              onTap = {
-                pcHudVisible = !pcHudVisible
-                pcHudInteraction++
-              },
-              onDoubleTap = {
-                if (pcZoom > 1.05f) {
-                  pcZoom = 1f
-                  pcPanX = 0f
-                  pcPanY = 0f
-                } else {
-                  pcZoom = 2.5f
-                }
-                pcHudVisible = true
-                pcHudInteraction++
-              }
-            )
-          }
-      ) {
-        Image(
-          bitmap = fullBmp.asImageBitmap(),
-          contentDescription = "Полный экран ПК",
-          contentScale = ContentScale.Fit,
+      )
+
+      if (!pcHudVisible) {
+        Row(
           modifier = Modifier
-            .fillMaxSize()
-            .graphicsLayer {
-              scaleX = pcZoom
-              scaleY = pcZoom
-              translationX = pcPanX
-              translationY = pcPanY
+            .align(Alignment.TopEnd)
+            .padding(top = 14.dp, end = 14.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(Color.Black.copy(alpha = 0.6f))
+            .border(1.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(18.dp))
+            .clickable {
+              pcHudVisible = true
+              pcHudInteraction++
             }
-        )
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+          Icon(Icons.Default.Visibility, contentDescription = null, tint = Color.White, modifier = Modifier.size(14.dp))
+          Text("Меню", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+      }
 
-        if (pcHudVisible) {
-          Row(
-            modifier = Modifier
-              .align(Alignment.TopCenter)
-              .fillMaxWidth()
-              .background(Color.Black.copy(alpha = 0.45f))
-              .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-          ) {
-            Column(modifier = Modifier.weight(1f)) {
-              Text(
-                text = "🖥 ${pcState.pcName}",
-                color = Color.White,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.ExtraBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-              )
-              Text(
-                text = if (liveFrame != null) {
-                  "🟢 ${streamStatus.fps} к/с • ${pcStreamQuality.label} • кадр $frameTimeStr • ${(pcZoom * 100).toInt()}%"
-                } else {
-                  "⏳ Подключение к потоку… ($frameTimeStr)"
-                },
-                color = if (liveFrame != null) EmeraldShieldLight else CyanLight,
-                fontSize = 10.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-              )
-            }
-            TextButton(onClick = closeFullscreen) {
-              Text("✕", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            }
-          }
-
-          Column(
-            modifier = Modifier
-              .align(Alignment.BottomCenter)
-              .fillMaxWidth()
-              .background(Color.Black.copy(alpha = 0.45f))
-              .padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(2.dp)
-          ) {
-            Row(
-              modifier = Modifier.fillMaxWidth(),
-              horizontalArrangement = Arrangement.spacedBy(6.dp),
-              verticalAlignment = Alignment.CenterVertically
-            ) {
-              Text("Качество:", color = Slate200, fontSize = 10.sp)
-              PcStreamQuality.values().forEach { option ->
-                val selected = pcStreamQuality == option
-                Box(
-                  modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(if (selected) CyanLight.copy(alpha = 0.25f) else Color.Black.copy(alpha = 0.35f))
-                    .border(1.dp, if (selected) CyanLight else Slate800, RoundedCornerShape(8.dp))
-                    .clickable {
-                      pcStreamQuality = option
-                      pcHudInteraction++
-                    }
-                    .padding(horizontal = 6.dp, vertical = 3.dp)
-                ) {
-                  Text(
-                    text = option.label,
-                    color = if (selected) CyanLight else Slate200,
-                    fontSize = 9.sp,
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                    maxLines = 1
-                  )
-                }
-              }
-            }
-            Row(
-              modifier = Modifier.fillMaxWidth(),
-              horizontalArrangement = Arrangement.SpaceBetween,
-              verticalAlignment = Alignment.CenterVertically
-            ) {
-              Row(
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically
-              ) {
-                TextButton(onClick = {
-                  PcBlockerClient.requestPcScreenshotHd()
-                  pcHudInteraction++
-                }) {
-                  Text("📸 HD-кадр", color = CyanLight, fontSize = 11.sp)
-                }
-                TextButton(onClick = {
-                  if (pcState.pcRecordingActive) {
-                    PcBlockerClient.stopPcRecording()
-                  } else {
-                    PcBlockerClient.startPcRecording()
-                  }
-                  pcHudInteraction++
-                }) {
-                  Icon(
-                    imageVector = if (pcState.pcRecordingActive) Icons.Default.Stop else Icons.Default.FiberManualRecord,
-                    contentDescription = null,
-                    tint = if (pcState.pcRecordingActive) RoseLock else Color.White,
-                    modifier = Modifier.size(13.dp)
-                  )
-                  Spacer(modifier = Modifier.width(3.dp))
-                  Text(
-                    text = if (pcState.pcRecordingActive) "Стоп ${pcState.pcRecordingSeconds}с" else "REC HD",
-                    color = if (pcState.pcRecordingActive) RoseLock else Color.White,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold
-                  )
-                }
-              }
-              Text(
-                text = when {
-                  pcState.pcRecordingActive -> "● REC"
-                  streamStatus.isActive -> "● LIVE"
-                  else -> "⏸ ПАУЗА"
-                },
-                color = when {
-                  pcState.pcRecordingActive -> RoseLock
-                  streamStatus.isActive -> EmeraldShieldLight
-                  else -> AmberWarning
-                },
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold
-              )
-            }
+      if (pcHudVisible) {
+        Row(
+          modifier = Modifier
+            .align(Alignment.TopCenter)
+            .fillMaxWidth()
+            .background(Color.Black.copy(alpha = 0.55f))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+          Column(modifier = Modifier.weight(1f)) {
             Text(
-              text = "Щипок — зум • 2 пальца — панорама • 2x тап — 250% • 1 тап — меню",
-              color = Slate400,
-              fontSize = 9.sp,
+              text = "🖥 ${pcState.pcName}",
+              color = Color.White,
+              fontSize = 14.sp,
+              fontWeight = FontWeight.ExtraBold,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis
+            )
+            Text(
+              text = if (liveFrame != null) {
+                "🟢 ${streamStatus.fps} к/с • ${pcStreamQuality.label} • кадр $frameTimeStr • ${(pcZoom * 100).toInt()}%"
+              } else {
+                "⏳ Подключение к потоку… ($frameTimeStr)"
+              },
+              color = if (liveFrame != null) EmeraldShieldLight else CyanLight,
+              fontSize = 10.sp,
               maxLines = 1,
               overflow = TextOverflow.Ellipsis
             )
           }
+
+          Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+          ) {
+            // Кнопка переключения масштаба: «На весь экран (100% без полей)» <-> «Пропорции ПК»
+            Box(
+              modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .background(
+                  if (pcStretchToFillScreen) EmeraldShield.copy(alpha = 0.25f)
+                  else Color.Black.copy(alpha = 0.45f)
+                )
+                .border(
+                  1.dp,
+                  if (pcStretchToFillScreen) EmeraldShieldLight else Slate400,
+                  RoundedCornerShape(8.dp)
+                )
+                .clickable {
+                  pcStretchToFillScreen = !pcStretchToFillScreen
+                  pcHudInteraction++
+                }
+                .padding(horizontal = 8.dp, vertical = 5.dp)
+            ) {
+              Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+              ) {
+                Icon(
+                  imageVector = Icons.Default.Fullscreen,
+                  contentDescription = "Масштаб экрана",
+                  tint = if (pcStretchToFillScreen) EmeraldShieldLight else CyanLight,
+                  modifier = Modifier.size(14.dp)
+                )
+                Text(
+                  text = if (pcStretchToFillScreen) "100% Экран" else "Растянуть",
+                  color = if (pcStretchToFillScreen) EmeraldShieldLight else CyanLight,
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold
+                )
+              }
+            }
+
+            // Кнопка принудительного переключения Альбомный (Горизонтально) / Портретный режим
+            Box(
+              modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .background(
+                  if (forceLandscapeInFullscreen || isDeviceLandscape) CyanLight.copy(alpha = 0.25f)
+                  else Color.Black.copy(alpha = 0.45f)
+                )
+                .border(
+                  1.dp,
+                  if (forceLandscapeInFullscreen || isDeviceLandscape) CyanLight else Slate400,
+                  RoundedCornerShape(8.dp)
+                )
+                .clickable {
+                  val act = context.findHostActivity()
+                  val nextLandscape = !(forceLandscapeInFullscreen || isDeviceLandscape)
+                  forceLandscapeInFullscreen = nextLandscape
+                  act?.requestedOrientation = if (nextLandscape) {
+                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                  } else {
+                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                  }
+                  pcHudInteraction++
+                }
+                .padding(horizontal = 8.dp, vertical = 5.dp)
+            ) {
+              Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+              ) {
+                Icon(
+                  imageVector = Icons.Default.ScreenRotation,
+                  contentDescription = "Повернуть экран",
+                  tint = CyanLight,
+                  modifier = Modifier.size(14.dp)
+                )
+                Text(
+                  text = if (forceLandscapeInFullscreen || isDeviceLandscape) "В портрет" else "Горизонтально",
+                  color = CyanLight,
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold
+                )
+              }
+            }
+
+            if (pcZoom > 1.05f) {
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(CyanLight.copy(alpha = 0.2f))
+                  .border(1.dp, CyanLight, RoundedCornerShape(8.dp))
+                  .clickable {
+                    pcZoom = 1f
+                    pcPanX = 0f
+                    pcPanY = 0f
+                    pcHudInteraction++
+                  }
+                  .padding(horizontal = 8.dp, vertical = 5.dp)
+              ) {
+                Text(
+                  text = "${(pcZoom * 100).toInt()}% Сброс",
+                  color = CyanLight,
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold
+                )
+              }
+            }
+
+            IconButton(
+              onClick = closeFullscreen,
+              modifier = Modifier
+                .size(34.dp)
+                .clip(CircleShape)
+                .background(RoseLock.copy(alpha = 0.85f))
+            ) {
+              Text("✕", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            }
+          }
         }
 
-        if (!streamStatus.isActive) {
-          Box(
-            modifier = Modifier
-              .align(Alignment.Center)
-              .clip(RoundedCornerShape(10.dp))
-              .background(AmberWarning.copy(alpha = 0.9f))
-              .padding(horizontal = 12.dp, vertical = 8.dp)
+        Column(
+          modifier = Modifier
+            .align(Alignment.BottomCenter)
+            .fillMaxWidth()
+            .background(Color.Black.copy(alpha = 0.55f))
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+          verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
           ) {
+            Text("Качество:", color = Slate200, fontSize = 10.sp)
+            PcStreamQuality.values().forEach { option ->
+              val selected = pcStreamQuality == option
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(if (selected) CyanLight.copy(alpha = 0.25f) else Color.Black.copy(alpha = 0.35f))
+                  .border(1.dp, if (selected) CyanLight else Slate800, RoundedCornerShape(8.dp))
+                  .clickable {
+                    pcStreamQuality = option
+                    pcHudInteraction++
+                  }
+                  .padding(horizontal = 6.dp, vertical = 3.dp)
+              ) {
+                Text(
+                  text = option.label,
+                  color = if (selected) CyanLight else Slate200,
+                  fontSize = 9.sp,
+                  fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                  maxLines = 1
+                )
+              }
+            }
+          }
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Row(
+              horizontalArrangement = Arrangement.spacedBy(4.dp),
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              TextButton(onClick = {
+                PcBlockerClient.requestPcScreenshotHd()
+                pcHudInteraction++
+              }) {
+                Text("📸 HD-кадр", color = CyanLight, fontSize = 11.sp)
+              }
+              TextButton(onClick = {
+                if (pcState.pcRecordingActive) {
+                  PcBlockerClient.stopPcRecording()
+                } else {
+                  PcBlockerClient.startPcRecording()
+                }
+                pcHudInteraction++
+              }) {
+                Icon(
+                  imageVector = if (pcState.pcRecordingActive) Icons.Default.Stop else Icons.Default.FiberManualRecord,
+                  contentDescription = null,
+                  tint = if (pcState.pcRecordingActive) RoseLock else Color.White,
+                  modifier = Modifier.size(13.dp)
+                )
+                Spacer(modifier = Modifier.width(3.dp))
+                Text(
+                  text = if (pcState.pcRecordingActive) "Стоп ${pcState.pcRecordingSeconds}с" else "REC HD",
+                  color = if (pcState.pcRecordingActive) RoseLock else Color.White,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.Bold
+                )
+              }
+              TextButton(onClick = closeFullscreen) {
+                Icon(
+                  imageVector = Icons.Default.FullscreenExit,
+                  contentDescription = null,
+                  tint = Slate200,
+                  modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(3.dp))
+                Text("Свернуть", color = Slate200, fontSize = 11.sp)
+              }
+            }
             Text(
-              "Поток на паузе",
-              color = Slate950,
-              fontSize = 12.sp,
+              text = when {
+                pcState.pcRecordingActive -> "● REC"
+                streamStatus.isActive -> "● LIVE"
+                else -> "⏸ ПАУЗА"
+              },
+              color = when {
+                pcState.pcRecordingActive -> RoseLock
+                streamStatus.isActive -> EmeraldShieldLight
+                else -> AmberWarning
+              },
+              fontSize = 11.sp,
               fontWeight = FontWeight.Bold
             )
           }
+          Text(
+            text = "Поворот телефона — авто-альбомный режим • Щипок — зум • 2x тап — 250% • 1 тап — скрыть меню",
+            color = Slate400,
+            fontSize = 9.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+          )
+        }
+      }
+
+      if (!streamStatus.isActive) {
+        Box(
+          modifier = Modifier
+            .align(Alignment.Center)
+            .clip(RoundedCornerShape(10.dp))
+            .background(AmberWarning.copy(alpha = 0.9f))
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+          Text(
+            "Поток на паузе",
+            color = Slate950,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold
+          )
         }
       }
     }

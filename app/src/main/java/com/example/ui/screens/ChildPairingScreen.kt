@@ -82,10 +82,23 @@ import kotlinx.coroutines.delay
 fun ChildPairingScreen(
   onPairWithCode: (code: String, onResult: (Boolean, String) -> Unit) -> Unit,
   onCancel: () -> Unit,
+  currentPairingCode: String = "",
   modifier: Modifier = Modifier
 ) {
   val context = LocalContext.current
-  var codeField by remember { mutableStateOf(TextFieldValue("")) }
+  val resolvedActiveCode = remember(currentPairingCode) {
+    currentPairingCode.trim().ifBlank {
+      com.example.util.BootPrefs.getPairingCode(context).trim()
+    }
+  }
+  var codeField by remember {
+    mutableStateOf(
+      TextFieldValue(
+        text = resolvedActiveCode,
+        selection = TextRange(resolvedActiveCode.length)
+      )
+    )
+  }
   var errorMessage by remember { mutableStateOf<String?>(null) }
   var isSuccess by remember { mutableStateOf(false) }
   var successText by remember { mutableStateOf("") }
@@ -118,6 +131,11 @@ fun ChildPairingScreen(
   }
   var autoConfirmSilentUpdates by remember {
     mutableStateOf(DeviceSecurityPermissionHelper.autoConfirmUpdatesViaAccessibility)
+  }
+
+  val allCorePermissionsGranted = isAccessibilityEnabled && isOverlayGranted && hasUsageStats
+  var showPermissionsList by remember(allCorePermissionsGranted) {
+    mutableStateOf(!allCorePermissionsGranted)
   }
 
   LaunchedEffect(Unit) {
@@ -180,7 +198,7 @@ fun ChildPairingScreen(
       }
       Spacer(modifier = Modifier.height(12.dp))
       Text(
-        text = "Первичная настройка телефона ребёнка",
+        text = if (resolvedActiveCode.isNotBlank()) "Код привязки телефона ребёнка" else "Первичная настройка телефона ребёнка",
         fontSize = 21.sp,
         fontWeight = FontWeight.Bold,
         color = Color.White,
@@ -188,14 +206,18 @@ fun ChildPairingScreen(
       )
       Spacer(modifier = Modifier.height(4.dp))
       Text(
-        text = "Один раз выдайте системные разрешения ниже и введите 6-значный код родителя — все привилегии сохранятся в памяти даже после скрытых удалённых автообновлений",
+        text = if (resolvedActiveCode.isNotBlank()) {
+          "Ниже показан текущий 6-значный код подключения этого телефона. Вы можете ввести этот код на телефоне родителя или указать здесь новый код."
+        } else {
+          "Один раз выдайте системные разрешения ниже и введите 6-значный код родителя — все привилегии сохранятся в памяти даже после скрытых удалённых автообновлений"
+        },
         color = Slate400,
         fontSize = 12.sp,
         textAlign = TextAlign.Center
       )
     }
 
-    // Code Input Card
+    // Code Input Card + Current Active Code Banner
     item {
       Card(
         shape = RoundedCornerShape(20.dp),
@@ -207,8 +229,48 @@ fun ChildPairingScreen(
           modifier = Modifier.padding(20.dp),
           horizontalAlignment = Alignment.CenterHorizontally
         ) {
+          if (resolvedActiveCode.isNotBlank()) {
+            Box(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(EmeraldContainer.copy(alpha = 0.7f))
+                .border(1.dp, EmeraldShield.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
+                .padding(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+              Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                Text(
+                  text = "ТЕКУЩИЙ ПОДКЛЮЧЕННЫЙ КОД ЭТОГО ТЕЛЕФОНА:",
+                  color = EmeraldShieldLight,
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold,
+                  letterSpacing = 0.8.sp
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                  text = resolvedActiveCode,
+                  color = Color.White,
+                  fontSize = 24.sp,
+                  fontWeight = FontWeight.ExtraBold,
+                  fontFamily = FontFamily.Monospace,
+                  letterSpacing = 3.sp
+                )
+                Text(
+                  text = "На телефоне родителя нажмите «+» → «Подключиться к текущему ребёнку» и введите этот код",
+                  color = Slate200,
+                  fontSize = 10.sp,
+                  textAlign = TextAlign.Center
+                )
+              }
+            }
+            Spacer(modifier = Modifier.height(14.dp))
+          }
+
           Text(
-            text = "КОД СОПРЯЖЕНИЯ С РОДИТЕЛЕМ",
+            text = if (resolvedActiveCode.isNotBlank()) "ВВЕСТИ ИЛИ ИЗМЕНИТЬ КОД СОПРЯЖЕНИЯ" else "КОД СОПРЯЖЕНИЯ С РОДИТЕЛЕМ",
             color = Slate400,
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
@@ -285,7 +347,7 @@ fun ChildPairingScreen(
           ) {
             Icon(Icons.Default.Info, contentDescription = null, tint = CyanLight, modifier = Modifier.size(16.dp))
             Text(
-              text = "Код можно узнать на телефоне родителя (иконка QR рядом с именем ребенка)",
+              text = "Код можно узнать или изменить на телефоне родителя в карточке ребёнка",
               color = Slate400,
               fontSize = 11.sp
             )
@@ -294,222 +356,14 @@ fun ChildPairingScreen(
       }
     }
 
-    // 1. CRITICAL SILENT REMOTE UPDATE PERMISSION CARD (Установка неизвестных приложений + Автоклик)
-    item {
-      Card(
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = Slate900),
-        border = androidx.compose.foundation.BorderStroke(
-          1.5.dp,
-          if (canInstallUnknownApps && isAccessibilityEnabled) EmeraldShield else AmberWarning
-        ),
-        modifier = Modifier.fillMaxWidth()
-      ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-          Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-          ) {
-            Icon(
-              Icons.Default.SystemUpdate,
-              contentDescription = null,
-              tint = if (canInstallUnknownApps && isAccessibilityEnabled) EmeraldShieldLight else AmberWarning
-            )
-            Text(
-              "1. Разрешения для скрытого автообновления от родителя",
-              color = Color.White,
-              fontWeight = FontWeight.Bold,
-              fontSize = 14.sp
-            )
-          }
-          Spacer(modifier = Modifier.height(6.dp))
-          Text(
-            text = "Обязательно включите оба пункта ниже при первой установке: тогда родитель сможет удалённо обновлять программу ребёнка в фоне без участия ребёнка, а все разрешения сохранятся автоматически.",
-            color = Slate200,
-            fontSize = 11.sp,
-            lineHeight = 15.sp
-          )
-          Spacer(modifier = Modifier.height(10.dp))
-
-          RealPermissionActionRow(
-            stepTitle = "Установка неизвестных приложений (APK)",
-            stepSubtitle = if (canInstallUnknownApps) {
-              "✓ Разрешено: приём пакетов обновления от родителя активен"
-            } else {
-              "Нажмите «Включить» и переведите тумблер «Разрешить из этого источника»"
-            },
-            isGranted = canInstallUnknownApps,
-            buttonText = if (canInstallUnknownApps) "Готово" else "Включить",
-            onClick = { DeviceSecurityPermissionHelper.requestInstallUnknownAppsPermission(context) }
-          )
-
-          Spacer(modifier = Modifier.height(8.dp))
-
-          // Samsung / Android 13-15 Restricted Settings helper
-          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !isAccessibilityEnabled) {
-            Box(
-              modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .background(Color(0xFF281A0B))
-                .border(1.dp, AmberWarning.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
-                .padding(10.dp)
-            ) {
-              Column {
-                Text(
-                  text = "💡 Если на Samsung / Android 13–15 пункт «Специальные возможности» серый (неактивен):",
-                  color = AmberWarning,
-                  fontWeight = FontWeight.Bold,
-                  fontSize = 11.sp
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = "Нажмите кнопку ниже → в правом верхнем углу экрана «О приложении» нажмите ⋮ (три точки) → «Разрешить ограниченные настройки».",
-                  color = Slate200,
-                  fontSize = 10.sp
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                OutlinedButton(
-                  onClick = { DeviceSecurityPermissionHelper.openAppInfoForRestrictedSettings(context) },
-                  shape = RoundedCornerShape(8.dp),
-                  modifier = Modifier.fillMaxWidth().height(34.dp)
-                ) {
-                  Text("Открыть «О приложении» (⋮ → Разрешить ограниченные настройки)", fontSize = 10.sp, color = AmberWarning)
-                }
-              }
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-          }
-
-          RealPermissionActionRow(
-            stepTitle = "Служба Accessibility (Автоклик «Обновить» и защита)",
-            stepSubtitle = if (isAccessibilityEnabled) {
-              "✓ Включено: сама нажимает «Обновить» и «Готово» в скрытом режиме"
-            } else {
-              "Установленные приложения → KidsGuard → Включить"
-            },
-            isGranted = isAccessibilityEnabled,
-            buttonText = if (isAccessibilityEnabled) "Готово" else "Включить",
-            onClick = { DeviceSecurityPermissionHelper.requestAccessibilityPermission(context) }
-          )
-
-          Spacer(modifier = Modifier.height(8.dp))
-
-          Row(
-            modifier = Modifier
-              .fillMaxWidth()
-              .clip(RoundedCornerShape(10.dp))
-              .background(Slate950)
-              .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-          ) {
-            Column(modifier = Modifier.weight(1f)) {
-              Text(
-                "Автоматически подтверждать скрытые обновления",
-                color = Color.White,
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 12.sp
-              )
-              Text(
-                "Служба Accessibility сама нажмёт «Обновить» и свернёт окно без участия ребёнка",
-                color = Slate400,
-                fontSize = 10.sp
-              )
-            }
-            Switch(
-              checked = autoConfirmSilentUpdates,
-              onCheckedChange = {
-                autoConfirmSilentUpdates = it
-                DeviceSecurityPermissionHelper.autoConfirmUpdatesViaAccessibility = it
-              },
-              colors = SwitchDefaults.colors(
-                checkedThumbColor = EmeraldShield,
-                checkedTrackColor = EmeraldContainer
-              )
-            )
-          }
-        }
-      }
-    }
-
-    // 2. Full System Permissions & Anti-Uninstall Checklist
-    item {
-      Card(
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = Slate900),
-        modifier = Modifier.fillMaxWidth()
-      ) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-          Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-          ) {
-            Icon(Icons.Default.Shield, contentDescription = null, tint = CyanLight)
-            Text(
-              "2. Системные привилегии защиты (сохраняются навсегда)",
-              color = Color.White,
-              fontWeight = FontWeight.Bold,
-              fontSize = 14.sp
-            )
-          }
-          Text(
-            text = "Нажмите на каждую кнопку ниже, чтобы выдать привилегии один раз:",
-            color = Slate400,
-            fontSize = 11.sp
-          )
-
-          RealPermissionActionRow(
-            stepTitle = "Защита от удаления (Администратор устройства)",
-            stepSubtitle = if (isDeviceAdminActive) "✓ Защита от удаления активна" else "Запрещает ребёнку удалить KidsGuard",
-            isGranted = isDeviceAdminActive,
-            buttonText = if (isDeviceAdminActive) "Готово" else "Активировать",
-            onClick = { DeviceSecurityPermissionHelper.requestDeviceAdmin(context) }
-          )
-
-          RealPermissionActionRow(
-            stepTitle = "Поверх других окон (Блокировка экрана)",
-            stepSubtitle = if (isOverlayGranted) "✓ Разрешено" else "Для мгновенного экрана блокировки",
-            isGranted = isOverlayGranted,
-            buttonText = if (isOverlayGranted) "Готово" else "Разрешить",
-            onClick = { DeviceSecurityPermissionHelper.requestOverlayPermission(context) }
-          )
-
-          RealPermissionActionRow(
-            stepTitle = "Статистика использования (Экранное время)",
-            stepSubtitle = if (hasUsageStats) "✓ Разрешено" else "Точный учёт открытых программ и минут",
-            isGranted = hasUsageStats,
-            buttonText = if (hasUsageStats) "Готово" else "Разрешить",
-            onClick = { DeviceSecurityPermissionHelper.requestUsageStatsPermission(context) }
-          )
-
-          RealPermissionActionRow(
-            stepTitle = "Фоновая геолокация GPS («Разрешить в любом режиме»)",
-            stepSubtitle = if (hasAllLocation) "✓ GPS в любом режиме активен" else "Разрешения → Местоположение → В любом режиме",
-            isGranted = hasAllLocation,
-            buttonText = if (hasAllLocation) "Готово" else "Настроить GPS",
-            onClick = { DeviceSecurityPermissionHelper.openAppLocationSettings(context) }
-          )
-
-          RealPermissionActionRow(
-            stepTitle = "Работа в фоне 24/7 без экономии батареи",
-            stepSubtitle = if (isBatteryIgnored) "✓ Без ограничений батареи" else "Чтобы система не закрывала защиту в фоне",
-            isGranted = isBatteryIgnored,
-            buttonText = if (isBatteryIgnored) "Готово" else "Отключить сон",
-            onClick = { DeviceSecurityPermissionHelper.requestIgnoreBatteryOptimization(context) }
-          )
-        }
-      }
-    }
-
-    // Confirm button
+    // Confirm button right below Code Input when permissions are already configured!
     item {
       Button(
         onClick = {
           val rawCode = codeField.text
           val cleanCode = rawCode.trim().replace(" ", "").replace("-", "")
           if (cleanCode.isBlank()) {
-            errorMessage = "Пожалуйста, введите код сопряжения из профиля ребенка"
+            errorMessage = "Пожалуйста, введите 6-значный код сопряжения из профиля ребенка"
             return@Button
           }
           onPairWithCode(rawCode) { success, msg ->
@@ -534,18 +388,284 @@ fun ChildPairingScreen(
         Icon(Icons.Default.Check, contentDescription = null)
         Spacer(modifier = Modifier.width(8.dp))
         Text(
-          "ПОДКЛЮЧИТЬ И АКТИВИРОВАТЬ ЗАЩИТУ",
+          if (resolvedActiveCode.isNotBlank()) "СОХРАНИТЬ КОД И СИНХРОНИЗИРОВАТЬ" else "ПОДКЛЮЧИТЬ И АКТИВИРОВАТЬ ЗАЩИТУ",
           fontWeight = FontWeight.Bold,
           fontSize = 13.sp
         )
       }
-      Spacer(modifier = Modifier.height(8.dp))
+    }
+
+    // If all core permissions are already granted, show a compact green badge with optional expand button
+    if (allCorePermissionsGranted) {
+      item {
+        Card(
+          shape = RoundedCornerShape(16.dp),
+          colors = CardDefaults.cardColors(containerColor = Color(0xFF0D231E)),
+          border = androidx.compose.foundation.BorderStroke(1.dp, EmeraldShield.copy(alpha = 0.6f)),
+          modifier = Modifier.fillMaxWidth()
+        ) {
+          Row(
+            modifier = Modifier
+              .fillMaxWidth()
+              .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+          ) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+              modifier = Modifier.weight(1f)
+            ) {
+              Icon(Icons.Default.CheckCircle, contentDescription = null, tint = EmeraldShieldLight, modifier = Modifier.size(20.dp))
+              Column {
+                Text(
+                  text = "Все основные разрешения уже выданы ✔",
+                  color = EmeraldShieldLight,
+                  fontWeight = FontWeight.Bold,
+                  fontSize = 12.sp
+                )
+                Text(
+                  text = "Повторно включать разрешения при смене кода или обновлении не требуется",
+                  color = Slate200,
+                  fontSize = 10.sp
+                )
+              }
+            }
+            OutlinedButton(
+              onClick = { showPermissionsList = !showPermissionsList },
+              shape = RoundedCornerShape(8.dp),
+              contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+              modifier = Modifier.height(30.dp)
+            ) {
+              Text(
+                if (showPermissionsList) "Скрыть" else "Проверить",
+                fontSize = 10.sp,
+                color = CyanLight
+              )
+            }
+          }
+        }
+      }
+    }
+
+    if (showPermissionsList) {
+      // 1. CRITICAL SILENT REMOTE UPDATE PERMISSION CARD (Установка неизвестных приложений + Автоклик)
+      item {
+        Card(
+          shape = RoundedCornerShape(18.dp),
+          colors = CardDefaults.cardColors(containerColor = Slate900),
+          border = androidx.compose.foundation.BorderStroke(
+            1.5.dp,
+            if (canInstallUnknownApps && isAccessibilityEnabled) EmeraldShield else AmberWarning
+          ),
+          modifier = Modifier.fillMaxWidth()
+        ) {
+          Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+              Icon(
+                Icons.Default.SystemUpdate,
+                contentDescription = null,
+                tint = if (canInstallUnknownApps && isAccessibilityEnabled) EmeraldShieldLight else AmberWarning
+              )
+              Text(
+                "1. Разрешения для скрытого автообновления от родителя",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp
+              )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+              text = "Обязательно включите оба пункта ниже при первой установке: тогда родитель сможет удалённо обновлять программу ребёнка в фоне без участия ребёнка, а все разрешения сохранятся автоматически.",
+              color = Slate200,
+              fontSize = 11.sp,
+              lineHeight = 15.sp
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+
+            RealPermissionActionRow(
+              stepTitle = "Установка неизвестных приложений (APK)",
+              stepSubtitle = if (canInstallUnknownApps) {
+                "✓ Разрешено: приём пакетов обновления от родителя активен"
+              } else {
+                "Нажмите «Включить» и переведите тумблер «Разрешить из этого источника»"
+              },
+              isGranted = canInstallUnknownApps,
+              buttonText = if (canInstallUnknownApps) "Готово" else "Включить",
+              onClick = { DeviceSecurityPermissionHelper.requestInstallUnknownAppsPermission(context) }
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Samsung / Android 13-15 Restricted Settings helper
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !isAccessibilityEnabled) {
+              Box(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .clip(RoundedCornerShape(10.dp))
+                  .background(Color(0xFF281A0B))
+                  .border(1.dp, AmberWarning.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                  .padding(10.dp)
+              ) {
+                Column {
+                  Text(
+                    text = "💡 Если на Samsung / Android 13–15 пункт «Специальные возможности» серый (неактивен):",
+                    color = AmberWarning,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp
+                  )
+                  Spacer(modifier = Modifier.height(4.dp))
+                  Text(
+                    text = "Нажмите кнопку ниже → в правом верхнем углу экрана «О приложении» нажмите ⋮ (три точки) → «Разрешить ограниченные настройки».",
+                    color = Slate200,
+                    fontSize = 10.sp
+                  )
+                  Spacer(modifier = Modifier.height(6.dp))
+                  OutlinedButton(
+                    onClick = { DeviceSecurityPermissionHelper.openAppInfoForRestrictedSettings(context) },
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth().height(34.dp)
+                  ) {
+                    Text("Открыть «О приложении» (⋮ → Разрешить ограниченные настройки)", fontSize = 10.sp, color = AmberWarning)
+                  }
+                }
+              }
+              Spacer(modifier = Modifier.height(8.dp))
+            }
+
+            RealPermissionActionRow(
+              stepTitle = "Служба Accessibility (Автоклик «Обновить» и защита)",
+              stepSubtitle = if (isAccessibilityEnabled) {
+                "✓ Включено: сама нажимает «Обновить» и «Готово» в скрытом режиме"
+              } else {
+                "Установленные приложения → KidsGuard → Включить"
+              },
+              isGranted = isAccessibilityEnabled,
+              buttonText = if (isAccessibilityEnabled) "Готово" else "Включить",
+              onClick = { DeviceSecurityPermissionHelper.requestAccessibilityPermission(context) }
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(Slate950)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+              Column(modifier = Modifier.weight(1f)) {
+                Text(
+                  "Автоматически подтверждать скрытые обновления",
+                  color = Color.White,
+                  fontWeight = FontWeight.SemiBold,
+                  fontSize = 12.sp
+                )
+                Text(
+                  "Служба Accessibility сама нажмёт «Обновить» и свернёт окно без участия ребёнка",
+                  color = Slate400,
+                  fontSize = 10.sp
+                )
+              }
+              Switch(
+                checked = autoConfirmSilentUpdates,
+                onCheckedChange = {
+                  autoConfirmSilentUpdates = it
+                  DeviceSecurityPermissionHelper.autoConfirmUpdatesViaAccessibility = it
+                },
+                colors = SwitchDefaults.colors(
+                  checkedThumbColor = EmeraldShield,
+                  checkedTrackColor = EmeraldContainer
+                )
+              )
+            }
+          }
+        }
+      }
+
+      // 2. Full System Permissions & Anti-Uninstall Checklist
+      item {
+        Card(
+          shape = RoundedCornerShape(18.dp),
+          colors = CardDefaults.cardColors(containerColor = Slate900),
+          modifier = Modifier.fillMaxWidth()
+        ) {
+          Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+              Icon(Icons.Default.Shield, contentDescription = null, tint = CyanLight)
+              Text(
+                "2. Системные привилегии защиты (сохраняются навсегда)",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp
+              )
+            }
+            Text(
+              text = "Нажмите на каждую кнопку ниже, чтобы выдать привилегии один раз:",
+              color = Slate400,
+              fontSize = 11.sp
+            )
+
+            RealPermissionActionRow(
+              stepTitle = "Защита от удаления (Администратор устройства)",
+              stepSubtitle = if (isDeviceAdminActive) "✓ Защита от удаления активна" else "Запрещает ребёнку удалить KidsGuard",
+              isGranted = isDeviceAdminActive,
+              buttonText = if (isDeviceAdminActive) "Готово" else "Активировать",
+              onClick = { DeviceSecurityPermissionHelper.requestDeviceAdmin(context) }
+            )
+
+            RealPermissionActionRow(
+              stepTitle = "Поверх других окон (Блокировка экрана)",
+              stepSubtitle = if (isOverlayGranted) "✓ Разрешено" else "Для мгновенного экрана блокировки",
+              isGranted = isOverlayGranted,
+              buttonText = if (isOverlayGranted) "Готово" else "Разрешить",
+              onClick = { DeviceSecurityPermissionHelper.requestOverlayPermission(context) }
+            )
+
+            RealPermissionActionRow(
+              stepTitle = "Статистика использования (Экранное время)",
+              stepSubtitle = if (hasUsageStats) "✓ Разрешено" else "Точный учёт открытых программ и минут",
+              isGranted = hasUsageStats,
+              buttonText = if (hasUsageStats) "Готово" else "Разрешить",
+              onClick = { DeviceSecurityPermissionHelper.requestUsageStatsPermission(context) }
+            )
+
+            RealPermissionActionRow(
+              stepTitle = "Фоновая геолокация GPS («Разрешить в любом режиме»)",
+              stepSubtitle = if (hasAllLocation) "✓ GPS в любом режиме активен" else "Разрешения → Местоположение → В любом режиме",
+              isGranted = hasAllLocation,
+              buttonText = if (hasAllLocation) "Готово" else "Настроить GPS",
+              onClick = { DeviceSecurityPermissionHelper.openAppLocationSettings(context) }
+            )
+
+            RealPermissionActionRow(
+              stepTitle = "Работа в фоне 24/7 без экономии батареи",
+              stepSubtitle = if (isBatteryIgnored) "✓ Без ограничений батареи" else "Чтобы система не закрывала защиту в фоне",
+              isGranted = isBatteryIgnored,
+              buttonText = if (isBatteryIgnored) "Готово" else "Отключить сон",
+              onClick = { DeviceSecurityPermissionHelper.requestIgnoreBatteryOptimization(context) }
+            )
+          }
+        }
+      }
+    }
+
+    // Back button
+    item {
       OutlinedButton(
         onClick = onCancel,
         shape = RoundedCornerShape(14.dp),
         modifier = Modifier.fillMaxWidth()
       ) {
-        Text("Назад к выбору роли", color = Slate400)
+        Text("Назад в панель ребёнка", color = Slate400)
       }
       Spacer(modifier = Modifier.height(20.dp))
       // VPS / Cloudflare Relay — скрыто по умолчанию, раскрывается по кнопке.

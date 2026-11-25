@@ -29,8 +29,43 @@ object DeviceControlDebugger {
   private const val KEY_LOGGING_ENABLED = "logging_enabled"
   private const val KEY_LAST_SYNCED_CHILD_TS = "last_synced_child_log_ts"
   private const val LOG_FILE_NAME = "kidsguard_diagnostic_log.json"
-  private const val MAX_LOG_ENTRIES = 500
-  private const val MAX_PERSISTED_ENTRIES = 350
+  private const val MAX_LOG_ENTRIES = 140
+  private const val MAX_PERSISTED_ENTRIES = 120
+  private const val RESERVED_CHILD_LOG_QUOTA = 60
+  private const val DISK_FLUSH_INTERVAL_MS = 30_000L
+
+  // Шумные и частые фоновые события, которые НЕ должны засорять журнал и расходовать память/батарею
+  private val IGNORED_NOISY_ACTIONS = setOf(
+    "СКРИНШОТ_ЭКРАНА",
+    "КАДР_ЭКРАНА_ОТПРАВЛЕН",
+    "КАДР_ЭКРАНА_ПРИНЯТ",
+    "ДУБЛЬ_БРОКЕРА_ОТБРОШЕН",
+    "ДУБЛЬ_КОМАНДЫ_ОТБРОШЕНА",
+    "СТАРАЯ_КОМАНДА_ОТБРОШЕНА",
+    "ЭКРАННОЕ_ВРЕМЯ",
+    "РАСХОД_ЭНЕРГИИ",
+    "БАТАРЕЯ_ОБНОВЛЕНА",
+    "СКРИНШОТ_СИСТЕМНЫЙ_КОД",
+    "VPS_ПОВТОР_ПОДКЛЮЧЕНИЯ",
+    "ЧУЖОЙ_ПРОФИЛЬ_ОТБРОШЕН"
+  )
+
+  // События с ограничением частоты (не чаще 1 раза в 60 секунд)
+  private val RATE_LIMITED_ACTIONS = setOf(
+    "P2P_БРОКЕР_ПОДКЛЮЧЕН",
+    "СТАТУС_ОНЛАЙН",
+    "СТАТУС_ОФФЛАЙН",
+    "СЕТЬ_ВОССТАНОВЛЕНА",
+    "СЕТЬ_ПОТЕРЯНА",
+    "СРЕЗ_ПАРАМЕТРОВ",
+    "VPS_СОЕДИНЕНИЕ_ЗАКРЫТО",
+    "НЕСОВПАДЕНИЕ_КОДА"
+  )
+
+  private val lastActionLogTimeMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+  @Volatile
+  private var lastDiskFlushTimeMs: Long = 0L
 
   @Volatile
   private var appContext: Context? = null
@@ -72,16 +107,18 @@ object DeviceControlDebugger {
     if (enabled && !prev) {
       forceLogInternal(
         action = "ЛОГГЕР_ВКЛЮЧЕН",
-        details = "Диагностическое логирование включено (версия v${BuildConfig.VERSION_NAME})",
+        details = "Диагностическое логирование включено (лимит $MAX_LOG_ENTRIES записей, v${BuildConfig.VERSION_NAME})",
         status = "SUCCESS",
-        source = "SYSTEM"
+        source = "SYSTEM",
+        forceFlushDisk = true
       )
     } else if (!enabled && prev) {
       forceLogInternal(
         action = "ЛОГГЕР_ВЫКЛЮЧЕН",
-        details = "Диагностическое логирование приостановлено пользователем (версия v${BuildConfig.VERSION_NAME})",
+        details = "Диагностическое логирование приостановлено пользователем (v${BuildConfig.VERSION_NAME})",
         status = "WARNING",
-        source = "SYSTEM"
+        source = "SYSTEM",
+        forceFlushDisk = true
       )
     }
   }
@@ -94,6 +131,14 @@ object DeviceControlDebugger {
     appVersion: String = BuildConfig.VERSION_NAME
   ) {
     if (!_isLoggingEnabled.value) return
+    val cleanAction = action.removePrefix("📱").substringAfter("• ").trim()
+    if (action in IGNORED_NOISY_ACTIONS || cleanAction in IGNORED_NOISY_ACTIONS) return
+    val now = System.currentTimeMillis()
+    if (action in RATE_LIMITED_ACTIONS || cleanAction in RATE_LIMITED_ACTIONS) {
+      val prevTs = lastActionLogTimeMs[cleanAction] ?: 0L
+      if (now - prevTs < 60_000L) return
+      lastActionLogTimeMs[cleanAction] = now
+    }
     forceLogInternal(action, details, status, source, appVersion)
   }
 
@@ -108,6 +153,10 @@ object DeviceControlDebugger {
     triggerReason: String
   ) {
     if (!_isLoggingEnabled.value) return
+    val now = System.currentTimeMillis()
+    val prevSnapTs = lastActionLogTimeMs["СРЕЗ_ПАРАМЕТРОВ_$role"] ?: 0L
+    if (now - prevSnapTs < 45_000L && !triggerReason.contains("Запрос", ignoreCase = true)) return
+    lastActionLogTimeMs["СРЕЗ_ПАРАМЕТРОВ_$role"] = now
     val ctx = context?.applicationContext ?: appContext ?: return
     try {
       val batt = DeviceBatteryUtil.getAccurateBatteryPercentage(ctx)
@@ -155,36 +204,46 @@ object DeviceControlDebugger {
     details: String,
     status: String,
     source: String,
-    appVersion: String = BuildConfig.VERSION_NAME
+    appVersion: String = BuildConfig.VERSION_NAME,
+    forceFlushDisk: Boolean = false
   ) {
     val now = System.currentTimeMillis()
     val entry = DebugLogEntry(
       timestamp = now,
       tag = TAG,
       action = action,
-      details = details,
+      details = details.take(240),
       status = status,
       source = source,
       appVersion = appVersion.ifBlank { BuildConfig.VERSION_NAME }
     )
-    val time = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date(entry.timestamp))
-    try {
-      android.util.Log.d(TAG, "[$time] [v${entry.appVersion}] [$source] [$status] $action: $details")
-    } catch (_: Throwable) {
-      println("[$TAG] [$time] [v${entry.appVersion}] [$source] [$status] $action: $details")
-    }
 
     synchronized(this) {
       val current = _logs.value.toMutableList()
-      val top = current.firstOrNull()
-      if (top != null && top.action == action && top.details == details && kotlin.math.abs(now - top.timestamp) < 500L) {
+      // Дедупликация одинаковых событий за последние 15 секунд, чтобы не копить повторы
+      val duplicateIdx = current.indexOfFirst {
+        it.action == action && (it.details == entry.details || kotlin.math.abs(now - it.timestamp) < 3_000L)
+      }
+      if (duplicateIdx >= 0 && kotlin.math.abs(now - current[duplicateIdx].timestamp) < 15_000L) {
         return
       }
       current.add(0, entry)
-      val trimmed = if (current.size > MAX_LOG_ENTRIES) current.take(MAX_LOG_ENTRIES) else current
+      val trimmed = trimPreservingChildQuota(current, MAX_LOG_ENTRIES)
       _logs.value = trimmed
-      persistLogsAsync(trimmed)
+      if (forceFlushDisk || (now - lastDiskFlushTimeMs >= DISK_FLUSH_INTERVAL_MS)) {
+        lastDiskFlushTimeMs = now
+        persistLogsAsync(trimmed)
+      }
     }
+  }
+
+  private fun trimPreservingChildQuota(entries: List<DebugLogEntry>, maxTotal: Int): List<DebugLogEntry> {
+    if (entries.size <= maxTotal) return entries.sortedByDescending { it.timestamp }
+    val sorted = entries.sortedByDescending { it.timestamp }
+    val childLogs = sorted.filter { it.source == "CHILD" || it.action.contains("РЕБЁНОК") }.take(RESERVED_CHILD_LOG_QUOTA)
+    val otherLimit = (maxTotal - childLogs.size).coerceAtLeast(maxTotal / 2)
+    val otherLogs = sorted.filterNot { it.source == "CHILD" || it.action.contains("РЕБЁНОК") }.take(otherLimit)
+    return (childLogs + otherLogs).sortedByDescending { it.timestamp }.take(maxTotal)
   }
 
   fun ingestRemoteChildLogs(childId: Long, arr: JSONArray, defaultChildVersion: String = BuildConfig.VERSION_NAME) {
@@ -196,13 +255,14 @@ object DeviceControlDebugger {
         val o = arr.optJSONObject(i) ?: continue
         val ts = o.optLong("ts", System.currentTimeMillis())
         val rawAct = o.optString("action", "CHILD_LOG")
-        val cleanAct = rawAct.removePrefix("📱 РЕБЁНОК #$childId • ").trim()
-        val det = o.optString("details", "")
+        val cleanAct = rawAct.removePrefix("📱").substringAfter("• ").trim().ifBlank { rawAct }
+        if (cleanAct in IGNORED_NOISY_ACTIONS) continue
+        val det = o.optString("details", "").take(240)
         val st = o.optString("status", "INFO")
         val ver = o.optString("ver", defaultChildVersion).ifBlank { defaultChildVersion }
         val prefixedAction = "📱 РЕБЁНОК #$childId • $cleanAct"
         val exists = current.any {
-          it.action == prefixedAction && it.details == det && kotlin.math.abs(it.timestamp - ts) < 1200L
+          it.action == prefixedAction && (it.details == det || kotlin.math.abs(it.timestamp - ts) < 2_500L)
         }
         if (!exists) {
           current.add(
@@ -220,9 +280,9 @@ object DeviceControlDebugger {
         }
       }
       if (added > 0) {
-        current.sortByDescending { it.timestamp }
-        val trimmed = if (current.size > MAX_LOG_ENTRIES) current.take(MAX_LOG_ENTRIES) else current
+        val trimmed = trimPreservingChildQuota(current, MAX_LOG_ENTRIES)
         _logs.value = trimmed
+        lastDiskFlushTimeMs = System.currentTimeMillis()
         persistLogsAsync(trimmed)
       }
     }
@@ -363,21 +423,26 @@ object DeviceControlDebugger {
       val loaded = mutableListOf<DebugLogEntry>()
       for (i in 0 until arr.length()) {
         val o = arr.optJSONObject(i) ?: continue
+        val rawAct = o.optString("action", "LOG")
+        val cleanAct = rawAct.removePrefix("📱").substringAfter("• ").trim()
+        if (rawAct in IGNORED_NOISY_ACTIONS || cleanAct in IGNORED_NOISY_ACTIONS) continue
         loaded.add(
           DebugLogEntry(
             id = o.optLong("id", System.nanoTime() + i),
             timestamp = o.optLong("ts", System.currentTimeMillis()),
             tag = TAG,
-            action = o.optString("action", "LOG"),
-            details = o.optString("details", ""),
+            action = rawAct,
+            details = o.optString("details", "").take(240),
             status = o.optString("status", "INFO"),
             source = o.optString("source", "LOCAL"),
             appVersion = o.optString("ver", BuildConfig.VERSION_NAME).ifBlank { BuildConfig.VERSION_NAME }
           )
         )
       }
-      if (loaded.isNotEmpty()) {
-        _logs.value = loaded.sortedByDescending { it.timestamp }.take(MAX_LOG_ENTRIES)
+      val trimmed = trimPreservingChildQuota(loaded, MAX_LOG_ENTRIES)
+      _logs.value = trimmed
+      if (loaded.size > MAX_PERSISTED_ENTRIES) {
+        persistLogsAsync(trimmed)
       }
     } catch (_: Exception) {}
   }

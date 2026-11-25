@@ -40,22 +40,149 @@ object DeviceUsageTracker {
     "com.android.packageinstaller",
     "com.google.android.packageinstaller",
     "com.samsung.android.packageinstaller",
-    "com.miui.packageinstaller"
+    "com.miui.packageinstaller",
+    "com.android.nfc",
+    "com.google.android.nfc",
+    "com.google.android.apps.walletnfcrel",
+    "com.google.android.apps.nbu.paisa.user",
+    "com.samsung.android.spay",
+    "com.samsung.android.spayfw",
+    "com.miui.tsmclient",
+    "com.xiaomi.payment",
+    "ru.nspk.mirpay"
+  )
+
+  private val NFC_PAYMENT_PACKAGES = listOf(
+    "com.android.nfc",
+    "com.google.android.nfc",
+    "com.google.android.apps.walletnfcrel",
+    "com.google.android.apps.nbu.paisa.user",
+    "com.samsung.android.spay",
+    "com.samsung.android.spayfw",
+    "com.miui.tsmclient",
+    "com.xiaomi.payment",
+    "ru.nspk.mirpay"
   )
 
   /**
+   * Возвращает true, если открыто окно бесконтактной оплаты NFC / Google Pay / Google Кошелёк / Mir Pay / Xiaomi Pay.
+   * В этот момент KidsGuard НЕ делает скриншотов, НЕ обходит дерево экрана и автоматически убирает плавающие оверлеи,
+   * чтобы защита PCI-DSS / Google Wallet не блокировала NFC-транзакцию на терминале.
+   */
+  fun isNfcOrPaymentPackage(packageName: String?, className: String? = null): Boolean {
+    if (packageName.isNullOrBlank()) return false
+    val lowerPkg = packageName.trim().lowercase(Locale.ROOT)
+    if (NFC_PAYMENT_PACKAGES.any { lowerPkg.startsWith(it) }) return true
+    if (lowerPkg.contains("walletnfcrel") || lowerPkg.contains("tapandpay") || lowerPkg == "com.android.nfc") return true
+    val lowerCls = className?.trim()?.lowercase(Locale.ROOT).orEmpty()
+    if (lowerPkg == "com.google.android.gms" && (
+        lowerCls.contains("tapandpay") ||
+        lowerCls.contains("pay") ||
+        lowerCls.contains("wallet") ||
+        lowerCls.contains("nfc")
+      )) {
+      return true
+    }
+    return false
+  }
+
+  /**
    * Explicit MDM Core Whitelist:
-   * Ensures KidsGuard and critical Android system/UI packages are NEVER blocked or killed
+   * Ensures KidsGuard and critical Android system/UI/NFC payment packages are NEVER blocked or killed
    * when the child's daily usage limit expires.
    */
   fun isWhitelistedCoreMdmPackage(context: Context, packageName: String?): Boolean {
     if (packageName.isNullOrBlank()) return true
     if (packageName == context.packageName) return true
     val lower = packageName.lowercase(Locale.ROOT)
-    if (lower.contains("kidsguard")) return true
+    if (lower == "android" || lower.contains("kidsguard")) return true
     if (WHITELISTED_SYSTEM_PREFIXES.any { lower.startsWith(it) }) return true
-    if (lower.contains("inputmethod") || lower.contains("keyboard") || lower.contains("latinime")) return true
+    if (lower.contains("systemui") || lower.contains("inputmethod") || lower.contains("keyboard") || lower.contains("latinime") || lower.contains("honeyboard")) return true
     return false
+  }
+
+  /**
+   * Возвращает true для любых системных оболочек, плагинов SystemUI, лаунчеров,
+   * процесса `android` («Система Android»), клавиатур, установщиков пакетов и служебных окон,
+   * чтобы они никогда не засоряли историю активности и список сайтов.
+   */
+  fun isSystemShellOrNoiseEntry(packageName: String?, labelOrTitle: String? = null): Boolean {
+    val pkg = packageName?.trim()?.lowercase(Locale.ROOT).orEmpty()
+    if (pkg.isBlank()) return true
+    if (!pkg.startsWith("web:")) {
+      if (pkg == "android" ||
+        pkg.contains("kidsguard") ||
+        pkg.contains("systemui") ||
+        pkg.contains("launcher") ||
+        pkg == "com.miui.home" ||
+        pkg == "com.mi.android.globallauncher" ||
+        pkg == "com.sec.android.app.launcher" ||
+        pkg == "com.google.android.apps.nexuslauncher" ||
+        pkg == "com.android.settings" ||
+        pkg == "com.miui.securitycenter" ||
+        pkg == "com.samsung.android.lool" ||
+        pkg == "com.samsung.android.app.cocktailbarservice" ||
+        pkg == "com.samsung.android.app.spage" ||
+        pkg.contains("packageinstaller") ||
+        pkg.contains("permissioncontroller") ||
+        pkg.contains("inputmethod") ||
+        pkg.contains("keyboard") ||
+        pkg.contains("latinime") ||
+        pkg.contains("honeyboard")
+      ) {
+        return true
+      }
+    }
+    val lbl = labelOrTitle?.trim()?.lowercase(Locale.ROOT).orEmpty()
+    if (lbl.isNotBlank() && !pkg.startsWith("web:")) {
+      val noiseLabels = listOf(
+        "системная оболочка",
+        "плагин пользовательского интерфейса",
+        "пользовательский интерфейс системы",
+        "интерфейс системы",
+        "система android",
+        "главный экран",
+        "рабочий стол",
+        "экран one ui",
+        "one ui home",
+        "system ui",
+        "android system",
+        "установщик пакетов",
+        "контроллер разрешений",
+        "permission controller"
+      )
+      if (noiseLabels.any { lbl.contains(it) }) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /**
+   * Очищает заголовок события окна от системных подписей ярлыков («Значок приложения», «App icon», «Кнопка» и т.д.).
+   */
+  fun sanitizeWindowEventTitle(rawTitle: String?, friendlyName: String): String? {
+    val cleaned = rawTitle?.trim().orEmpty()
+    if (cleaned.length !in 3..80) return null
+    if (cleaned.equals(friendlyName, ignoreCase = true)) return null
+    val lower = cleaned.lowercase(Locale.ROOT)
+    val ignoredSubstrings = listOf(
+      "значок приложения",
+      "иконка приложения",
+      "app icon",
+      "системная оболочка",
+      "плагин пользовательского интерфейса",
+      "система android",
+      "интерфейс системы",
+      "главный экран",
+      "рабочий стол",
+      "экран one ui",
+      "панель навигации",
+      "строка состояния",
+      "уведомление"
+    )
+    if (ignoredSubstrings.any { lower.contains(it) }) return null
+    return cleaned
   }
 
   /**
@@ -86,8 +213,9 @@ object DeviceUsageTracker {
     val todayIso = currentDateIso()
     val prefs = context.applicationContext.getSharedPreferences(DAILY_LIMIT_PREFS, Context.MODE_PRIVATE)
     val lastResetDate = prefs.getString(KEY_LAST_RESET_DATE_ISO, null)
+    val bootDate = BootPrefs.getUsageDateIso(context.applicationContext)
 
-    if (lastResetDate != todayIso) {
+    if (lastResetDate != todayIso || bootDate != todayIso) {
       val db = KidsGuardDatabase.getDatabase(context.applicationContext)
       val dao = db.kidsGuardDao()
       if (childId > 0L) {
@@ -97,6 +225,7 @@ object DeviceUsageTracker {
       dao.resetAllChildrenUsedScreenTimeToday()
       dao.resetAllAppsUsedMinutesTodayGlobal()
       prefs.edit().putString(KEY_LAST_RESET_DATE_ISO, todayIso).apply()
+      BootPrefs.setUsageDateIso(context.applicationContext, todayIso)
       Log.d(TAG, "Midnight 00:00 reset executed for date $todayIso (childId=$childId)")
       return true
     }
@@ -261,12 +390,20 @@ object DeviceUsageTracker {
         ensureDailyMidnightReset(context, childId)
         if (isWhitelistedCoreMdmPackage(context, packageName)) return@withContext
 
+        // Если выдано системное разрешение UsageStatsManager — используем точный расчёт из UsageEvents с 00:00,
+        // чтобы исключить двойное суммирование (recordAppSessionTime + syncRealUsageStats)!
+        if (DeviceSecurityPermissionHelper.hasUsageStatsPermission(context)) {
+          syncRealUsageStats(context, childId, force = false)
+          return@withContext
+        }
+
         val database = KidsGuardDatabase.getDatabase(context)
         val dao = database.kidsGuardDao()
         // CRITICAL (Phase 4B): Never insert or mutate local apps on the Parent's phone!
         val cfg = dao.getFamilyConfigOnce()
         if (cfg?.selectedRole != "CHILD") return@withContext
         val cloudSync = CloudSyncManager(context)
+        val bootBlocked = BootPrefs.getBlockedPackages(context)
 
         // 1. Update or insert app entity
         val app = dao.getAppByPackageOnce(childId, packageName)
@@ -281,9 +418,9 @@ object DeviceUsageTracker {
             appName = friendlyName,
             iconType = "generic",
             category = "Приложения",
-            dailyLimitMinutes = 0,
+            dailyLimitMinutes = BootPrefs.getAppLimitsMap(context)[packageName.trim().lowercase()] ?: 0,
             usedMinutesToday = minutesToAdd,
-            isBlocked = false
+            isBlocked = bootBlocked.contains(packageName.trim().lowercase())
           )
           dao.insertApp(newApp)
         }
@@ -311,6 +448,10 @@ object DeviceUsageTracker {
     withContext(Dispatchers.IO) {
       try {
         ensureDailyMidnightReset(context, childId)
+        if (DeviceSecurityPermissionHelper.hasUsageStatsPermission(context)) {
+          syncRealUsageStats(context, childId, force = false)
+          return@withContext
+        }
         val database = KidsGuardDatabase.getDatabase(context)
         val dao = database.kidsGuardDao()
         val cfg = dao.getFamilyConfigOnce()
@@ -335,16 +476,7 @@ object DeviceUsageTracker {
   private fun isSystemOrLauncherPackage(pkg: String, currentPkg: String, homePkg: String?): Boolean {
     if (pkg.isBlank()) return true
     if (pkg == currentPkg || pkg == homePkg) return true
-    val lower = pkg.lowercase()
-    return lower.startsWith("com.android.systemui") ||
-        lower.contains("launcher") ||
-        lower == "com.miui.home" ||
-        lower == "com.sec.android.app.launcher" ||
-        lower == "com.google.android.apps.nexuslauncher" ||
-        lower == "com.android.settings" ||
-        lower.contains("packageinstaller") ||
-        lower.contains("permissioncontroller") ||
-        lower == "com.miui.securitycenter"
+    return isSystemShellOrNoiseEntry(pkg)
   }
 
   @Volatile
@@ -411,14 +543,28 @@ object DeviceUsageTracker {
             }
           }
         }
+        // Если приложение открыто прямо сейчас на экране — учитываем текущую незавершённую сессию до текущего момента
+        if (isInteractive(context)) {
+          val curFgPkg = lastKnownPackage
+          if (!curFgPkg.isNullOrBlank()) {
+            val openResumeTs = activeStartByPkg.remove(curFgPkg)
+            if (openResumeTs != null && endTime > openResumeTs) {
+              val delta = (endTime - openResumeTs).coerceAtMost(30 * 60_000L)
+              fgDurationMsByPkg[curFgPkg] = (fgDurationMsByPkg[curFgPkg] ?: 0L) + delta
+            }
+          }
+        }
 
         val cloudSync = CloudSyncManager(context)
         val existingApps = dao.getAppsForChildOnce(childId)
+        val bootBlocked = BootPrefs.getBlockedPackages(context)
+        val bootLimits = BootPrefs.getAppLimitsMap(context)
         var totalScreenMinutes = 0
 
         val visitedPackages = mutableSetOf<String>()
         for (app in existingApps) {
           visitedPackages.add(app.packageName)
+          val pkgKey = app.packageName.trim().lowercase()
           val ms = if (isSystemOrLauncherPackage(app.packageName, currentPkg, homePkg) ||
               isWhitelistedCoreMdmPackage(context, app.packageName)) {
             0L
@@ -427,8 +573,16 @@ object DeviceUsageTracker {
           }
           val minutes = (ms / 60_000L).toInt()
           totalScreenMinutes += minutes
-          if (app.usedMinutesToday != minutes) {
-            dao.updateApp(app.copy(usedMinutesToday = minutes))
+          val preservedBlocked = app.isBlocked || bootBlocked.contains(pkgKey)
+          val preservedLimit = if (app.dailyLimitMinutes > 0) app.dailyLimitMinutes else (bootLimits[pkgKey] ?: 0)
+          if (app.usedMinutesToday != minutes || app.isBlocked != preservedBlocked || app.dailyLimitMinutes != preservedLimit) {
+            dao.updateApp(
+              app.copy(
+                usedMinutesToday = minutes,
+                isBlocked = preservedBlocked,
+                dailyLimitMinutes = preservedLimit
+              )
+            )
           }
         }
 
@@ -438,6 +592,7 @@ object DeviceUsageTracker {
           if (minutes > 0) {
             totalScreenMinutes += minutes
             val friendlyName = getFriendlyAppLabel(context, pkg, homePkg)
+            val pkgKey = pkg.trim().lowercase()
             dao.insertApp(
               AppControlEntity(
                 childId = childId,
@@ -445,9 +600,9 @@ object DeviceUsageTracker {
                 appName = friendlyName,
                 iconType = "generic",
                 category = "Приложения",
-                dailyLimitMinutes = 0,
+                dailyLimitMinutes = bootLimits[pkgKey] ?: 0,
                 usedMinutesToday = minutes,
-                isBlocked = false
+                isBlocked = bootBlocked.contains(pkgKey)
               )
             )
           }

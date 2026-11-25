@@ -185,23 +185,16 @@ object SosEmergencySender {
             ?: 1L
 
           // 1. Если окно блокировки было открыто для конкретного приложения —
-          // полностью разблокируем это приложение до новой блокировки родителем и синхронизируем с родителями!
+          // полностью разблокируем это приложение до новой блокировки родителем, синхронизируем с родителями и сразу открываем программу!
           val targetPkg = blockedPackageName?.trim()?.takeIf { it.isNotBlank() }
             ?: com.example.service.KidsGuardAccessibilityService.instance?.getCurrentBlockedOverlayPackage()
           if (!targetPkg.isNullOrBlank()) {
+            BootPrefs.saveBlockedPackage(appContext, targetPkg, false)
             com.example.service.KidsGuardAccessibilityService.instance?.unblockPackageLocallyByPin(targetPkg)
+            dao.setAppBlockedByPackageGlobal(targetPkg, false)
             val existingApp = dao.getAppByPackageOnce(boundId, targetPkg)
-            if (existingApp != null) {
-              dao.setAppBlocked(existingApp.id, false)
-              if (existingApp.dailyLimitMinutes > 0 && existingApp.usedMinutesToday >= existingApp.dailyLimitMinutes) {
-                dao.setAppLimit(existingApp.id, 0)
-              }
-            }
-            for (c in allChildren) {
-              val appForChild = dao.getAppByPackageOnce(c.id, targetPkg)
-              if (appForChild != null) {
-                dao.setAppBlocked(appForChild.id, false)
-              }
+            if (existingApp != null && existingApp.dailyLimitMinutes > 0 && existingApp.usedMinutesToday >= existingApp.dailyLimitMinutes) {
+              dao.setAppLimitByPackageGlobal(targetPkg, 0)
             }
             try {
               RealtimeCloudRelay.publishAppUpdate(
@@ -215,7 +208,7 @@ object SosEmergencySender {
             } catch (_: Exception) {}
             DeviceControlDebugger.logEvent(
               "РАЗБЛОКИРОВКА_ПО_PIN",
-              "Приложение «$targetPkg» полностью разблокировано PIN-кодом родителя и синхронизировано с родителями",
+              "Приложение «$targetPkg» разблокировано PIN-кодом родителя и запущено",
               "SUCCESS",
               "CHILD"
             )
@@ -236,6 +229,23 @@ object SosEmergencySender {
             triggerShortVibration(appContext)
             DeviceTotalLockManager.releaseTotalLock(appContext)
             onResult(true)
+            // Автоматически запускаем разблокированную программу сразу после снятия окна PIN-шлюза
+            if (!targetPkg.isNullOrBlank() && targetPkg != appContext.packageName) {
+              try {
+                val launchIntent = appContext.packageManager.getLaunchIntentForPackage(targetPkg)?.apply {
+                  addFlags(
+                    android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                      android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                      android.content.Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                  )
+                }
+                if (launchIntent != null) {
+                  appContext.startActivity(launchIntent)
+                }
+              } catch (e: Exception) {
+                Log.e(TAG, "Failed to auto-launch unlocked package $targetPkg: ${e.message}")
+              }
+            }
           }
         } else {
           CoroutineScope(Dispatchers.Main).launch {

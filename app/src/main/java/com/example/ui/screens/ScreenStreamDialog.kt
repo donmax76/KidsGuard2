@@ -345,6 +345,11 @@ fun ScreenStreamDialog(
     }
   }
 
+  val streamConfig = androidx.compose.ui.platform.LocalConfiguration.current
+  val isStreamLandscape =
+    streamConfig.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE ||
+      streamConfig.screenWidthDp > streamConfig.screenHeightDp
+
   Dialog(
     onDismissRequest = { stopAndClose() },
     properties = DialogProperties(
@@ -352,6 +357,30 @@ fun ScreenStreamDialog(
       decorFitsSystemWindows = false
     )
   ) {
+    val dialogView = androidx.compose.ui.platform.LocalView.current
+    DisposableEffect(dialogView, streamConfig.orientation, streamConfig.screenWidthDp, streamConfig.screenHeightDp) {
+      val dlgWindow = (dialogView.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window
+      dlgWindow?.setLayout(
+        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+        android.view.ViewGroup.LayoutParams.MATCH_PARENT
+      )
+      if (dlgWindow != null) {
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(dlgWindow, false)
+        val ctrl = androidx.core.view.WindowCompat.getInsetsController(dlgWindow, dialogView)
+        ctrl.systemBarsBehavior =
+          androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        ctrl.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+      }
+      onDispose {}
+    }
+
+    LaunchedEffect(isStreamLandscape) {
+      if (zoomScale <= 1.05f) {
+        panOffsetX = 0f
+        panOffsetY = 0f
+      }
+    }
+
     Surface(
       modifier = modifier
         .fillMaxSize()

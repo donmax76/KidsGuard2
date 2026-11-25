@@ -2039,24 +2039,42 @@ object PcBlockerClient {
                 )
               }
             }
-            for (t in uAct.titles) {
-              if (t.label.isNotBlank() && t.seconds > 0) {
-                dayLogs.add(
-                  OfflineActivityLogEntity(
-                    childId = childId,
-                    deviceType = "PC",
-                    packageName = "browser",
-                    appName = winUser,
-                    windowTitle = t.label.trim(),
-                    durationSeconds = t.seconds,
-                    hourOfDay = hour,
-                    dateIso = dateIso,
-                    timestamp = anchorTs,
-                    startedAtMs = t.startedAtMs,
-                    isSyncedToParent = true
-                  )
+            val mergedTitles = uAct.titles
+              .mapNotNull { t ->
+                val cleaned = normalizePcBrowserTitle(t.label)
+                if (cleaned.isNotBlank() && t.seconds > 0) {
+                  t.copy(label = cleaned)
+                } else null
+              }
+              .groupBy { t ->
+                val low = t.label.lowercase()
+                val primary = low.split(Regex("\\s+[-—|]\\s+")).firstOrNull()?.trim()?.takeIf { it.length >= 16 } ?: low
+                if (primary.length > 24) primary.take(24).trim() else primary
+              }
+              .map { (_, items) ->
+                val bestLabel = items.minByOrNull { it.label.length }?.label ?: items.first().label
+                PcActivityItem(
+                  label = bestLabel,
+                  seconds = items.sumOf { it.seconds },
+                  startedAtMs = items.mapNotNull { i -> i.startedAtMs.takeIf { it > 0L } }.maxOrNull() ?: 0L
                 )
               }
+            for (t in mergedTitles) {
+              dayLogs.add(
+                OfflineActivityLogEntity(
+                  childId = childId,
+                  deviceType = "PC",
+                  packageName = "browser",
+                  appName = winUser,
+                  windowTitle = t.label,
+                  durationSeconds = t.seconds,
+                  hourOfDay = hour,
+                  dateIso = dateIso,
+                  timestamp = anchorTs,
+                  startedAtMs = t.startedAtMs,
+                  isSyncedToParent = true
+                )
+              )
             }
           }
           dao.replacePcActivitySnapshotForDate(childId, dateIso, dayLogs)
@@ -2064,5 +2082,35 @@ object PcBlockerClient {
         }
       } catch (_: Exception) {}
     }
+  }
+
+  private fun normalizePcBrowserTitle(rawTitle: String): String {
+    var t = rawTitle.trim()
+    t = t.replace(Regex("^([(\\[\\{]\\d+[)\\]\\}]\\s*|•\\s*)+"), "").trim()
+    val suffixes = listOf(
+      " - Google Chrome", " — Google Chrome",
+      " - Microsoft\u200B Edge", " - Microsoft Edge", " — Microsoft Edge",
+      " — Яндекс Браузер", " - Яндекс Браузер", " — Яндекс.Браузер", " - Яндекс.Браузер",
+      " - Yandex", " — Yandex", " - Yandex Browser", " — Yandex Browser",
+      " - Opera", " — Opera", " - Opera GX", " — Opera GX",
+      " - Mozilla Firefox", " — Mozilla Firefox",
+      " - Brave", " — Brave", " - Vivaldi", " — Vivaldi"
+    )
+    var stripped = true
+    while (stripped) {
+      stripped = false
+      for (s in suffixes) {
+        if (t.endsWith(s, ignoreCase = true)) {
+          t = t.dropLast(s.length).trim()
+          stripped = true
+        }
+      }
+    }
+    val chapterRegex = Regex("(?i)^(.{10,}?)\\s*(?:[-—|/:•]\\s*)?(?:глава|гл\\.|том|часть|серия|сезон|эпизод|стр\\.|страница|chapter|ep\\.|episode|ch\\.|vol\\.)\\s*\\d+.*$")
+    val chapterMatch = chapterRegex.find(t)
+    if (chapterMatch != null) {
+      t = chapterMatch.groupValues[1].trim().trimEnd('-', '—', '|', ':', '/', '•', ',')
+    }
+    return t.replace(Regex("\\s+"), " ").trim()
   }
 }

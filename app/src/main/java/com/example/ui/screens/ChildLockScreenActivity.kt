@@ -44,15 +44,15 @@ class ChildLockScreenActivity : ComponentActivity() {
         "Доступ к приложению ограничен родительским контролем KidsGuard."
       }
 
-    // If system overlay permission is granted, use the single static overlay instead of a competing Activity
-    if (Settings.canDrawOverlays(applicationContext) &&
+    // При блокировке конкретного приложения ChildLockScreenActivity ВСЕГДА остаётся на вершине стека,
+    // чтобы Android перевёл заблокированное приложение в onStop() и уничтожил его видео-поверхность,
+    // не позволяя смотреть видео в уменьшенном окне или карусели Недавних!
+    if (!isTotalLock && !blockedPkg.isNullOrBlank()) {
+      com.example.service.KidsGuardAccessibilityService.killBlockedPackageCompletely(applicationContext, blockedPkg)
+    } else if (isTotalLock && Settings.canDrawOverlays(applicationContext) &&
         com.example.service.KidsGuardAccessibilityService.instance != null) {
       isUnlocked = true
-      if (isTotalLock) {
-        com.example.service.KidsGuardAccessibilityService.instance?.enforceTotalLockFromService(reason)
-      } else {
-        com.example.service.KidsGuardAccessibilityService.instance?.enforceAppOrLimitBlockFromService(reason, blockedPkg)
-      }
+      com.example.service.KidsGuardAccessibilityService.instance?.enforceTotalLockFromService(reason)
       finish()
       return
     }
@@ -79,6 +79,10 @@ class ChildLockScreenActivity : ComponentActivity() {
       onCloseToHome = if (!isTotalLock) {
         {
           isUnlocked = true
+          if (!blockedPkg.isNullOrBlank()) {
+            com.example.service.KidsGuardAccessibilityService.killBlockedPackageCompletely(applicationContext, blockedPkg)
+          }
+          com.example.service.KidsGuardAccessibilityService.instance?.dismissOverlayFromGatekeeperActivity()
           try {
             val homeIntent = Intent(Intent.ACTION_MAIN).apply {
               addCategory(Intent.CATEGORY_HOME)
@@ -91,8 +95,20 @@ class ChildLockScreenActivity : ComponentActivity() {
       } else null,
       onUnlocked = {
         isUnlocked = true
+        com.example.service.KidsGuardAccessibilityService.instance?.dismissOverlayFromGatekeeperActivity()
         if (isTotalLock) {
           DeviceTotalLockManager.releaseTotalLock(applicationContext)
+        } else if (!blockedPkg.isNullOrBlank()) {
+          // После ввода PIN-кода родителя открываем запрошенную программу
+          com.example.service.KidsGuardAccessibilityService.instance?.grantTemporaryPinUnlockForPackage(blockedPkg)
+          try {
+            val launchIntent = packageManager.getLaunchIntentForPackage(blockedPkg)?.apply {
+              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+            if (launchIntent != null) {
+              startActivity(launchIntent)
+            }
+          } catch (_: Exception) {}
         }
         finishAndRemoveTask()
       }
@@ -199,16 +215,16 @@ class ChildLockScreenActivity : ComponentActivity() {
       isDeviceTotalLock: Boolean = true,
       blockedPackageName: String? = null
     ) {
-      if (Settings.canDrawOverlays(context.applicationContext) &&
+      if (isDeviceTotalLock &&
+          Settings.canDrawOverlays(context.applicationContext) &&
           com.example.service.KidsGuardAccessibilityService.instance != null) {
-        if (isDeviceTotalLock) {
-          com.example.service.KidsGuardAccessibilityService.instance?.enforceTotalLockFromService(reason)
-        } else {
-          com.example.service.KidsGuardAccessibilityService.instance?.enforceAppOrLimitBlockFromService(reason, blockedPackageName)
-        }
+        com.example.service.KidsGuardAccessibilityService.instance?.enforceTotalLockFromService(reason)
         return
       }
       if (!isDeviceTotalLock) {
+        if (!blockedPackageName.isNullOrBlank()) {
+          com.example.service.KidsGuardAccessibilityService.killBlockedPackageCompletely(context.applicationContext, blockedPackageName)
+        }
         try {
           val homeIntent = Intent(Intent.ACTION_MAIN).apply {
             addCategory(Intent.CATEGORY_HOME)
@@ -227,10 +243,13 @@ class ChildLockScreenActivity : ComponentActivity() {
           Intent.FLAG_ACTIVITY_NEW_TASK or
               Intent.FLAG_ACTIVITY_CLEAR_TOP or
               Intent.FLAG_ACTIVITY_SINGLE_TOP or
+              Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
               Intent.FLAG_ACTIVITY_NO_ANIMATION
         )
       }
-      context.startActivity(intent)
+      try {
+        context.startActivity(intent)
+      } catch (_: Exception) {}
     }
   }
 }

@@ -59,10 +59,15 @@ class BootCompletedReceiver : BroadcastReceiver() {
             try {
               // Ensure no overlay blocks the PackageInstaller button (Android tapjacking protection)
               LockOverlayService.stop(appContext)
-              KidsGuardAccessibilityService.instance?.prepareForSilentUpdate()
               confirmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-              appContext.startActivity(confirmIntent)
-              Log.i(TAG, "Launched PackageInstaller STATUS_PENDING_USER_ACTION confirmation intent for Accessibility auto-clicker")
+              ApkUpdateInstaller.showInstallReadyNotification(appContext, confirmIntent)
+              val a11ySvc = KidsGuardAccessibilityService.instance
+              val launchedViaA11y = a11ySvc?.launchInstallerIntentFromAccessibility(confirmIntent) == true
+              if (!launchedViaA11y) {
+                a11ySvc?.prepareForSilentUpdate()
+                appContext.startActivity(confirmIntent)
+              }
+              Log.i(TAG, "Launched PackageInstaller STATUS_PENDING_USER_ACTION confirmation intent (viaA11y=$launchedViaA11y)")
             } catch (e: Exception) {
               Log.e(TAG, "Failed launching confirmIntent: ${e.message}", e)
               DeviceControlDebugger.logEvent("OTA_CONFIRM_INTENT_ERROR", "Ошибка запуска окна подтверждения: ${e.message}", "ERROR")
@@ -210,9 +215,23 @@ class BootCompletedReceiver : BroadcastReceiver() {
             ?: dao.getAllChildrenOnce().firstOrNull()?.id
             ?: 1L
 
-          // Обновляем device-protected boot-конфиг для следующей перезагрузки.
+          // Обновляем device-protected boot-конфиг и кэш кода пары для мгновенного фонового соединения без открытия окна приложения
+          val bootChild = dao.getChildByIdOnce(childId) ?: dao.getAllChildrenOnce().firstOrNull()
           try {
-            val bootChild = dao.getChildByIdOnce(childId)
+            val resolvedCode = bootChild?.pairingCode?.trim()?.takeIf { it.length >= 6 }
+              ?: com.example.util.BootPrefs.getPairingCode(appContext)
+            if (resolvedCode.length >= 6) {
+              com.example.util.BootPrefs.savePairingCode(appContext, resolvedCode)
+            }
+            if (bootChild != null) {
+              com.example.data.cloud.RealtimeCloudRelay.replaceCachedChildProfile(
+                if (resolvedCode.length >= 6 && bootChild.pairingCode != resolvedCode) {
+                  bootChild.copy(pairingCode = resolvedCode, isPaired = true)
+                } else {
+                  bootChild
+                }
+              )
+            }
             com.example.util.BootPrefs.save(
               context = appContext,
               role = "CHILD",
@@ -231,9 +250,10 @@ class BootCompletedReceiver : BroadcastReceiver() {
 
           Log.i(TAG, "Child device restored on boot/update for Child ID: $childId (unifiedVer=$unifiedBuildVer, apk=$apkVer)")
 
-          // 1. Ensure P2P Socket Engine is running in CHILD role
+          // 1. Ensure P2P Socket Engine is running in CHILD role and wakes immediately
           com.example.data.cloud.DirectP2pSocketEngine.appContext = appContext
           DirectP2pSocketEngine.startEngine("CHILD", childId)
+          DirectP2pSocketEngine.ensureConnectedAndWake()
 
           // 2. Update local DB version & clear updatePending flag
           dao.updateChildAppVersion(childId, apkVer)
@@ -243,7 +263,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
           val liveStreamEnabled = com.example.util.ScreenShotManager.isLiveStreamEnabled(appContext)
           KidsGuardBackgroundService.start(appContext, childId, enableProjectionFgs = liveStreamEnabled)
 
-          // 4. Push updated APK version, battery, and completion alert to Parent phone
+          // 4. Push updated APK version, battery, PONG, and initial screen image to Parent phone
           try {
             val cloudSync = CloudSyncManager(appContext)
             cloudSync.syncChildAppVersion(childId, apkVer)
@@ -251,16 +271,17 @@ class BootCompletedReceiver : BroadcastReceiver() {
             dao.updateChildBattery(childId, batt)
             cloudSync.upsertBatteryLevel(childId, batt)
 
-            val child = dao.getChildByIdOnce(childId)
+            val child = dao.getChildByIdOnce(childId) ?: bootChild
             if (child != null) {
-              cloudSync.upsertChildProfile(
-                child.copy(
-                  appVersion = unifiedBuildVer,
-                  updatePending = false,
-                  batteryLevel = batt
-                )
+              val updatedChild = child.copy(
+                appVersion = unifiedBuildVer,
+                updatePending = false,
+                batteryLevel = batt
               )
+              com.example.data.cloud.RealtimeCloudRelay.replaceCachedChildProfile(updatedChild)
+              cloudSync.upsertChildProfile(updatedChild)
             }
+            com.example.data.cloud.RealtimeCloudRelay.publishChildPong(childId)
 
             if (isPackageReplacedOrSuccess) {
               val childName = child?.name ?: "Ребёнок #$childId"
@@ -288,12 +309,17 @@ class BootCompletedReceiver : BroadcastReceiver() {
             ChildLockScreenActivity.launch(appContext, "Телефон заблокирован родителем!\nПерезагрузка не отменяет блокировку.")
           }
 
-          // 6. Second-pass Accessibility watchdog: if AccessibilityService is still not bound 2.5s after OTA, re-trigger restore
-          kotlinx.coroutines.delay(2500L)
+          // 6. Second-pass Accessibility watchdog & immediate screen capture so parent gets image right away
+          kotlinx.coroutines.delay(1500L)
           if (KidsGuardAccessibilityService.instance == null) {
-            Log.w(TAG, "AccessibilityService not yet bound 2.5s after OTA/boot; running second-pass restoreAccessibilityServiceAfterOta")
+            Log.w(TAG, "AccessibilityService not yet bound 1.5s after OTA/boot; running second-pass restoreAccessibilityServiceAfterOta")
             com.example.util.DeviceSecurityPermissionHelper.restoreAccessibilityServiceAfterOta(appContext)
           }
+          com.example.data.cloud.RealtimeCloudRelay.publishChildPong(childId)
+          KidsGuardAccessibilityService.instance?.triggerImmediateCaptureNow()
+          kotlinx.coroutines.delay(2500L)
+          com.example.data.cloud.RealtimeCloudRelay.publishChildPong(childId)
+          KidsGuardAccessibilityService.instance?.triggerImmediateCaptureNow()
         }
       } catch (e: Exception) {
         Log.e(TAG, "Error handling boot/update restore: ${e.message}")

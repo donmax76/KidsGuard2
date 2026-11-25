@@ -35,6 +35,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -67,15 +68,19 @@ import com.example.ui.theme.Slate800
 import com.example.ui.theme.Slate900
 import kotlin.math.atan2
 import kotlin.math.hypot
+import kotlinx.coroutines.launch
 
 data class AppUsageChartSlice(
   val appId: Long,
+  val packageName: String,
   val appName: String,
   val category: String,
   val minutes: Int,
   val limitMinutes: Int,
   val isBlocked: Boolean,
   val sharePercent: Float,
+  val lastActivityTimestampMs: Long,
+  val latestWindowTitle: String,
   val color: Color
 )
 
@@ -94,40 +99,244 @@ private val chartPalette = listOf(
 fun AppUsageDistributionChartCard(
   apps: List<AppControlEntity>,
   totalChildUsedMinutes: Int = 0,
+  childId: Long = 0L,
   onSyncUsage: (() -> Unit)? = null,
   onToggleAppBlock: ((AppControlEntity) -> Unit)? = null,
   modifier: Modifier = Modifier
 ) {
+  val context = androidx.compose.ui.platform.LocalContext.current
+  val dao = remember(context) { com.example.data.local.KidsGuardDatabase.getDatabase(context).kidsGuardDao() }
+  val scope = androidx.compose.runtime.rememberCoroutineScope()
+
   // 0 = Donut / Pie Chart, 1 = Comparative Bar Chart
   var chartMode by remember { mutableIntStateOf(0) }
   var selectedSliceIndex by remember { mutableIntStateOf(-1) }
 
-  val slices: List<AppUsageChartSlice> = remember(apps, totalChildUsedMinutes) {
-    val activeApps = apps.filter { it.usedMinutesToday > 0 }.sortedByDescending { it.usedMinutesToday }
-    val sourceList = if (activeApps.isNotEmpty()) {
-      activeApps.take(7)
-    } else {
-      emptyList()
-    }
+  // Фильтр даты: 0 = Сегодня, 1 = Вчера, 2 = Выбранная дата
+  var dateFilterMode by remember { mutableIntStateOf(0) }
+  var customSelectedTimeMs by remember { androidx.compose.runtime.mutableLongStateOf(System.currentTimeMillis()) }
 
+  // Фильтр интервала времени внутри выбранной даты (например, с 00:00 по 02:00):
+  var filterStartHour by remember { mutableIntStateOf(0) }
+  var filterStartMinute by remember { mutableIntStateOf(0) }
+  var filterEndHour by remember { mutableIntStateOf(23) }
+  var filterEndMinute by remember { mutableIntStateOf(59) }
+
+  // 0 = Все (программы + сайты), 1 = Только сайты браузеров, 2 = Только программы
+  var logTypeTab by remember { mutableIntStateOf(0) }
+
+  val isFullDayInterval = filterStartHour == 0 && filterStartMinute == 0 && filterEndHour == 23 && filterEndMinute == 59
+
+  val resolvedChildId = remember(childId, apps) {
+    if (childId > 0L) childId else (apps.firstOrNull()?.childId ?: 1L)
+  }
+
+  val (startDayMs, endDayMs, selectedDateLabel) = remember(
+    dateFilterMode,
+    customSelectedTimeMs,
+    filterStartHour,
+    filterStartMinute,
+    filterEndHour,
+    filterEndMinute
+  ) {
+    val cal = java.util.Calendar.getInstance()
+    when (dateFilterMode) {
+      1 -> cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+      2 -> cal.timeInMillis = customSelectedTimeMs
+    }
+    cal.set(java.util.Calendar.HOUR_OF_DAY, filterStartHour)
+    cal.set(java.util.Calendar.MINUTE, filterStartMinute)
+    cal.set(java.util.Calendar.SECOND, 0)
+    cal.set(java.util.Calendar.MILLISECOND, 0)
+    val startMs = cal.timeInMillis
+
+    cal.set(java.util.Calendar.HOUR_OF_DAY, filterEndHour)
+    cal.set(java.util.Calendar.MINUTE, filterEndMinute)
+    cal.set(java.util.Calendar.SECOND, 59)
+    cal.set(java.util.Calendar.MILLISECOND, 999)
+    val endMs = cal.timeInMillis.coerceAtLeast(startMs)
+
+    val fmt = java.text.SimpleDateFormat("dd.MM.yyyy", java.util.Locale.getDefault())
+    val timeRangeText = "%02d:%02d–%02d:%02d".format(filterStartHour, filterStartMinute, filterEndHour, filterEndMinute)
+    val baseLabel = when (dateFilterMode) {
+      0 -> "Сегодня (${fmt.format(java.util.Date(startMs))})"
+      1 -> "Вчера (${fmt.format(java.util.Date(startMs))})"
+      else -> fmt.format(java.util.Date(startMs))
+    }
+    Triple(startMs, endMs, "$baseLabel • $timeRangeText")
+  }
+
+  androidx.compose.runtime.LaunchedEffect(resolvedChildId) {
+    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+      runCatching {
+        dao.purgeSystemGarbageFromActivityLogs()
+        dao.cleanAppIconNoiseInActivityLogs()
+        dao.deduplicateOfflineActivityLogs()
+        dao.purgeSystemGarbageFromAppControls()
+      }
+    }
+  }
+
+  val historicalPhoneProcs by remember(resolvedChildId, startDayMs, endDayMs) {
+    dao.getAggregatedProcsByDateRange(
+      childId = resolvedChildId,
+      deviceType = "PHONE",
+      startTimestamp = startDayMs,
+      endTimestamp = endDayMs
+    )
+  }.collectAsState(initial = emptyList())
+
+  val rawIntervalLogs by remember(resolvedChildId, startDayMs, endDayMs) {
+    dao.getActivityLogsByDateRange(
+      childId = resolvedChildId,
+      deviceType = "PHONE",
+      startTimestamp = startDayMs,
+      endTimestamp = endDayMs
+    )
+  }.collectAsState(initial = emptyList())
+
+  val contentRules by remember(resolvedChildId) {
+    dao.getAllContentRules()
+  }.collectAsState(initial = emptyList())
+
+  val blockedDomainsSet = remember(contentRules) {
+    contentRules
+      .filter { it.ruleType == "DOMAIN" && it.isBlocked }
+      .map { com.example.util.BootPrefs.normalizeDomain(it.value) }
+      .filter { it.isNotBlank() }
+      .toSet()
+  }
+
+  val dateTimeFormatter = remember {
+    java.text.SimpleDateFormat("dd.MM.yyyy HH:mm:ss", java.util.Locale.getDefault())
+  }
+
+  val procByPkgMap = remember(historicalPhoneProcs) {
+    historicalPhoneProcs.associateBy { it.packageName.trim().lowercase() }
+  }
+
+  val effectiveAppsForDate: List<AppControlEntity> = remember(
+    apps,
+    dateFilterMode,
+    isFullDayInterval,
+    historicalPhoneProcs,
+    resolvedChildId
+  ) {
+    val byPkg = apps.associateBy { it.packageName.trim().lowercase() }
+    if (dateFilterMode == 0 && isFullDayInterval) {
+      if (apps.any { it.usedMinutesToday > 0 } && historicalPhoneProcs.isEmpty()) {
+        apps
+      } else {
+        val fromProcs = historicalPhoneProcs.mapIndexed { idx, item ->
+          val pkgKey = item.packageName.trim().lowercase()
+          val existing = byPkg[pkgKey]
+          val isWeb = pkgKey.startsWith("web:")
+          val webDomain = if (isWeb) com.example.util.BootPrefs.normalizeDomain(pkgKey.removePrefix("web:")) else ""
+          val mins = maxOf(
+            ((item.totalDurationSeconds + 30L) / 60L).toInt().coerceAtLeast(1),
+            existing?.usedMinutesToday ?: 0
+          )
+          existing?.copy(usedMinutesToday = mins) ?: AppControlEntity(
+            id = (idx + 1000).toLong(),
+            childId = resolvedChildId,
+            packageName = item.packageName,
+            appName = item.appName.ifBlank { item.packageName },
+            category = if (isWeb) "🌐 Сайт браузера" else "Телефон",
+            dailyLimitMinutes = 0,
+            usedMinutesToday = mins,
+            isBlocked = if (isWeb) (webDomain in blockedDomainsSet) else false,
+            iconType = if (isWeb) "web" else "generic"
+          )
+        }
+        val procKeys = fromProcs.map { it.packageName.trim().lowercase() }.toSet()
+        val extraTodayApps = apps.filter { it.usedMinutesToday > 0 && it.packageName.trim().lowercase() !in procKeys }
+        fromProcs + extraTodayApps
+      }
+    } else {
+      // Вчера, выбранная дата или заданный интервал времени (например, 00:00–02:00) — строго за интервал [startDayMs, endDayMs]
+      historicalPhoneProcs.mapIndexed { idx, item ->
+        val pkgKey = item.packageName.trim().lowercase()
+        val existing = byPkg[pkgKey]
+        val isWeb = pkgKey.startsWith("web:")
+        val webDomain = if (isWeb) com.example.util.BootPrefs.normalizeDomain(pkgKey.removePrefix("web:")) else ""
+        val mins = ((item.totalDurationSeconds + 30L) / 60L).toInt().coerceAtLeast(1)
+        existing?.copy(usedMinutesToday = mins) ?: AppControlEntity(
+          id = (idx + 2000).toLong(),
+          childId = resolvedChildId,
+          packageName = item.packageName,
+          appName = item.appName.ifBlank { item.packageName },
+          category = if (isWeb) "🌐 Сайт браузера" else "Телефон",
+          dailyLimitMinutes = 0,
+          usedMinutesToday = mins,
+          isBlocked = if (isWeb) (webDomain in blockedDomainsSet) else false,
+          iconType = if (isWeb) "web" else "generic"
+        )
+      }
+    }
+  }
+
+  val slices: List<AppUsageChartSlice> = remember(
+    effectiveAppsForDate,
+    procByPkgMap,
+    blockedDomainsSet,
+    logTypeTab
+  ) {
+    val filteredByType = effectiveAppsForDate.filter { app ->
+      val isWeb = app.packageName.startsWith("web:", ignoreCase = true)
+      val isNoise = !isWeb && com.example.util.DeviceUsageTracker.isSystemShellOrNoiseEntry(
+        app.packageName,
+        app.appName
+      )
+      if (isNoise) return@filter false
+      when (logTypeTab) {
+        1 -> isWeb
+        2 -> !isWeb
+        else -> true
+      }
+    }
+    val activeApps = filteredByType
+      .filter { it.usedMinutesToday > 0 }
+      .sortedWith(
+        compareByDescending<AppControlEntity> {
+          procByPkgMap[it.packageName.trim().lowercase()]?.lastTimestamp ?: 0L
+        }.thenByDescending { it.usedMinutesToday }
+      )
+    val sourceList = activeApps.take(15)
     val sumMins = sourceList.sumOf { it.usedMinutesToday }.coerceAtLeast(1)
     sourceList.mapIndexed { index, app ->
+      val pkgKey = app.packageName.trim().lowercase()
+      val procMeta = procByPkgMap[pkgKey]
+      val isWeb = pkgKey.startsWith("web:")
+      val webDom = if (isWeb) com.example.util.BootPrefs.normalizeDomain(pkgKey.removePrefix("web:")) else ""
+      val rawWinTitle = procMeta?.windowTitle.orEmpty()
+      val cleanWinTitle = if (isWeb) {
+        rawWinTitle
+      } else {
+        com.example.util.DeviceUsageTracker.sanitizeWindowEventTitle(rawWinTitle, app.appName).orEmpty()
+      }
       AppUsageChartSlice(
         appId = app.id,
+        packageName = app.packageName,
         appName = app.appName,
-        category = app.category,
+        category = if (isWeb) "🌐 Веб-сайт" else app.category,
         minutes = app.usedMinutesToday,
         limitMinutes = app.dailyLimitMinutes,
-        isBlocked = app.isBlocked,
+        isBlocked = if (isWeb) (webDom in blockedDomainsSet) else app.isBlocked,
         sharePercent = (app.usedMinutesToday.toFloat() / sumMins.toFloat()) * 100f,
+        lastActivityTimestampMs = procMeta?.lastTimestamp ?: 0L,
+        latestWindowTitle = cleanWinTitle,
         color = chartPalette[index % chartPalette.size]
       )
     }
   }
 
-  val totalChartMinutes = remember(slices, totalChildUsedMinutes) {
+  val totalChartMinutes = remember(slices, totalChildUsedMinutes, dateFilterMode, isFullDayInterval) {
     val sum = slices.sumOf { it.minutes }
-    if (sum > 0) sum else totalChildUsedMinutes
+    if (dateFilterMode == 0 && isFullDayInterval) {
+      if (sum > 0) sum else totalChildUsedMinutes
+    } else {
+      sum
+    }
   }
 
   val animProgress by animateFloatAsState(
@@ -135,6 +344,41 @@ fun AppUsageDistributionChartCard(
     animationSpec = tween(durationMillis = 700, easing = FastOutSlowInEasing),
     label = "ChartAnimProgress"
   )
+
+  fun toggleWebsiteDomainBlock(rawDomain: String) {
+    val cleanDomain = com.example.util.BootPrefs.normalizeDomain(rawDomain)
+    if (cleanDomain.isBlank() || !cleanDomain.contains(".")) return
+    val currentlyBlocked = cleanDomain in blockedDomainsSet
+    val nextBlocked = !currentlyBlocked
+    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+      val sync = com.example.data.cloud.CloudSyncManager(context)
+      if (nextBlocked) {
+        val existing = dao.getAllContentRulesOnce()
+          .firstOrNull { it.ruleType == "DOMAIN" && com.example.util.BootPrefs.normalizeDomain(it.value) == cleanDomain }
+        if (existing == null) {
+          dao.insertContentRule(
+            com.example.data.model.ContentRuleEntity(
+              ruleType = "DOMAIN",
+              value = cleanDomain,
+              displayName = "🌐 $cleanDomain",
+              isBlocked = true
+            )
+          )
+        } else {
+          dao.updateContentRule(existing.copy(isBlocked = true))
+        }
+        sync.sendRemoteCommand(resolvedChildId, "BLOCK_DOMAIN", cleanDomain)
+      } else {
+        val matches = dao.getAllContentRulesOnce()
+          .filter { it.ruleType == "DOMAIN" && com.example.util.BootPrefs.normalizeDomain(it.value) == cleanDomain }
+        for (rule in matches) {
+          dao.deleteContentRule(rule)
+        }
+        sync.sendRemoteCommand(resolvedChildId, "UNBLOCK_DOMAIN", cleanDomain)
+      }
+      sync.syncContentRulesToCloud(dao.getAllContentRulesOnce())
+    }
+  }
 
   Card(
     modifier = modifier
@@ -162,15 +406,16 @@ fun AppUsageDistributionChartCard(
       ) {
         Column(modifier = Modifier.weight(1f)) {
           Text(
-            text = "Распределение времени по приложениям",
+            text = "Активность программ и сайтов (Дата + Время)",
             color = Color.White,
             fontSize = 15.sp,
             fontWeight = FontWeight.ExtraBold
           )
           Text(
-            text = "Статистика за текущий день • Всего: ${totalChartMinutes / 60} ч ${totalChartMinutes % 60} мин",
-            color = Slate400,
-            fontSize = 11.sp
+            text = "$selectedDateLabel • Активность: ${totalChartMinutes / 60} ч ${totalChartMinutes % 60} мин",
+            color = CyanLight,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold
           )
         }
 
@@ -230,9 +475,258 @@ fun AppUsageDistributionChartCard(
         }
       }
 
-      Spacer(modifier = Modifier.height(14.dp))
+      Spacer(modifier = Modifier.height(10.dp))
 
-      if (slices.isEmpty()) {
+      // 1. Панель выбора ДАТЫ (Сегодня / Вчера / Выбор даты в календаре)
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        val dateModes = listOf(0 to "Сегодня", 1 to "Вчера")
+        dateModes.forEach { (modeIdx, title) ->
+          val isSelected = dateFilterMode == modeIdx
+          Box(
+            modifier = Modifier
+              .weight(1f)
+              .clip(RoundedCornerShape(10.dp))
+              .background(if (isSelected) CyanContainer else Color(0xFF131F33))
+              .border(1.dp, if (isSelected) CyanLight else Slate800, RoundedCornerShape(10.dp))
+              .clickable {
+                dateFilterMode = modeIdx
+                selectedSliceIndex = -1
+              }
+              .padding(vertical = 7.dp),
+            contentAlignment = Alignment.Center
+          ) {
+            Text(
+              text = title,
+              color = if (isSelected) CyanLight else Slate200,
+              fontSize = 11.sp,
+              fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium,
+              maxLines = 1
+            )
+          }
+        }
+
+        val isCustomDate = dateFilterMode == 2
+        val customBtnText = if (isCustomDate) {
+          "📅 " + java.text.SimpleDateFormat("dd.MM.yy", java.util.Locale.getDefault()).format(java.util.Date(customSelectedTimeMs))
+        } else {
+          "📅 Дата"
+        }
+        Box(
+          modifier = Modifier
+            .weight(0.95f)
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (isCustomDate) CyanContainer else Color(0xFF131F33))
+            .border(1.dp, if (isCustomDate) CyanLight else Slate800, RoundedCornerShape(10.dp))
+            .clickable {
+              val cal = java.util.Calendar.getInstance().apply { timeInMillis = customSelectedTimeMs }
+              android.app.DatePickerDialog(
+                context,
+                { _, year, month, dayOfMonth ->
+                  val picked = java.util.Calendar.getInstance().apply {
+                    set(java.util.Calendar.YEAR, year)
+                    set(java.util.Calendar.MONTH, month)
+                    set(java.util.Calendar.DAY_OF_MONTH, dayOfMonth)
+                  }
+                  customSelectedTimeMs = picked.timeInMillis
+                  dateFilterMode = 2
+                  selectedSliceIndex = -1
+                },
+                cal.get(java.util.Calendar.YEAR),
+                cal.get(java.util.Calendar.MONTH),
+                cal.get(java.util.Calendar.DAY_OF_MONTH)
+              ).apply {
+                datePicker.maxDate = System.currentTimeMillis()
+              }.show()
+            }
+            .padding(vertical = 7.dp),
+          contentAlignment = Alignment.Center
+        ) {
+          Text(
+            text = customBtnText,
+            color = if (isCustomDate) CyanLight else Slate200,
+            fontSize = 11.sp,
+            fontWeight = if (isCustomDate) FontWeight.ExtraBold else FontWeight.Medium,
+            maxLines = 1
+          )
+        }
+      }
+
+      Spacer(modifier = Modifier.height(8.dp))
+
+      // 2. Панель выбора ИНТЕРВАЛА ВРЕМЕНИ (например, 00:00–02:00 или точный выбор часов/минут С ЧЧ:ММ по ЧЧ:ММ)
+      Column(
+        modifier = Modifier
+          .fillMaxWidth()
+          .clip(RoundedCornerShape(12.dp))
+          .background(Color(0xFF111C2E))
+          .border(1.dp, Slate800, RoundedCornerShape(12.dp))
+          .padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+      ) {
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(6.dp),
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          Text(
+            text = "🕒 Интервал:",
+            color = Slate200,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold
+          )
+          // Кнопка выбора начала интервала (С ЧЧ:ММ)
+          Box(
+            modifier = Modifier
+              .weight(1f)
+              .clip(RoundedCornerShape(8.dp))
+              .background(Color(0xFF16243A))
+              .border(1.dp, CyanLight.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+              .clickable {
+                android.app.TimePickerDialog(
+                  context,
+                  { _, hourOfDay, minute ->
+                    filterStartHour = hourOfDay
+                    filterStartMinute = minute
+                    selectedSliceIndex = -1
+                  },
+                  filterStartHour,
+                  filterStartMinute,
+                  true
+                ).show()
+              }
+              .padding(vertical = 5.dp),
+            contentAlignment = Alignment.Center
+          ) {
+            Text(
+              text = "С %02d:%02d".format(filterStartHour, filterStartMinute),
+              color = CyanLight,
+              fontSize = 11.sp,
+              fontWeight = FontWeight.ExtraBold
+            )
+          }
+          // Кнопка выбора конца интервала (По ЧЧ:ММ)
+          Box(
+            modifier = Modifier
+              .weight(1f)
+              .clip(RoundedCornerShape(8.dp))
+              .background(Color(0xFF16243A))
+              .border(1.dp, CyanLight.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+              .clickable {
+                android.app.TimePickerDialog(
+                  context,
+                  { _, hourOfDay, minute ->
+                    filterEndHour = hourOfDay
+                    filterEndMinute = minute
+                    selectedSliceIndex = -1
+                  },
+                  filterEndHour,
+                  filterEndMinute,
+                  true
+                ).show()
+              }
+              .padding(vertical = 5.dp),
+            contentAlignment = Alignment.Center
+          ) {
+            Text(
+              text = "По %02d:%02d".format(filterEndHour, filterEndMinute),
+              color = CyanLight,
+              fontSize = 11.sp,
+              fontWeight = FontWeight.ExtraBold
+            )
+          }
+        }
+
+        // Быстрые пресеты времени (Весь день / 00:00–02:00 / 02:00–06:00 / 06:00–12:00 / 12:00–18:00 / 18:00–24:00)
+        val presets = listOf(
+          Triple("Весь день", Pair(0, 0), Pair(23, 59)),
+          Triple("00:00–02:00", Pair(0, 0), Pair(2, 0)),
+          Triple("02:00–06:00", Pair(2, 0), Pair(6, 0)),
+          Triple("06:00–12:00", Pair(6, 0), Pair(12, 0)),
+          Triple("12:00–18:00", Pair(12, 0), Pair(18, 0)),
+          Triple("18:00–24:00", Pair(18, 0), Pair(23, 59))
+        )
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+          presets.forEach { (label, startHm, endHm) ->
+            val isPresetActive = filterStartHour == startHm.first &&
+              filterStartMinute == startHm.second &&
+              filterEndHour == endHm.first &&
+              filterEndMinute == endHm.second
+            Box(
+              modifier = Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(7.dp))
+                .background(if (isPresetActive) CyanContainer else Color(0xFF16243A))
+                .border(1.dp, if (isPresetActive) CyanLight else Slate800, RoundedCornerShape(7.dp))
+                .clickable {
+                  filterStartHour = startHm.first
+                  filterStartMinute = startHm.second
+                  filterEndHour = endHm.first
+                  filterEndMinute = endHm.second
+                  selectedSliceIndex = -1
+                }
+                .padding(vertical = 4.dp),
+              contentAlignment = Alignment.Center
+            ) {
+              Text(
+                text = label,
+                color = if (isPresetActive) CyanLight else Slate400,
+                fontSize = 9.sp,
+                fontWeight = if (isPresetActive) FontWeight.ExtraBold else FontWeight.Medium,
+                maxLines = 1
+              )
+            }
+          }
+        }
+      }
+
+      Spacer(modifier = Modifier.height(8.dp))
+
+      // 3. Фильтр типа записей: Все / 🌐 Только сайты (браузеры) / 📱 Только программы
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+      ) {
+        val tabs = listOf(
+          0 to "Все (${effectiveAppsForDate.size})",
+          1 to "🌐 Сайты (${effectiveAppsForDate.count { it.packageName.startsWith("web:", ignoreCase = true) }})",
+          2 to "📱 Программы (${effectiveAppsForDate.count { !it.packageName.startsWith("web:", ignoreCase = true) }})"
+        )
+        tabs.forEach { (idx, title) ->
+          val isSel = logTypeTab == idx
+          Box(
+            modifier = Modifier
+              .weight(1f)
+              .clip(RoundedCornerShape(9.dp))
+              .background(if (isSel) CyanContainer else Color(0xFF131F33))
+              .border(1.dp, if (isSel) CyanLight else Slate800, RoundedCornerShape(9.dp))
+              .clickable {
+                logTypeTab = idx
+                selectedSliceIndex = -1
+              }
+              .padding(vertical = 6.dp),
+            contentAlignment = Alignment.Center
+          ) {
+            Text(
+              text = title,
+              color = if (isSel) CyanLight else Slate200,
+              fontSize = 10.sp,
+              fontWeight = if (isSel) FontWeight.ExtraBold else FontWeight.Medium,
+              maxLines = 1
+            )
+          }
+        }
+      }
+
+      Spacer(modifier = Modifier.height(12.dp))
+
+      if (slices.isEmpty() && rawIntervalLogs.isEmpty()) {
         Box(
           modifier = Modifier
             .fillMaxWidth()
@@ -245,13 +739,14 @@ fun AppUsageDistributionChartCard(
             Icon(Icons.Default.PieChart, contentDescription = null, tint = CyanLight, modifier = Modifier.size(28.dp))
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-              text = "За сегодня ещё нет активности в приложениях",
+              text = "За выбранный период ($selectedDateLabel) нет записей активности",
               color = Color.White,
               fontWeight = FontWeight.Bold,
-              fontSize = 13.sp
+              fontSize = 13.sp,
+              textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
             Text(
-              text = "Как только ребёнок откроет игры, видео или соцсети на своём телефоне, график автоматически покажет долю каждого приложения.",
+              text = "Выберите другой часовой интервал (например, «Весь день») или нажмите кнопку обновления.",
               color = Slate400,
               fontSize = 11.sp,
               lineHeight = 15.sp,
@@ -260,7 +755,7 @@ fun AppUsageDistributionChartCard(
           }
         }
       } else {
-        if (chartMode == 0) {
+        if (chartMode == 0 && slices.isNotEmpty()) {
           // --- MODE 0: INTERACTIVE DONUT CHART + LEGEND ---
           Row(
             modifier = Modifier.fillMaxWidth(),
@@ -350,15 +845,15 @@ fun AppUsageDistributionChartCard(
                     fontWeight = FontWeight.ExtraBold
                   )
                   Text(
-                    text = "%.0f%% дня".format(activeSlice.sharePercent),
+                    text = "%.0f%%".format(activeSlice.sharePercent),
                     color = Slate400,
                     fontSize = 9.sp
                   )
                 } else {
                   Text(
-                    text = "СЕГОДНЯ",
+                    text = "%02d:%02d–%02d:%02d".format(filterStartHour, filterStartMinute, filterEndHour, filterEndMinute),
                     color = Slate400,
-                    fontSize = 9.sp,
+                    fontSize = 8.sp,
                     fontWeight = FontWeight.Bold
                   )
                   Text(
@@ -368,7 +863,7 @@ fun AppUsageDistributionChartCard(
                     fontWeight = FontWeight.ExtraBold
                   )
                   Text(
-                    text = "${slices.size} прил.",
+                    text = "${slices.size} поз.",
                     color = CyanLight,
                     fontSize = 9.sp,
                     fontWeight = FontWeight.SemiBold
@@ -430,11 +925,17 @@ fun AppUsageDistributionChartCard(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // --- DETAILED COMPARATIVE BARS PER APP WITH QUICK BLOCK/ALLOW ---
+        // --- DETAILED COMPARATIVE BARS PER APP / WEBSITE WITH FULL DATETIME & 1-CLICK BLOCK/UNBLOCK ---
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
           slices.forEachIndexed { index, slice ->
             val isSelected = selectedSliceIndex == index
-            val matchedApp = apps.find { it.id == slice.appId }
+            val matchedApp = apps.find {
+              it.id == slice.appId || it.packageName.equals(slice.packageName, ignoreCase = true)
+            }
+            val isWebsiteEntry = slice.packageName.startsWith("web:", ignoreCase = true)
+            val webDomain = if (isWebsiteEntry) {
+              com.example.util.BootPrefs.normalizeDomain(slice.packageName.removePrefix("web:"))
+            } else ""
 
             Column(
               modifier = Modifier
@@ -467,19 +968,50 @@ fun AppUsageDistributionChartCard(
                       .clip(CircleShape)
                       .background(slice.color)
                   )
-                  Text(
-                    text = slice.appName,
-                    color = Color.White,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                  )
-                  Text(
-                    text = "• ${slice.category}",
-                    color = Slate400,
-                    fontSize = 10.sp
-                  )
+                  Column(modifier = Modifier.weight(1f)) {
+                    Row(
+                      verticalAlignment = Alignment.CenterVertically,
+                      horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                      Text(
+                        text = slice.appName,
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                      )
+                      Text(
+                        text = "• ${slice.category}",
+                        color = Slate400,
+                        fontSize = 10.sp,
+                        maxLines = 1
+                      )
+                    }
+                    // Точная дата и время последней активности (DateTime: dd.MM.yyyy HH:mm:ss)
+                    val lastDtText = if (slice.lastActivityTimestampMs > 0L) {
+                      "Последняя активность: ${dateTimeFormatter.format(java.util.Date(slice.lastActivityTimestampMs))}"
+                    } else {
+                      "Активность за выбранный период: $selectedDateLabel"
+                    }
+                    Text(
+                      text = lastDtText,
+                      color = CyanLight.copy(alpha = 0.9f),
+                      fontSize = 10.sp,
+                      fontWeight = FontWeight.Medium,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis
+                    )
+                    if (slice.latestWindowTitle.isNotBlank() && !slice.latestWindowTitle.equals(slice.appName, ignoreCase = true)) {
+                      Text(
+                        text = slice.latestWindowTitle,
+                        color = Slate400,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                      )
+                    }
+                  }
                 }
 
                 Row(
@@ -487,13 +1019,38 @@ fun AppUsageDistributionChartCard(
                   horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                   Text(
-                    text = "${slice.minutes} мин (%.0f%%)".format(slice.sharePercent),
+                    text = "${slice.minutes} мин",
                     color = slice.color,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.ExtraBold
                   )
 
-                  if (onToggleAppBlock != null && matchedApp != null) {
+                  if (isWebsiteEntry && webDomain.isNotBlank()) {
+                    val isWebBlocked = webDomain in blockedDomainsSet
+                    Box(
+                      modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (isWebBlocked) RoseLock.copy(alpha = 0.2f) else EmeraldShield.copy(alpha = 0.18f))
+                        .border(1.dp, if (isWebBlocked) RoseLock else EmeraldShield, RoundedCornerShape(6.dp))
+                        .clickable { toggleWebsiteDomainBlock(webDomain) }
+                        .padding(horizontal = 7.dp, vertical = 3.dp)
+                    ) {
+                      Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Icon(
+                          imageVector = if (isWebBlocked) Icons.Default.Block else Icons.Default.CheckCircle,
+                          contentDescription = null,
+                          tint = if (isWebBlocked) RoseLock else EmeraldShieldLight,
+                          modifier = Modifier.size(11.dp)
+                        )
+                        Text(
+                          text = if (isWebBlocked) "Заблок." else "Заблокировать",
+                          color = if (isWebBlocked) RoseLock else EmeraldShieldLight,
+                          fontSize = 9.sp,
+                          fontWeight = FontWeight.Bold
+                        )
+                      }
+                    }
+                  } else if (onToggleAppBlock != null && matchedApp != null) {
                     Box(
                       modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
@@ -532,6 +1089,136 @@ fun AppUsageDistributionChartCard(
                 color = if (slice.isBlocked) RoseLock else slice.color,
                 trackColor = Slate800
               )
+            }
+          }
+        }
+
+        // --- ХРОНОЛОГИЧЕСКИЙ ЛОГ ПОСЕЩЁННЫХ САЙТОВ БРАУЗЕРА С ТОЧНОЙ ДАТОЙ-ВРЕМЕНЕМ (DateTime) ЗА ВЫБРАННЫЙ ИНТЕРВАЛ ---
+        val websiteChronologyLogs = remember(rawIntervalLogs) {
+          val seenBuckets = HashSet<String>()
+          rawIntervalLogs
+            .filter { log ->
+              if (!log.packageName.startsWith("web:", ignoreCase = true)) return@filter false
+              val dom = com.example.util.BootPrefs.normalizeDomain(log.packageName.removePrefix("web:"))
+              dom.isNotBlank() && dom.contains(".")
+            }
+            .filter { log ->
+              val dom = com.example.util.BootPrefs.normalizeDomain(log.packageName.removePrefix("web:"))
+              val bucketKey = "$dom|${log.timestamp / 2000L}"
+              seenBuckets.add(bucketKey)
+            }
+            .take(30)
+        }
+
+        if (logTypeTab != 2) {
+          Spacer(modifier = Modifier.height(12.dp))
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Text(
+              text = "🌐 Хронология посещённых сайтов за интервал (${websiteChronologyLogs.size})",
+              color = Color.White,
+              fontSize = 12.sp,
+              fontWeight = FontWeight.ExtraBold,
+              modifier = Modifier.weight(1f)
+            )
+            if (websiteChronologyLogs.isNotEmpty()) {
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(6.dp))
+                  .background(Slate800)
+                  .border(1.dp, Slate400.copy(alpha = 0.4f), RoundedCornerShape(6.dp))
+                  .clickable {
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                      runCatching {
+                        dao.deleteWebsiteHistoryForChild(resolvedChildId)
+                        dao.purgeSystemGarbageFromActivityLogs()
+                        dao.deduplicateOfflineActivityLogs()
+                      }
+                    }
+                  }
+                  .padding(horizontal = 8.dp, vertical = 3.dp)
+              ) {
+                Text(
+                  text = "Очистить",
+                  color = Slate200,
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold
+                )
+              }
+            }
+          }
+          Spacer(modifier = Modifier.height(6.dp))
+
+          if (websiteChronologyLogs.isEmpty()) {
+            Box(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(Color(0xFF0E1726))
+                .border(1.dp, Slate800, RoundedCornerShape(10.dp))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+              contentAlignment = Alignment.Center
+            ) {
+              Text(
+                text = "За выбранный интервал времени посещений сайтов в браузерах не зафиксировано",
+                color = Slate400,
+                fontSize = 11.sp
+              )
+            }
+          } else {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+              websiteChronologyLogs.forEach { logItem ->
+                val domain = com.example.util.BootPrefs.normalizeDomain(logItem.packageName.removePrefix("web:"))
+                val isDomBlocked = domain.isNotBlank() && domain in blockedDomainsSet
+                Row(
+                  modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF0E1726))
+                    .border(1.dp, if (isDomBlocked) RoseLock.copy(alpha = 0.5f) else Slate800, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                  horizontalArrangement = Arrangement.SpaceBetween,
+                  verticalAlignment = Alignment.CenterVertically
+                ) {
+                  Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                      text = logItem.windowTitle.ifBlank { "🌐 $domain" },
+                      color = Color.White,
+                      fontSize = 11.sp,
+                      fontWeight = FontWeight.Bold,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                      text = "🕒 ${dateTimeFormatter.format(java.util.Date(logItem.timestamp))} • $domain",
+                      color = CyanLight,
+                      fontSize = 10.sp,
+                      fontWeight = FontWeight.Medium
+                    )
+                  }
+                  if (domain.isNotBlank()) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(
+                      modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (isDomBlocked) RoseLock.copy(alpha = 0.22f) else EmeraldShield.copy(alpha = 0.18f))
+                        .border(1.dp, if (isDomBlocked) RoseLock else EmeraldShield, RoundedCornerShape(6.dp))
+                        .clickable { toggleWebsiteDomainBlock(domain) }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                      Text(
+                        text = if (isDomBlocked) "Разблок." else "Заблокировать",
+                        color = if (isDomBlocked) RoseLock else EmeraldShieldLight,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.ExtraBold
+                      )
+                    }
+                  }
+                }
+              }
             }
           }
         }

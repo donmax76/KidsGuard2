@@ -136,6 +136,15 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
   var isConnectExistingChildByCodeVisible by remember { mutableStateOf(false) }
   var isChangePinDialogVisible by remember { mutableStateOf(false) }
   var isDebugLogsDialogVisible by remember { mutableStateOf(false) }
+  var isPcFullscreenActive by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+
+  LaunchedEffect(activeTab) {
+    if (activeTab != ParentTab.PC_CONTROL) {
+      isPcFullscreenActive = false
+    }
+  }
+
+  val isPcFullOverlay = activeTab == ParentTab.PC_CONTROL && isPcFullscreenActive
 
   val snackbarHostState = remember { SnackbarHostState() }
 
@@ -170,7 +179,8 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
           callback(success, msg)
         }
       },
-      onCancel = { isPairingScreenVisible = false }
+      onCancel = { isPairingScreenVisible = false },
+      currentPairingCode = activeChild?.pairingCode ?: ""
     )
     return
   }
@@ -249,9 +259,10 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
 
   // 4. Parent Mode View
   Scaffold(
-    snackbarHost = { SnackbarHost(snackbarHostState) },
+    snackbarHost = { if (!isPcFullOverlay) SnackbarHost(snackbarHostState) },
     topBar = {
-      TopAppBar(
+      if (!isPcFullOverlay) {
+        TopAppBar(
         title = {
           Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -409,18 +420,20 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
           titleContentColor = Color.White
         )
       )
+      }
     },
     bottomBar = {
-      val unreadAlertsCount = alerts.count { !it.isRead }
-      val navItemColors = NavigationBarItemDefaults.colors(
-        selectedIconColor = Slate950,
-        selectedTextColor = CyanLight,
-        indicatorColor = CyanLight,
-        unselectedIconColor = Slate400,
-        unselectedTextColor = Slate400
-      )
+      if (!isPcFullOverlay) {
+        val unreadAlertsCount = alerts.count { !it.isRead }
+        val navItemColors = NavigationBarItemDefaults.colors(
+          selectedIconColor = Slate950,
+          selectedTextColor = CyanLight,
+          indicatorColor = CyanLight,
+          unselectedIconColor = Slate400,
+          unselectedTextColor = Slate400
+        )
 
-      NavigationBar(
+        NavigationBar(
         containerColor = Slate950,
         tonalElevation = 8.dp,
         modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars)
@@ -493,21 +506,26 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
           modifier = Modifier.testTag("nav_tab_alerts")
         )
       }
+      }
     },
-    containerColor = Slate950
+    containerColor = if (isPcFullOverlay) Color.Black else Slate950
   ) { innerPadding ->
+    val mainConfig = androidx.compose.ui.platform.LocalConfiguration.current
+    val isMainLandscape =
+      mainConfig.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE ||
+        mainConfig.screenWidthDp > mainConfig.screenHeightDp
     Box(
       modifier = Modifier
         .fillMaxSize()
-        .padding(innerPadding),
+        .let { mod -> if (isPcFullOverlay) mod else mod.padding(innerPadding) },
       contentAlignment = Alignment.TopCenter
     ) {
       Column(
         modifier = Modifier
           .fillMaxSize()
-          .widthIn(max = 640.dp)
+          .let { mod -> if (isMainLandscape || isPcFullOverlay) mod else mod.widthIn(max = 640.dp) }
       ) {
-        if (isPermanentChildPhone || isTemporaryParentSessionOnChildPhone) {
+        if (!isPcFullOverlay && (isPermanentChildPhone || isTemporaryParentSessionOnChildPhone)) {
           Row(
             modifier = Modifier
               .fillMaxWidth()
@@ -548,6 +566,9 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
             onSelectChild = { viewModel.selectChild(it) },
             onAddNewChild = { name, age, limit -> viewModel.addNewChild(name, age, limit) },
             onConnectSecondParentByCode = { code, customName -> viewModel.connectSecondParentByCode(code, customName) },
+            onEditChildProfile = { childId, newName, newAge, newLimit, newCode ->
+              viewModel.updateExistingChildProfile(childId, newName, newAge, newLimit, newCode)
+            },
             onDeleteChild = { viewModel.deleteChild(it) },
             onToggleRemoteLock = { viewModel.toggleRemoteLockForActiveChild() },
             onToggleStudyMode = { viewModel.toggleStudyModeForActiveChild() },
@@ -659,7 +680,8 @@ fun MainScreen(viewModel: ParentControlViewModel = viewModel()) {
             onSelectCustomDateRange = { startMs, endMs ->
               viewModel.selectCustomActivityDateRange(startMs, endMs)
             },
-            onBack = { viewModel.setActiveParentTab(ParentTab.DASHBOARD) }
+            onBack = { viewModel.setActiveParentTab(ParentTab.DASHBOARD) },
+            onFullscreenChanged = { isFull -> isPcFullscreenActive = isFull }
           )
         }
       }

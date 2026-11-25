@@ -178,6 +178,17 @@ fun AppManagementScreen(
         }
       }
 
+      // Статистика использования программ телефона по датам (Сегодня / Вчера / Календарь)
+      item {
+        com.example.ui.components.AppUsageDistributionChartCard(
+          apps = apps,
+          totalChildUsedMinutes = apps.sumOf { it.usedMinutesToday },
+          childId = apps.firstOrNull()?.childId ?: 1L,
+          onSyncUsage = onSyncRealApps,
+          onToggleAppBlock = onToggleAppBlocked
+        )
+      }
+
       // Multi-Selection & Batch Force Block / Allow Card
       item {
         val selectedList = apps.filter { selectedAppIds.contains(it.id) }

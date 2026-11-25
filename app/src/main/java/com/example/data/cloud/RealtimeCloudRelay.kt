@@ -132,20 +132,38 @@ object RealtimeCloudRelay {
   private val _liveChildrenFlow = MutableStateFlow<List<ChildProfileEntity>>(emptyList())
   val liveChildrenFlow: StateFlow<List<ChildProfileEntity>> = _liveChildrenFlow.asStateFlow()
 
-  // Честный онлайн телефона ребёнка в реальном времени:
-  // Родитель шлёт PING каждые 8 с, ребёнок отвечает CHILD_PONG (а при пропаже сети или
-  // остановке отправляет CHILD_OFFLINE / MQTT Last Will). Нет свежих пакетов 28 с = Оффлайн.
-  private const val CHILD_ONLINE_TIMEOUT_MS = 28_000L
+  // Порог 330 секунд (5.5 минут) синхронизирован с Doze-пульсом AlarmManager (каждые 3.5 минуты при выключенном экране),
+  // чтобы телефон ребёнка оставался на связи («Онлайн • Телефон не используется») даже в глубоком сне без разряда батареи!
+  private const val CHILD_ONLINE_TIMEOUT_MS = 330_000L
   private val childLastSeenMs = ConcurrentHashMap<Long, Long>()
+  // Хранит статус режима ожидания ребёнка: childId -> Pair(isScreenOffStandby, standbyStatusText)
+  private val childStandbyStateMap = ConcurrentHashMap<Long, Pair<Boolean, String>>()
   private val _childOnlineFlow = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
   val childOnlineFlow: StateFlow<Map<Long, Boolean>> = _childOnlineFlow.asStateFlow()
   private val presenceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+  fun isChildInStandbyScreenOff(childId: Long): Boolean {
+    if (childId <= 0L) return false
+    val direct = childStandbyStateMap[childId]?.first
+    if (direct != null) return direct
+    val canon = try { resolveCanonicalChildId(childId) } catch (_: Exception) { childId }
+    return childStandbyStateMap[canon]?.first == true
+  }
+
+  fun getChildStandbyDescription(childId: Long): String {
+    if (childId <= 0L) return ""
+    val direct = childStandbyStateMap[childId]?.second
+    if (!direct.isNullOrBlank()) return direct
+    val canon = try { resolveCanonicalChildId(childId) } catch (_: Exception) { childId }
+    return childStandbyStateMap[canon]?.second.orEmpty()
+  }
 
   init {
     presenceScope.launch {
       while (isActive) {
         delay(2_000L)
         recomputeChildPresence()
+        cleanupExpiredTypingIndicators()
       }
     }
   }
@@ -190,7 +208,7 @@ object RealtimeCloudRelay {
     val now = System.currentTimeMillis()
     val snapshot = HashMap<Long, Boolean>()
     for ((id, last) in childLastSeenMs) {
-      if (now - last <= 5 * 60_000L) {
+      if (now - last <= 10 * 60_000L) {
         snapshot[id] = now - last <= CHILD_ONLINE_TIMEOUT_MS
       } else {
         childLastSeenMs.remove(id)
@@ -212,6 +230,40 @@ object RealtimeCloudRelay {
 
   private val _incomingChatsFlow = MutableSharedFlow<ChatMessageEntity>(extraBufferCapacity = 64)
   val incomingChatsFlow: SharedFlow<ChatMessageEntity> = _incomingChatsFlow.asSharedFlow()
+
+  // WhatsApp-style read receipts (childId, readerRole: "CHILD" or "PARENT")
+  private val _chatReadReceiptsFlow = MutableSharedFlow<Pair<Long, String>>(extraBufferCapacity = 64)
+  val chatReadReceiptsFlow: SharedFlow<Pair<Long, String>> = _chatReadReceiptsFlow.asSharedFlow()
+
+  // WhatsApp-style live typing indicator: key = "${childId}_${senderRole}" -> expiresAtMs
+  private val typingExpiryMap = ConcurrentHashMap<String, Long>()
+  private val _chatTypingFlow = MutableStateFlow<Map<String, Long>>(emptyMap())
+  val chatTypingFlow: StateFlow<Map<String, Long>> = _chatTypingFlow.asStateFlow()
+
+  private fun cleanupExpiredTypingIndicators() {
+    val now = System.currentTimeMillis()
+    var changed = false
+    val iter = typingExpiryMap.entries.iterator()
+    while (iter.hasNext()) {
+      val entry = iter.next()
+      if (entry.value <= now) {
+        iter.remove()
+        changed = true
+      }
+    }
+    if (changed) {
+      _chatTypingFlow.value = HashMap(typingExpiryMap)
+    }
+  }
+
+  fun isRemotePartyTyping(childId: Long, remoteRole: String): Boolean {
+    val now = System.currentTimeMillis()
+    val canonId = resolveCanonicalChildId(childId)
+    val directExp = typingExpiryMap["${childId}_${remoteRole.uppercase()}"] ?: 0L
+    val canonExp = typingExpiryMap["${canonId}_${remoteRole.uppercase()}"] ?: 0L
+    val anyExp = typingExpiryMap["ANY_${remoteRole.uppercase()}"] ?: 0L
+    return maxOf(directExp, canonExp, anyExp) > now
+  }
 
   private val _incomingAlertsFlow = MutableSharedFlow<AlertNotificationEntity>(extraBufferCapacity = 64)
   val incomingAlertsFlow: SharedFlow<AlertNotificationEntity> = _incomingAlertsFlow.asSharedFlow()
@@ -349,6 +401,118 @@ object RealtimeCloudRelay {
     }
     if (childrenCache.size == 1) return childrenCache.values.firstOrNull()
     return null
+  }
+
+  data class ChildPermissionsTelemetry(
+    val a11y: Boolean = true,
+    val gps: Boolean = true,
+    val installUpdates: Boolean = true,
+    val liveStream: Boolean = true,
+    val usageStats: Boolean = true,
+    val overlay: Boolean = true,
+    val deviceAdmin: Boolean = true,
+    val batteryOpt: Boolean = true,
+    val grantedCount: Int = 8,
+    val totalCount: Int = 8,
+    val updatedAtMs: Long = 0L
+  )
+
+  private val _childPermissionsFlow = MutableStateFlow<Map<Long, ChildPermissionsTelemetry>>(emptyMap())
+  val childPermissionsFlow: StateFlow<Map<Long, ChildPermissionsTelemetry>> = _childPermissionsFlow.asStateFlow()
+
+  private fun parseAndStorePermissionsTelemetry(childId: Long, rawId: Long, permObj: JSONObject?) {
+    if (permObj == null || childId <= 0L) return
+    val a11y = permObj.optBoolean("a11y", true)
+    val gps = permObj.optBoolean("gps", true)
+    val installUpdates = permObj.optBoolean("installUpdates", true)
+    val liveStream = permObj.optBoolean("liveStream", true)
+    val usageStats = permObj.optBoolean("usageStats", true)
+    val overlay = permObj.optBoolean("overlay", true)
+    val deviceAdmin = permObj.optBoolean("deviceAdmin", true)
+    val batteryOpt = permObj.optBoolean("batteryOpt", true)
+    val list = listOf(a11y, gps, installUpdates, liveStream, usageStats, overlay, deviceAdmin, batteryOpt)
+    val telemetry = ChildPermissionsTelemetry(
+      a11y = a11y,
+      gps = gps,
+      installUpdates = installUpdates,
+      liveStream = liveStream,
+      usageStats = usageStats,
+      overlay = overlay,
+      deviceAdmin = deviceAdmin,
+      batteryOpt = batteryOpt,
+      grantedCount = permObj.optInt("grantedCount", list.count { it }),
+      totalCount = permObj.optInt("totalCount", 8),
+      updatedAtMs = System.currentTimeMillis()
+    )
+    val next = HashMap(_childPermissionsFlow.value)
+    next[childId] = telemetry
+    if (rawId > 0L) next[rawId] = telemetry
+    _childPermissionsFlow.value = next
+  }
+
+  fun getChildPermissions(childId: Long): ChildPermissionsTelemetry? {
+    val map = _childPermissionsFlow.value
+    return map[childId] ?: idAliasMap[childId]?.let { map[it] } ?: map.values.firstOrNull()
+  }
+
+  /**
+   * Возвращает актуальный 6-значный код привязки:
+   * - На телефоне РЕБЁНКА приоритет у BootPrefs, кэша профиля и Room DB (чтобы после обновления APK
+   *   фоновый сервис мгновенно находил код без открытия главного окна приложения!).
+   * - На телефоне РОДИТЕЛЯ берётся из профиля ребёнка в childrenCache.
+   */
+  fun resolveAuthoritativePairingCode(childId: Long): String {
+    val ctx = DirectP2pSocketEngine.appContext
+    if (DirectP2pSocketEngine.currentRole == "CHILD") {
+      val bootCode = com.example.util.BootPrefs.getPairingCode(ctx)
+      if (bootCode.length >= 6) return bootCode
+    }
+    val cachedCode = getCachedChild(childId)?.pairingCode?.trim().orEmpty()
+    if (cachedCode.length >= 6) {
+      if (DirectP2pSocketEngine.currentRole == "CHILD" && ctx != null) {
+        com.example.util.BootPrefs.savePairingCode(ctx, cachedCode)
+      }
+      return cachedCode
+    }
+    if (ctx != null) {
+      try {
+        val dbChild = kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+          val dao = com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+          val cfg = dao.getFamilyConfigOnce()
+          val all = dao.getAllChildrenOnce()
+          val boundId = cfg?.thisDeviceChildId?.takeIf { it > 0L }
+            ?: cfg?.currentActiveChildId?.takeIf { it > 0L }
+            ?: childId
+          all.firstOrNull { it.id == boundId && it.pairingCode.trim().length >= 6 }
+            ?: all.firstOrNull { it.isPaired && it.pairingCode.trim().length >= 6 }
+            ?: dao.getChildByIdOnce(childId)
+            ?: all.firstOrNull()
+        }
+        val dbCode = dbChild?.pairingCode?.trim().orEmpty()
+        if (dbCode.length >= 6 && dbChild != null) {
+          childrenCache[dbChild.id] = dbChild
+          if (DirectP2pSocketEngine.currentRole == "CHILD") {
+            com.example.util.BootPrefs.savePairingCode(ctx, dbCode)
+          }
+          return dbCode
+        }
+      } catch (_: Exception) {}
+    }
+    return cachedCode
+  }
+
+  /**
+   * Мгновенно обновляет или заменяет профиль ребёнка в оперативном кэше релея (при редактировании
+   * имени, возраста, лимита или смене 6-значного кода).
+   */
+  fun replaceCachedChildProfile(child: ChildProfileEntity) {
+    childrenCache[child.id] = child
+    if (DirectP2pSocketEngine.currentRole == "CHILD" && child.pairingCode.isNotBlank()) {
+      DirectP2pSocketEngine.appContext?.let { ctx ->
+        com.example.util.BootPrefs.savePairingCode(ctx, child.pairingCode)
+      }
+    }
+    _liveChildrenFlow.value = deduplicateChildrenCache()
   }
 
   fun mergeOfflineBreadcrumbs(childId: Long, crumbs: List<LocationBreadcrumb>) {
@@ -518,12 +682,30 @@ object RealtimeCloudRelay {
 
   fun isAuthorizedChild(childId: Long): Boolean = authorizedChildIds.contains(childId)
 
+  private fun hydrateCacheFromLocalDbIfEmpty() {
+    if (childrenCache.isNotEmpty()) return
+    val ctx = DirectP2pSocketEngine.appContext ?: return
+    try {
+      val dbChildren = kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+        com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao().getAllChildrenOnce()
+      }
+      for (c in dbChildren) {
+        if (!deletedChildIds.contains(c.id)) {
+          childrenCache.putIfAbsent(c.id, c)
+        }
+      }
+    } catch (_: Exception) {}
+  }
+
   fun ingestImmediateStateJson(msg: JSONObject) {
     val type = msg.optString("type")
     val rawId = msg.optLong("id", msg.optLong("childId", 0L))
     val msgCodeRaw = msg.optString("pairingCode", "").trim()
     val msgCodeClean = msgCodeRaw.replace("-", "").replace(" ", "").uppercase()
-    // Строгая привязка по 6-значному проверочному коду
+    if (childrenCache.isEmpty() && msgCodeClean.length >= 6) {
+      hydrateCacheFromLocalDbIfEmpty()
+    }
+    // Строгая привязка по 6-значному проверочному коду (поддержка одновременной работы Мамы и Папы даже с разными локальными id!)
     val matchedByCodeId = if (msgCodeClean.length >= 6) {
       childrenCache.values.firstOrNull {
         it.pairingCode.replace("-", "").replace(" ", "").uppercase() == msgCodeClean
@@ -571,44 +753,72 @@ object RealtimeCloudRelay {
         markChildOfflineImmediate(deleteTargetId)
       }
       "CHILD_PONG" -> {
-        // Лёгкий ответ на PING: принимаем только свежий пакет (не старше 35 с).
+        // Лёгкий пульс онлайна и режима ожидания (включая Doze-пульс при выключенном экране).
         val ageMs = if (pktTs > 0L) kotlin.math.abs(now - pktTs) else 0L
-        if (pktTs <= 0L || ageMs <= 35_000L) {
-          val wasOnline = isChildOnline(id)
-          authorizeChildId(id)
+        if (pktTs <= 0L || ageMs <= CHILD_ONLINE_TIMEOUT_MS) {
+          val prev = childrenCache[id] ?: childrenCache.values.firstOrNull()
+          val resolvedTargetId = prev?.id ?: id
+          if (DirectP2pSocketEngine.currentRole != "CHILD") {
+            if (prev == null && matchedByCodeId == null) {
+              return
+            }
+            if (prev != null) {
+              val localCode = prev.pairingCode.replace("-", "").replace(" ", "").uppercase()
+              // Отклоняем только если присланный код НЕ пустой и отличается от локального кода родителя
+              if (localCode.length >= 6 && msgCodeClean.length >= 6 && localCode != msgCodeClean) {
+                return
+              }
+            }
+          }
+          val wasOnline = isChildOnline(resolvedTargetId)
+          authorizeChildId(resolvedTargetId)
           if (rawId > 0L) authorizeChildId(rawId)
-          markChildSeen(id)
+          markChildSeen(resolvedTargetId)
+          if (rawId > 0L && rawId != resolvedTargetId) markChildSeen(rawId)
+          parseAndStorePermissionsTelemetry(resolvedTargetId, rawId, msg.optJSONObject("permissionsStatus"))
+          val screenInteractive = msg.optBoolean("screenInteractive", true)
+          val pongActiveApp = msg.optString("activeAppName", "").trim()
+          val standbyDesc = if (!screenInteractive) {
+            pongActiveApp.ifBlank { "🌙 Телефон не используется • Экран выключен" }
+          } else ""
+          childStandbyStateMap[resolvedTargetId] = Pair(!screenInteractive, standbyDesc)
+          if (rawId > 0L) childStandbyStateMap[rawId] = Pair(!screenInteractive, standbyDesc)
+          if (!screenInteractive && standbyDesc.isNotBlank() && DirectP2pSocketEngine.currentRole != "CHILD") {
+            DirectP2pSocketEngine.updateActiveAppLabelOnly(resolvedTargetId, standbyDesc)
+          }
+          val pongBatt = msg.optInt("batteryLevel", -1)
+          val pongVer = msg.optString("appVersion", "").trim()
+          if (prev != null && (pongBatt in 1..100 || pongVer.isNotBlank())) {
+            val cleanVer = if (pongVer.isNotBlank()) normalizeAppVersion(pongVer) else prev.appVersion
+            if (pongVer.isNotBlank()) {
+              authoritativeCoreVersionMap[resolvedTargetId] = cleanVer
+            }
+            val isCurrent = com.example.util.ApkUpdateInstaller.compareVersions(cleanVer, BuildConfig.VERSION_NAME) >= 0
+            childrenCache[resolvedTargetId] = prev.copy(
+              batteryLevel = if (pongBatt in 1..100) pongBatt else prev.batteryLevel,
+              appVersion = cleanVer,
+              updatePending = if (isCurrent) false else prev.updatePending
+            )
+            _liveChildrenFlow.value = deduplicateChildrenCache()
+          }
           if (!wasOnline) {
+            val modeNote = if (!screenInteractive) "в режиме ожидания (экран выключен)" else "активен"
             com.example.util.DeviceControlDebugger.logEvent(
               "СТАТУС_ОНЛАЙН",
-              "Телефон ребёнка #$id вышел на связь (CHILD_PONG, задержка ${ageMs} мс)",
+              "Телефон ребёнка #$resolvedTargetId на связи: $modeNote",
               "SUCCESS",
               "P2P"
             )
           }
-        } else {
-          com.example.util.DeviceControlDebugger.logEvent(
-            "СТАРЫЙ_PONG_ОТБРОШЕН",
-            "Отброшен устаревший CHILD_PONG от ребёнка #$id (возраст ${ageMs / 1000} с)",
-            "WARNING",
-            "P2P"
-          )
         }
         return
       }
       "CHILD_STATE" -> {
         val isFromChild = msg.optBoolean("isChildDevice", false)
-        // Защита от вчерашних retained-пакетов с брокеров (78% заряда и ложный Онлайн):
-        // если пакет от ребёнка старше 45 секунд — отбрасываем его!
+        // Защита от старых пакетов с учётом возможного расхождения часов на телефонах родителя и ребёнка (до 15 минут):
         if (isFromChild) {
           val ageMs = if (pktTs > 0L) kotlin.math.abs(now - pktTs) else 0L
-          if (pktTs > 0L && ageMs > 45_000L) {
-            com.example.util.DeviceControlDebugger.logEvent(
-              "СТАРЫЙ_ПАКЕТ_ОТБРОШЕН",
-              "Отброшен устаревший CHILD_STATE от #$id (возраст ${ageMs / 1000} с, батарея=${msg.optInt("batteryLevel", -1)}%)",
-              "BLOCKED",
-              "P2P"
-            )
+          if (pktTs > 0L && ageMs > 900_000L) {
             return
           }
           val lastTs = lastChildTelemetryTsByChild[id] ?: 0L
@@ -660,6 +870,7 @@ object RealtimeCloudRelay {
           }
           authorizeChildId(id)
           markChildSeen(id)
+          parseAndStorePermissionsTelemetry(id, rawId, msg.optJSONObject("permissionsStatus"))
           deletedChildIds.remove(id)
           if (rawId > 0L) deletedChildIds.remove(rawId)
           val incomingBatt = msg.optInt("batteryLevel", -1)
@@ -708,12 +919,21 @@ object RealtimeCloudRelay {
         val authLock = getAuthoritativeLock(id)
         val resolvedLock = authLock?.first ?: (prev?.isDeviceLocked ?: msg.optBoolean("isDeviceLocked", false))
         val msgAppVer = msg.optString("appVersion").takeIf { it.isNotBlank() }
-        val resolvedAppVersion = resolveHighestChildVersion(
-          id,
-          if (isFromChild) msgAppVer else null,
-          prev?.appVersion,
-          msgAppVer
-        )
+        val resolvedAppVersion = if (isFromChild && !msgAppVer.isNullOrBlank()) {
+          normalizeAppVersion(msgAppVer).also { realVer ->
+            authoritativeCoreVersionMap[id] = realVer
+            DirectP2pSocketEngine.appContext?.let { ctx ->
+              com.example.util.CoreEngineHotUpdater.setChildCoreVersionName(ctx, id, realVer)
+            }
+          }
+        } else {
+          resolveHighestChildVersion(
+            id,
+            if (isFromChild) msgAppVer else null,
+            prev?.appVersion,
+            msgAppVer
+          )
+        }
         val resolvedUpdatePending = when {
           com.example.util.ApkUpdateInstaller.isSameVersion(resolvedAppVersion, BuildConfig.VERSION_NAME) ||
             com.example.util.ApkUpdateInstaller.compareVersions(resolvedAppVersion, BuildConfig.VERSION_NAME) >= 0 -> false
@@ -722,17 +942,17 @@ object RealtimeCloudRelay {
         }
         val defaultName = "Ребёнок #$id"
         val resolvedName = when {
-          prev != null && prev.name.isNotBlank() && !prev.name.startsWith("Ребёнок #") &&
-            (isFromChild && msg.optString("name", "").startsWith("Ребёнок #")) -> prev.name
           !isFromChild && msg.optString("name", "").isNotBlank() && !msg.optString("name", "").startsWith("Ребёнок #") ->
             msg.optString("name")
+          prev != null && prev.name.isNotBlank() && !prev.name.startsWith("Ребёнок #") &&
+            isFromChild -> prev.name
           else -> msg.optString("name", prev?.name ?: defaultName).ifBlank { prev?.name ?: defaultName }
         }
         val msgAge = msg.optInt("age", prev?.age ?: 10)
         val resolvedAge = when {
           !isFromChild && msg.has("age") && msgAge > 0 -> msgAge
-          isFromChild && prev != null && prev.age > 0 && (msgAge == 10 || msg.optString("name", "").startsWith("Ребёнок #")) -> prev.age
           prev != null && !prev.name.startsWith("Ребёнок #") && isFromChild -> prev.age
+          isFromChild && prev != null && prev.age > 0 && (msgAge == 10 || msg.optString("name", "").startsWith("Ребёнок #")) -> prev.age
           else -> msgAge
         }
         val todayIso = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
@@ -777,12 +997,20 @@ object RealtimeCloudRelay {
           else -> msg.optInt("dailyScreenLimitMinutes", 120)
         }
 
+        val resolvedPairingCode = when {
+          DirectP2pSocketEngine.currentRole == "CHILD" && msgCodeRaw.length >= 6 -> msgCodeRaw
+          !isFromChild && msgCodeRaw.length >= 6 -> msgCodeRaw
+          prev != null && prev.pairingCode.isNotBlank() -> prev.pairingCode
+          msgCodeRaw.isNotBlank() -> msgCodeRaw
+          else -> "${100 + id}-${700 + id}"
+        }
+
         val entity = ChildProfileEntity(
           id = id,
           name = resolvedName,
           age = resolvedAge,
           deviceModel = if (isFromChild) msg.optString("deviceModel", prev?.deviceModel ?: "Смартфон ребёнка") else (prev?.deviceModel ?: msg.optString("deviceModel", "Ожидание подключения")),
-          pairingCode = prev?.pairingCode?.takeIf { it.isNotBlank() } ?: msg.optString("pairingCode", "${100 + id}-${700 + id}").ifBlank { "${100 + id}-${700 + id}" },
+          pairingCode = resolvedPairingCode,
           isPaired = if (isFromChild && matchedByCodeId != null) true else (prev?.isPaired ?: msg.optBoolean("isPaired", false)),
           batteryLevel = resolvedBatt,
           isDeviceLocked = resolvedLock,
@@ -807,7 +1035,7 @@ object RealtimeCloudRelay {
           msg.has("batteryLevel") ||
           msg.has("lastLocationLat")
         if (isFromChild) {
-          if (pktTs > 0L && kotlin.math.abs(now - pktTs) > 45_000L) {
+          if (pktTs > 0L && kotlin.math.abs(now - pktTs) > 900_000L) {
             return
           }
           val lastTs = lastChildTelemetryTsByChild[id] ?: 0L
@@ -832,6 +1060,7 @@ object RealtimeCloudRelay {
         }
         if (isFromChild) {
           authorizeChildId(id)
+          parseAndStorePermissionsTelemetry(id, rawId, msg.optJSONObject("permissionsStatus"))
           val incomingBatt = msg.optInt("batteryLevel", -1)
           if (incomingBatt in 1..100 && existingPrev?.batteryLevel != incomingBatt) {
             com.example.util.DeviceControlDebugger.logEvent(
@@ -856,11 +1085,17 @@ object RealtimeCloudRelay {
         var updated = prev
         if (msg.has("name")) {
           val n = msg.optString("name", updated.name)
-          if (n.isNotBlank() && (!n.startsWith("Ребёнок #") || updated.name.startsWith("Ребёнок #"))) {
+          if (n.isNotBlank() && (!isFromChild || !n.startsWith("Ребёнок #") || updated.name.startsWith("Ребёнок #"))) {
             updated = updated.copy(name = n)
           }
         }
-        if (msg.has("pairingCode") && (!updated.isPaired || updated.pairingCode.isBlank())) {
+        if (msg.has("age") && !isFromChild) {
+          val a = msg.optInt("age", updated.age)
+          if (a in 1..25) {
+            updated = updated.copy(age = a)
+          }
+        }
+        if (msg.has("pairingCode") && (!isFromChild || DirectP2pSocketEngine.currentRole == "CHILD" || !updated.isPaired || updated.pairingCode.isBlank())) {
           val pc = msg.optString("pairingCode", updated.pairingCode)
           if (pc.isNotBlank()) updated = updated.copy(pairingCode = pc)
         }
@@ -936,10 +1171,13 @@ object RealtimeCloudRelay {
         }
         if (msg.has("appVersion") && isFromChild) {
           val reportedVer = normalizeAppVersion(msg.optString("appVersion"))
-          val highestVer = resolveHighestChildVersion(id, reportedVer, updated.appVersion)
-          val isCurrent = com.example.util.ApkUpdateInstaller.compareVersions(highestVer, BuildConfig.VERSION_NAME) >= 0
+          authoritativeCoreVersionMap[id] = reportedVer
+          DirectP2pSocketEngine.appContext?.let { ctx ->
+            com.example.util.CoreEngineHotUpdater.setChildCoreVersionName(ctx, id, reportedVer)
+          }
+          val isCurrent = com.example.util.ApkUpdateInstaller.compareVersions(reportedVer, BuildConfig.VERSION_NAME) >= 0
           updated = updated.copy(
-            appVersion = highestVer,
+            appVersion = reportedVer,
             updatePending = if (isCurrent) false else updated.updatePending
           )
         }
@@ -1048,9 +1286,10 @@ object RealtimeCloudRelay {
                   seenNames.add(nameKey)
               ) {
                 val authRule = authoritativeAppRules["${cid}_$pkgKey"] ?: authoritativeAppRules["${rawCid}_$pkgKey"]
-                val keepAuthRule = authRule != null && (now - authRule.third) < 600_000L
-                val resolvedBlocked = if (keepAuthRule && authRule?.first != null) authRule.first!! else o.optBoolean("isBlocked", false)
-                val resolvedLimit = if (keepAuthRule && authRule?.second != null) authRule.second!! else o.optInt("dailyLimitMinutes", 0)
+                // Авторитетные правила блокировки/лимитов родителя НЕ истекают через 10 минут:
+                // пакет APPS_LIST от ребёнка никогда не может самопроизвольно сбросить родительскую блокировку!
+                val resolvedBlocked = authRule?.first ?: o.optBoolean("isBlocked", false)
+                val resolvedLimit = authRule?.second ?: o.optInt("dailyLimitMinutes", 0)
                 parsed.add(
                   AppControlEntity(
                     id = "${cid}_$pkgKey".hashCode().toLong(),
@@ -1095,12 +1334,22 @@ object RealtimeCloudRelay {
             appsCache[cid] = current
           }
         }
-        // Мгновенно синхронизируем изменение блокировки/лимита в Room DB (чтобы оба родителя — Мать и Отец —
-        // а также телефон ребёнка видели актуальный статус без задержки)
+        // Мгновенно синхронизируем изменение блокировки/лимита в Room DB и BootPrefs (чтобы оба родителя — Мать и Отец —
+        // а также телефон ребёнка видели актуальный статус без задержки и никогда не теряли блокировку!)
         val ctx = DirectP2pSocketEngine.appContext
         if (ctx != null && pkg.isNotBlank()) {
+          if (DirectP2pSocketEngine.currentRole == "CHILD" && blockedVal != null) {
+            com.example.util.BootPrefs.saveBlockedPackage(ctx, pkg, blockedVal)
+            com.example.service.KidsGuardAccessibilityService.instance?.setPackageBlockedImmediate(pkg, blockedVal)
+          }
           try {
             val dao = com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+            if (blockedVal != null) {
+              dao.setAppBlockedByPackageGlobal(pkg, blockedVal)
+            }
+            if (limitVal != null) {
+              dao.setAppLimitByPackageGlobal(pkg, limitVal)
+            }
             val dbApps = dao.getAppsForChildOnce(cid)
             val targetApp = dbApps.firstOrNull { it.packageName.trim().equals(pkg, ignoreCase = true) }
             if (targetApp != null) {
@@ -1115,15 +1364,85 @@ object RealtimeCloudRelay {
           } catch (_: Exception) {}
         }
       }
+      "PARENT_POLICY_SYNC" -> {
+        val policyTs = m.optLong("timestamp", now)
+        val blockedArr = m.optJSONArray("blockedPackages") ?: JSONArray()
+        val limitsObj = m.optJSONObject("appLimits") ?: JSONObject()
+        val blockedSet = HashSet<String>()
+        for (i in 0 until blockedArr.length()) {
+          val pkg = blockedArr.optString(i, "").trim().lowercase()
+          if (pkg.isNotBlank()) blockedSet.add(pkg)
+        }
+        val limitsMap = HashMap<String, Int>()
+        val limitKeys = limitsObj.keys()
+        while (limitKeys.hasNext()) {
+          val k = limitKeys.next().trim().lowercase()
+          if (k.isNotBlank()) {
+            limitsMap[k] = limitsObj.optInt(k, 0).coerceAtLeast(0)
+          }
+        }
+        // Обновляем authoritativeAppRules и appsCache для обоих родителей и ребёнка
+        val allKnownPkgs = HashSet<String>()
+        allKnownPkgs.addAll(blockedSet)
+        allKnownPkgs.addAll(limitsMap.keys)
+        appsCache[cid]?.forEach { allKnownPkgs.add(it.packageName.trim().lowercase()) }
+        for (pkgKey in allKnownPkgs) {
+          val isBlk = blockedSet.contains(pkgKey)
+          val lim = limitsMap[pkgKey] ?: 0
+          authoritativeAppRules["${cid}_$pkgKey"] = Triple(isBlk, lim, policyTs)
+          authoritativeAppRules["${rawCid}_$pkgKey"] = Triple(isBlk, lim, policyTs)
+        }
+        for (targetCid in linkedSetOf(cid, rawCid)) {
+          val current = appsCache[targetCid]?.toMutableList() ?: continue
+          for (i in current.indices) {
+            val pkgKey = current[i].packageName.trim().lowercase()
+            val isBlk = blockedSet.contains(pkgKey)
+            val lim = limitsMap[pkgKey] ?: current[i].dailyLimitMinutes
+            current[i] = current[i].copy(isBlocked = isBlk, dailyLimitMinutes = lim)
+          }
+          appsCache[targetCid] = current
+        }
+        val ctx = DirectP2pSocketEngine.appContext
+        if (ctx != null) {
+          if (DirectP2pSocketEngine.currentRole == "CHILD") {
+            com.example.util.BootPrefs.applyAuthoritativeParentPolicy(ctx, blockedSet, limitsMap, policyTs)
+            val a11y = com.example.service.KidsGuardAccessibilityService.instance
+            for (pkgKey in allKnownPkgs) {
+              a11y?.setPackageBlockedImmediate(pkgKey, blockedSet.contains(pkgKey))
+            }
+          }
+          try {
+            val dao = com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+            val dbApps = dao.getAppsForChildOnce(cid)
+            for (app in dbApps) {
+              val pkgKey = app.packageName.trim().lowercase()
+              val shouldBlock = blockedSet.contains(pkgKey)
+              val newLimit = limitsMap[pkgKey] ?: app.dailyLimitMinutes
+              if (app.isBlocked != shouldBlock || app.dailyLimitMinutes != newLimit) {
+                dao.updateApp(app.copy(isBlocked = shouldBlock, dailyLimitMinutes = newLimit))
+              }
+            }
+          } catch (_: Exception) {}
+        }
+      }
       "CHAT" -> {
         val ts = m.optLong("timestamp", m.optLong("ts", now))
-        // Отбрасываем старые (вчерашние/retained) сообщения и сигналы сирены старше 60 секунд!
-        if (kotlin.math.abs(now - ts) > 60_000L) return
+        // Отбрасываем только старые пакеты старше 15 минут (устойчивость к разнице часов между телефонами)
+        if (kotlin.math.abs(now - ts) > 900_000L) return
         val senderRole = m.optString("senderRole", m.optString("sender", "PARENT")).ifBlank { "PARENT" }
         val senderName = m.optString("senderName", m.optString("childName", ""))
         val text = m.optString("text", "").trim()
         val isAttention = m.optBoolean("isAttentionSignal", m.optBoolean("attention", false))
         if (text.isNotBlank()) {
+          if (senderRole.equals("CHILD", ignoreCase = true)) {
+            markChildSeen(cid)
+          }
+          // Сразу гасим индикатор «печатает...» от этого отправителя, так как сообщение уже пришло
+          typingExpiryMap.remove("${cid}_${senderRole.uppercase()}")
+          typingExpiryMap.remove("${rawCid}_${senderRole.uppercase()}")
+          typingExpiryMap.remove("ANY_${senderRole.uppercase()}")
+          _chatTypingFlow.value = HashMap(typingExpiryMap)
+
           val chatEntity = ChatMessageEntity(
             id = ts,
             childId = cid,
@@ -1147,9 +1466,49 @@ object RealtimeCloudRelay {
           }
         }
       }
+      "CHAT_READ" -> {
+        val readerRole = m.optString("readerRole", "").trim().uppercase()
+        if (readerRole == "CHILD" || readerRole == "PARENT") {
+          if (readerRole == "CHILD") {
+            markChildSeen(cid)
+          }
+          val senderToMark = if (readerRole == "CHILD") "PARENT" else "CHILD"
+          for (targetCid in linkedSetOf(cid, rawCid)) {
+            val list = chatCache[targetCid]
+            if (list != null) {
+              synchronized(list) {
+                for (i in list.indices) {
+                  if (list[i].senderRole.equals(senderToMark, ignoreCase = true) && !list[i].isRead) {
+                    list[i] = list[i].copy(isRead = true)
+                  }
+                }
+              }
+            }
+          }
+          _chatReadReceiptsFlow.tryEmit(Pair(cid, readerRole))
+        }
+      }
+      "CHAT_TYPING" -> {
+        val senderRole = m.optString("senderRole", "").trim().uppercase()
+        val isTyping = m.optBoolean("isTyping", false)
+        if (senderRole == "CHILD" || senderRole == "PARENT") {
+          if (senderRole == "CHILD") {
+            markChildSeen(cid)
+          }
+          val exp = now + 4_500L
+          for (key in listOf("${cid}_$senderRole", "${rawCid}_$senderRole", "ANY_$senderRole")) {
+            if (isTyping) {
+              typingExpiryMap[key] = exp
+            } else {
+              typingExpiryMap.remove(key)
+            }
+          }
+          _chatTypingFlow.value = HashMap(typingExpiryMap)
+        }
+      }
       "ALERT" -> {
         val ts = m.optLong("timestamp", m.optLong("ts", now))
-        if (kotlin.math.abs(now - ts) > 60_000L) return
+        if (kotlin.math.abs(now - ts) > 900_000L) return
         val id = m.optLong("id", ts)
         val alertType = m.optString("alertType", "GENERAL")
         val payloadStr = m.optString("payload", "")
@@ -1320,6 +1679,9 @@ object RealtimeCloudRelay {
       put("isChildDevice", isChildDevice)
       if (isChildDevice) {
         put("lanIp", DirectP2pSocketEngine.getLocalIpv4Address())
+        DirectP2pSocketEngine.appContext?.let { ctx ->
+          put("permissionsStatus", com.example.util.DeviceSecurityPermissionHelper.collectChildPermissionsStatusJson(ctx))
+        }
       }
       put("ts", System.currentTimeMillis())
     }
@@ -1402,16 +1764,45 @@ object RealtimeCloudRelay {
   }
 
   /**
-   * Ответ ребёнка на PING родителя. Это НЕ состояние профиля: только тип CHILD_PONG,
-   * поэтому не пишет Room, не меняет battery/location и не будит лишние экраны.
+   * Ответ ребёнка на PING родителя и Doze-пульс режима ожидания.
+   * Публикуется в т.ч. с retain=true в выделенный топик TOPIC_DATA/pong_$targetId,
+   * чтобы родитель сразу при входе видел, что телефон ребёнка ОНЛАЙН и находится в режиме ожидания («Экран выключен / Телефон не используется»).
    */
   suspend fun publishChildPong(childId: Long) {
     val rawId = if (childId > 0L) childId else 1L
-    val targetId = resolveCanonicalChildId(rawId)
+    val authCode = resolveAuthoritativePairingCode(rawId)
+    val targetId = resolveCanonicalChildId(rawId, authCode)
     val json = JSONObject().apply {
       put("type", "CHILD_PONG")
       put("id", targetId)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
+      }
       put("isChildDevice", true)
+      put("appVersion", BuildConfig.VERSION_NAME)
+      put("lanIp", DirectP2pSocketEngine.getLocalIpv4Address())
+      DirectP2pSocketEngine.appContext?.let { ctx ->
+        val batt = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(ctx)
+        if (batt in 1..100) {
+          put("batteryLevel", batt)
+        }
+        val isInteractive = com.example.util.DeviceUsageTracker.isInteractive(ctx)
+        val isCharging = com.example.util.AppEnergyMeter.isCharging(ctx)
+        put("screenInteractive", isInteractive)
+        put("isCharging", isCharging)
+        val activeLabel = if (!isInteractive) {
+          val battStr = if (batt in 1..100) " • $batt%" else ""
+          if (isCharging) {
+            "🌙 Телефон не используется • Экран выключен (на зарядке$battStr)"
+          } else {
+            "🌙 Телефон не используется • Экран выключен$battStr"
+          }
+        } else {
+          com.example.service.KidsGuardAccessibilityService.currentForegroundApp()
+        }
+        put("activeAppName", activeLabel)
+        put("permissionsStatus", com.example.util.DeviceSecurityPermissionHelper.collectChildPermissionsStatusJson(ctx))
+      }
       put("ts", System.currentTimeMillis())
     }
     DirectP2pSocketEngine.publishTcpSocketPacket(
@@ -1419,15 +1810,38 @@ object RealtimeCloudRelay {
       json = json,
       retain = false
     )
+    DirectP2pSocketEngine.publishTcpSocketPacket(
+      topic = "${DirectP2pSocketEngine.TOPIC_DATA}/pong_$targetId",
+      json = json,
+      retain = true
+    )
     DirectP2pSocketEngine.broadcastUdpJson(json)
+    if (DirectP2pSocketEngine.currentRole == "CHILD") {
+      val now = System.currentTimeMillis()
+      if (now - lastAutoChildLogsPushMs >= 45_000L) {
+        lastAutoChildLogsPushMs = now
+        publishChildDebugLogs(
+          childId = targetId,
+          fullDump = false,
+          triggerReason = "Авто-выгрузка логов ребёнка при связи с родителем"
+        )
+      }
+    }
   }
+
+  @Volatile
+  private var lastAutoChildLogsPushMs: Long = 0L
 
   fun publishChildOffline(childId: Long) {
     val rawId = if (childId > 0L) childId else 1L
-    val targetId = resolveCanonicalChildId(rawId)
+    val authCode = resolveAuthoritativePairingCode(rawId)
+    val targetId = resolveCanonicalChildId(rawId, authCode)
     val json = JSONObject().apply {
       put("type", "CHILD_OFFLINE")
       put("id", targetId)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
+      }
       put("isChildDevice", true)
       put("ts", System.currentTimeMillis())
     }
@@ -1441,7 +1855,9 @@ object RealtimeCloudRelay {
 
   suspend fun publishChildFields(childId: Long, fields: Map<String, Any>) {
     val rawId = if (childId > 0) childId else 1L
-    val targetId = resolveCanonicalChildId(rawId, (fields["pairingCode"] as? String).orEmpty())
+    val explicitCode = (fields["pairingCode"] as? String)?.trim().orEmpty()
+    val authCode = explicitCode.ifBlank { resolveAuthoritativePairingCode(rawId) }
+    val targetId = resolveCanonicalChildId(rawId, authCode)
     if (fields.containsKey("isDeviceLocked")) {
       val locked = fields["isDeviceLocked"] as? Boolean ?: false
       setLocalAuthoritativeLock(targetId, locked)
@@ -1460,14 +1876,13 @@ object RealtimeCloudRelay {
       )
     }
 
-    val existingProfile = getCachedChild(targetId)
     val todayIso = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
     val patchJson = JSONObject().apply {
       put("type", "CHILD_PATCH")
       put("id", targetId)
       put("usageDateIso", todayIso)
-      if (!existingProfile?.pairingCode.isNullOrBlank()) {
-        put("pairingCode", existingProfile?.pairingCode)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
       }
       for ((k, v) in fields) {
         put(k, v)
@@ -1610,10 +2025,10 @@ object RealtimeCloudRelay {
     // Никогда не retain для обычных команд (особенно LOUD_RING, LOCK, UNLOCK)!
     val shouldRetain = false
     val targets = linkedSetOf(targetId).apply {
-      if (aliasId != null && aliasId > 0L && aliasId != targetId && !childrenCache.containsKey(targetId)) {
+      if (aliasId != null && aliasId > 0L && aliasId != targetId) {
         add(aliasId)
       }
-      if ((commandType == "LOCK" || commandType == "UNLOCK") && childrenCache.size <= 1) {
+      if (commandType.isNotBlank() && childrenCache.size <= 1) {
         add(1L)
       }
     }
@@ -1630,7 +2045,7 @@ object RealtimeCloudRelay {
     // Внимание: publishTcpSocketPacket уже сам отправляет пакет по прямому LAN-сокету (pushDirectLanPacket),
     // поэтому повторно pushDirectLanPacket здесь НЕ вызываем (иначе ребёнок получал дубль по LAN)!
     DirectP2pSocketEngine.broadcastUdpJson(json)
-    if (commandType != "PING" && commandType != "MAP_VIEWING") {
+    if ((commandType != "PING" || payload == "WAKE") && commandType != "MAP_VIEWING") {
       com.example.util.DeviceControlDebugger.logEvent(
         "КОМАНДА_ОТПРАВЛЕНА",
         "Отправлена команда [$commandType] для ребёнка #$targetId (payload=${payload.take(60)})",
@@ -1655,7 +2070,8 @@ object RealtimeCloudRelay {
     triggerReason: String = if (fullDump) "Запрос родителя" else "Авто-догрузка после офлайна"
   ) {
     val rawId = if (childId > 0L) childId else 1L
-    val targetId = resolveCanonicalChildId(rawId)
+    val authCode = resolveAuthoritativePairingCode(rawId)
+    val targetId = resolveCanonicalChildId(rawId, authCode)
     if (DirectP2pSocketEngine.currentRole == "CHILD") {
       com.example.util.DeviceControlDebugger.logFullDeviceSnapshot(
         context = DirectP2pSocketEngine.appContext,
@@ -1672,22 +2088,33 @@ object RealtimeCloudRelay {
     val json = JSONObject().apply {
       put("type", "CHILD_DEBUG_LOGS")
       put("childId", targetId)
+      put("canonicalChildId", targetId)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
+      }
       put("childAppVersion", BuildConfig.VERSION_NAME)
       put("logs", logsArr)
       put("timestamp", System.currentTimeMillis())
     }
-    DirectP2pSocketEngine.publishTcpSocketPacket(
-      topic = "${DirectP2pSocketEngine.TOPIC_DATA}/logs_$targetId",
-      json = json,
-      retain = false
-    )
+    val targets = linkedSetOf(targetId, rawId, 1L)
+    for (tid in targets) {
+      DirectP2pSocketEngine.publishTcpSocketPacket(
+        topic = "${DirectP2pSocketEngine.TOPIC_DATA}/logs_$tid",
+        json = JSONObject(json.toString()).apply {
+          put("childId", tid)
+        },
+        retain = false
+      )
+    }
+    DirectP2pSocketEngine.broadcastUdpJson(json)
   }
 
   /** Лёгкая телеметрия расхода энергии приложения (раз в минуту, без истории). */
   suspend fun publishPowerStats(childId: Long, appPercent: Int, mahPerHour: Float, percentPerHour: Float) {
     if (DirectP2pSocketEngine.currentRole != "CHILD") return
     val rawId = if (childId > 0L) childId else 1L
-    val canonicalId = resolveCanonicalChildId(rawId)
+    val authCode = resolveAuthoritativePairingCode(rawId)
+    val canonicalId = resolveCanonicalChildId(rawId, authCode)
     com.example.util.DeviceControlDebugger.logEvent(
       "РАСХОД_ЭНЕРГИИ",
       "Потребление KidsGuard на телефоне ребёнка #$canonicalId: $appPercent% (${"%.1f".format(mahPerHour)} мА·ч, ${"%.1f".format(percentPerHour)}%/ч)",
@@ -1698,6 +2125,9 @@ object RealtimeCloudRelay {
       put("type", "POWER_STATS")
       put("childId", rawId)
       put("canonicalChildId", canonicalId)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
+      }
       put("appEnergyPercent", appPercent)
       put("appMahPerHour", mahPerHour.toDouble())
       put("percentPerHour", percentPerHour.toDouble())
@@ -1708,6 +2138,7 @@ object RealtimeCloudRelay {
       json = json,
       retain = false
     )
+    DirectP2pSocketEngine.broadcastUdpJson(json)
   }
 
   suspend fun publishScreenSnapshot(childId: Long, activeAppName: String, base64Bitmap: String) {
@@ -1722,12 +2153,12 @@ object RealtimeCloudRelay {
 
   suspend fun publishActiveAppOnly(childId: Long, activeAppName: String) {
     val targetId = if (childId > 0L) childId else 1L
-    val cachedProfile = getCachedChild(targetId)
+    val authCode = resolveAuthoritativePairingCode(targetId)
     val json = JSONObject().apply {
       put("type", "DIRECT_SCREEN_FRAME")
       put("childId", targetId)
-      if (!cachedProfile?.pairingCode.isNullOrBlank()) {
-        put("pairingCode", cachedProfile?.pairingCode)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
       }
       put("activeAppName", activeAppName)
       put("lanIp", DirectP2pSocketEngine.getLocalIpv4Address())
@@ -1796,10 +2227,21 @@ object RealtimeCloudRelay {
     } else apps
     if (verifiedApps.isEmpty()) return
 
+    val bootBlockedSet = if (ctx != null) com.example.util.BootPrefs.getBlockedPackages(ctx) else emptySet()
+    val bootLimitsMap = if (ctx != null) com.example.util.BootPrefs.getAppLimitsMap(ctx) else emptyMap()
     val targetId = resolveCanonicalChildId(if (childId > 0L) childId else 1L)
-    appsCache[targetId] = verifiedApps
+    val mergedApps = verifiedApps.map { app ->
+      val pkgKey = app.packageName.trim().lowercase()
+      val authRule = authoritativeAppRules["${targetId}_$pkgKey"]
+      val isBlk = authRule?.first ?: (app.isBlocked || bootBlockedSet.contains(pkgKey))
+      val lim = authRule?.second ?: (if (app.dailyLimitMinutes > 0) app.dailyLimitMinutes else (bootLimitsMap[pkgKey] ?: 0))
+      if (isBlk != app.isBlocked || lim != app.dailyLimitMinutes) {
+        app.copy(isBlocked = isBlk, dailyLimitMinutes = lim)
+      } else app
+    }
+    appsCache[targetId] = mergedApps
     val arr = JSONArray()
-    for (app in verifiedApps) {
+    for (app in mergedApps) {
       arr.put(
         JSONObject().apply {
           put("packageName", app.packageName)
@@ -1833,8 +2275,10 @@ object RealtimeCloudRelay {
           ""
         }
       )
-      if (!cachedProfile?.pairingCode.isNullOrBlank()) {
-        put("pairingCode", cachedProfile?.pairingCode)
+      val authCode = cachedProfile?.pairingCode?.takeIf { it.isNotBlank() }
+        ?: resolveAuthoritativePairingCode(targetId)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
       }
       put("apps", arr)
       put("timestamp", System.currentTimeMillis())
@@ -1852,8 +2296,17 @@ object RealtimeCloudRelay {
     val pkgKey = packageName.trim().lowercase()
     val now = System.currentTimeMillis()
     if (pkgKey.isNotBlank()) {
-      authoritativeAppRules["${targetId}_$pkgKey"] = Triple(isBlocked, limitMinutes, now)
-      authoritativeAppRules["${rawId}_$pkgKey"] = Triple(isBlocked, limitMinutes, now)
+      val prevRule = authoritativeAppRules["${targetId}_$pkgKey"]
+      authoritativeAppRules["${targetId}_$pkgKey"] = Triple(
+        isBlocked ?: prevRule?.first,
+        limitMinutes ?: prevRule?.second,
+        now
+      )
+      authoritativeAppRules["${rawId}_$pkgKey"] = Triple(
+        isBlocked ?: prevRule?.first,
+        limitMinutes ?: prevRule?.second,
+        now
+      )
     }
     // Немедленно обновляем локальный кэш appsCache на телефоне родителя, чтобы poller не откатил кнопку назад!
     for (cid in linkedSetOf(targetId, rawId)) {
@@ -1884,6 +2337,87 @@ object RealtimeCloudRelay {
       json = json,
       retain = false
     )
+    DirectP2pSocketEngine.pushDirectLanPacket(json)
+    DirectP2pSocketEngine.broadcastUdpJson(json)
+    // Публикуем полный авторитетный чёрный список и лимиты родителя (retain=true),
+    // чтобы второй родитель (Мать/Отец) и телефон ребёнка после обновления APK всегда имели 100% актуальный чёрный список!
+    publishAuthoritativeParentPolicy(targetId)
+  }
+
+  /**
+   * Публикует авторитетную политику блокировок и лимитов программ от родителя (retain = true),
+   * чтобы чёрный список программ НИКОГДА не сбрасывался после обновления APK на телефоне ребёнка
+   * и мгновенно синхронизировался между обоими родителями (Мать ⇄ Отец ⇄ Ребёнок).
+   */
+  suspend fun publishAuthoritativeParentPolicy(childId: Long) {
+    val rawId = if (childId > 0L) childId else 1L
+    val targetId = resolveCanonicalChildId(rawId)
+    val ctx = DirectP2pSocketEngine.appContext
+    val blockedSet = HashSet<String>()
+    val limitsMap = HashMap<String, Int>()
+
+    // Собираем из Room DB + appsCache + authoritativeAppRules
+    try {
+      if (ctx != null) {
+        val dao = com.example.data.local.KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+        for (app in dao.getAppsForChildOnce(targetId)) {
+          val k = app.packageName.trim().lowercase()
+          if (k.isBlank()) continue
+          if (app.isBlocked) blockedSet.add(k)
+          if (app.dailyLimitMinutes > 0) limitsMap[k] = app.dailyLimitMinutes
+        }
+      }
+    } catch (_: Exception) {}
+
+    appsCache[targetId]?.forEach { app ->
+      val k = app.packageName.trim().lowercase()
+      if (k.isNotBlank()) {
+        if (app.isBlocked) blockedSet.add(k) else blockedSet.remove(k)
+        if (app.dailyLimitMinutes > 0) limitsMap[k] = app.dailyLimitMinutes
+      }
+    }
+
+    val prefix = "${targetId}_"
+    for ((ruleKey, triple) in authoritativeAppRules) {
+      if (ruleKey.startsWith(prefix)) {
+        val pkgKey = ruleKey.removePrefix(prefix)
+        triple.first?.let { isBlk ->
+          if (isBlk) blockedSet.add(pkgKey) else blockedSet.remove(pkgKey)
+        }
+        triple.second?.let { lim ->
+          if (lim > 0) limitsMap[pkgKey] = lim else limitsMap.remove(pkgKey)
+        }
+      }
+    }
+
+    val blockedArr = JSONArray()
+    blockedSet.sorted().forEach { blockedArr.put(it) }
+    val limitsObj = JSONObject()
+    for ((k, v) in limitsMap) {
+      limitsObj.put(k, v)
+    }
+
+    val cachedProfile = getCachedChild(targetId)
+    val now = System.currentTimeMillis()
+    val policyJson = JSONObject().apply {
+      put("type", "PARENT_POLICY_SYNC")
+      put("childId", targetId)
+      val authCode = cachedProfile?.pairingCode?.takeIf { it.isNotBlank() }
+        ?: resolveAuthoritativePairingCode(targetId)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
+      }
+      put("blockedPackages", blockedArr)
+      put("appLimits", limitsObj)
+      put("timestamp", now)
+    }
+    DirectP2pSocketEngine.publishTcpSocketPacket(
+      topic = "${DirectP2pSocketEngine.TOPIC_DATA}/policy_$targetId",
+      json = policyJson,
+      retain = true
+    )
+    DirectP2pSocketEngine.pushDirectLanPacket(policyJson)
+    DirectP2pSocketEngine.broadcastUdpJson(policyJson)
   }
 
   suspend fun publishChatMessage(msg: ChatMessageEntity) {
@@ -1918,6 +2452,57 @@ object RealtimeCloudRelay {
     // Пункт 4 и 5: retain = false! Чаты и сигналы сирены НИКОГДА не должны висеть на брокере со вчерашнего дня!
     DirectP2pSocketEngine.publishTcpSocketPacket(
       topic = "${DirectP2pSocketEngine.TOPIC_DATA}/chat_$targetId",
+      json = json,
+      retain = false
+    )
+    DirectP2pSocketEngine.pushDirectLanPacket(json)
+    DirectP2pSocketEngine.broadcastUdpJson(json)
+  }
+
+  /**
+   * Отправляет квитанцию о прочтении сообщений в чате (одна галочка ✓ превращается в две ✓✓ как в WhatsApp).
+   */
+  fun publishChatReadReceipt(childId: Long, readerRole: String) {
+    val rawId = if (childId > 0L) childId else 1L
+    val targetId = resolveCanonicalChildId(rawId)
+    val authCode = resolveAuthoritativePairingCode(targetId)
+    val json = JSONObject().apply {
+      put("type", "CHAT_READ")
+      put("childId", targetId)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
+      }
+      put("readerRole", readerRole.uppercase())
+      put("timestamp", System.currentTimeMillis())
+    }
+    DirectP2pSocketEngine.publishTcpSocketPacket(
+      topic = "${DirectP2pSocketEngine.TOPIC_DATA}/chat_read_$targetId",
+      json = json,
+      retain = false
+    )
+    DirectP2pSocketEngine.pushDirectLanPacket(json)
+    DirectP2pSocketEngine.broadcastUdpJson(json)
+  }
+
+  /**
+   * Отправляет живой статус набора текста в чате («печатает •••» как в WhatsApp).
+   */
+  fun publishChatTypingStatus(childId: Long, senderRole: String, isTyping: Boolean) {
+    val rawId = if (childId > 0L) childId else 1L
+    val targetId = resolveCanonicalChildId(rawId)
+    val authCode = resolveAuthoritativePairingCode(targetId)
+    val json = JSONObject().apply {
+      put("type", "CHAT_TYPING")
+      put("childId", targetId)
+      if (authCode.isNotBlank()) {
+        put("pairingCode", authCode)
+      }
+      put("senderRole", senderRole.uppercase())
+      put("isTyping", isTyping)
+      put("timestamp", System.currentTimeMillis())
+    }
+    DirectP2pSocketEngine.publishTcpSocketPacket(
+      topic = "${DirectP2pSocketEngine.TOPIC_DATA}/chat_typing_$targetId",
       json = json,
       retain = false
     )

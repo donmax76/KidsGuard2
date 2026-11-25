@@ -27,9 +27,37 @@ class MainActivity : ComponentActivity() {
     syncServicesWithCurrentRole()
   }
 
+  override fun attachBaseContext(newBase: android.content.Context) {
+    val res = newBase.resources
+    val config = android.content.res.Configuration(res.configuration)
+    var changed = false
+    if (config.fontScale != 1.0f) {
+      config.fontScale = 1.0f
+      changed = true
+    }
+    val dm = res.displayMetrics
+    val shortPx = minOf(dm.widthPixels, dm.heightPixels)
+    val shortDp = minOf(config.screenWidthDp, config.screenHeightDp)
+    if (shortPx > 0 && shortDp in 1..388) {
+      val targetDpi = ((shortPx / 392f) * 160f).toInt().coerceIn(220, dm.densityDpi)
+      if (config.densityDpi != targetDpi) {
+        config.densityDpi = targetDpi
+        changed = true
+      }
+    }
+    val contextToUse = if (changed) newBase.createConfigurationContext(config) else newBase
+    super.attachBaseContext(contextToUse)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+      window.attributes = window.attributes.apply {
+        layoutInDisplayCutoutMode =
+          android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+      }
+    }
     com.example.util.ScreenShotManager.restorePersistentLiveStreamState(applicationContext)
     handleSessionInstallerIntent(intent)
 

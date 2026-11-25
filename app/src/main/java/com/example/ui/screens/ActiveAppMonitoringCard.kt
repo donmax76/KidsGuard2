@@ -92,13 +92,12 @@ fun ActiveAppMonitoringCard(
     androidx.compose.runtime.mutableStateOf(0L)
   }
 
-  val applyIncomingFrame: suspend (String?, String?, Long?) -> Unit = { remoteApp, remoteB64, ts ->
+  val applyIncomingFrame: suspend (String?, String?, Long?) -> Unit = { remoteApp, remoteB64, _ ->
     val nowMs = System.currentTimeMillis()
     if (!remoteApp.isNullOrBlank() && !remoteApp.contains("Определение")) {
       cloudActiveApp = remoteApp
     }
-    val isFresh = ts == null || ts <= 0L || kotlin.math.abs(nowMs - ts) <= 20_000L
-    if (!remoteB64.isNullOrBlank() && isFresh) {
+    if (!remoteB64.isNullOrBlank()) {
       val decodedBmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
         try {
           val bytes = android.util.Base64.decode(remoteB64, android.util.Base64.DEFAULT)
@@ -129,7 +128,7 @@ fun ActiveAppMonitoringCard(
     }
   }
 
-  // 1. Real-time push stream observer (requests lightweight active app name on load; full bitmap stream only when user activates LIVE)
+  // 1. Real-time push stream observer (requests initial real screen snapshot + active app on load and refreshes while card is open)
   androidx.compose.runtime.LaunchedEffect(child?.id) {
     val cId = child?.id ?: run {
       cloudActiveApp = null
@@ -138,14 +137,46 @@ fun ActiveAppMonitoringCard(
       return@LaunchedEffect
     }
     try {
+      val cached = cloudSync.pollLatestScreenSnapshot(cId)
+      if (cached != null) {
+        applyIncomingFrame(cached.first, cached.second, cached.third)
+      }
+      // Also check existing capturedScreens history for this child so a screenshot is shown immediately if available
+      if (cloudThumbBitmap == null) {
+        val recentItem = ScreenShotManager.capturedScreens.value.firstOrNull {
+          (it.childId == cId || it.childId <= 0L) && !it.base64Bitmap.isNullOrBlank()
+        }
+        if (recentItem != null) {
+          applyIncomingFrame(recentItem.activeAppName, recentItem.base64Bitmap, null)
+        }
+      }
+      cloudSync.sendRemoteCommand(cId, "TAKE_SCREENSHOT", "")
       cloudSync.sendRemoteCommand(cId, "QUERY_ACTIVE_APP", "")
+      cloudSync.sendRemoteCommand(cId, "REQUEST_POWER_STATS", "")
     } catch (_: Exception) {}
+    launch {
+      // Пока карточка мониторинга открыта у родителя и картинки ещё нет — запрашиваем снимок быстрее (каждые 3.5 сек),
+      // а после получения картинки — в экономном режиме раз в 15 секунд (без включения тяжёлого LIVE-потока 1.4 сек).
+      while (true) {
+        val delayMs = if (cloudThumbBitmap == null) 3_500L else 15_000L
+        kotlinx.coroutines.delay(delayMs)
+        if (!isPollingActive) {
+          try {
+            cloudSync.sendRemoteCommand(cId, "TAKE_SCREENSHOT", "")
+            val polled = cloudSync.pollLatestScreenSnapshot(cId)
+            if (polled != null) {
+              applyIncomingFrame(polled.first, polled.second, polled.third)
+            }
+          } catch (_: Exception) {}
+        }
+      }
+    }
     cloudSync.observeScreenSnapshot(cId).collect { pair ->
       applyIncomingFrame(pair?.first, pair?.second, null)
     }
   }
 
-  // 2. Active polling loop ONLY when user explicitly enables LIVE streaming
+  // 2. Active high-frequency polling loop when user explicitly enables LIVE streaming
   androidx.compose.runtime.LaunchedEffect(child?.id, isPollingActive, pollingIntervalMs) {
     val cId = child?.id ?: return@LaunchedEffect
     if (!isPollingActive) {
@@ -157,10 +188,6 @@ fun ActiveAppMonitoringCard(
     } catch (_: Exception) {}
     while (isPollingActive) {
       try {
-        val nowMs = System.currentTimeMillis()
-        if (cloudThumbBitmap != null && lastThumbReceivedAtMs > 0L && (nowMs - lastThumbReceivedAtMs > 20_000L)) {
-          cloudThumbBitmap = null
-        }
         cloudSync.sendRemoteCommand(cId, "TAKE_SCREENSHOT", "")
         val polled = cloudSync.pollLatestScreenSnapshot(cId)
         pollCount++

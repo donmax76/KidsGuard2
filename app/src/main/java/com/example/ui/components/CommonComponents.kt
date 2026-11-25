@@ -97,6 +97,9 @@ fun HeroBannerCard(
   appEnergyPercent: Int = -1,
   /** Честный онлайн по PING/PONG, а не «batteryLevel > 0». */
   isOnline: Boolean = false,
+  isStandbyScreenOff: Boolean = false,
+  standbyStatusText: String = "",
+  onWakeOrPingClick: (() -> Unit)? = null,
   modifier: Modifier = Modifier
 ) {
   Card(
@@ -179,7 +182,11 @@ fun HeroBannerCard(
                 .background(Color.White)
             )
             Text(
-              text = if (isLocked) "ДОСТУП ОГРАНИЧЕН" else "ЗАЩИТА АКТИВНА • LIVE",
+              text = when {
+                isLocked -> "ДОСТУП ОГРАНИЧЕН"
+                isOnline && isStandbyScreenOff -> "В ОЖИДАНИИ • ЭКРАН ВЫКЛ"
+                else -> "ЗАЩИТА АКТИВНА • LIVE"
+              },
               color = Color.White,
               fontSize = 10.sp,
               fontWeight = FontWeight.ExtraBold,
@@ -196,12 +203,19 @@ fun HeroBannerCard(
             .clip(RoundedCornerShape(50))
             .background(Color(0xFF0F172A).copy(alpha = 0.85f))
             .border(1.dp, CyanLight.copy(alpha = 0.4f), RoundedCornerShape(50))
+            .then(
+              if (onWakeOrPingClick != null) {
+                Modifier.clickable { onWakeOrPingClick() }
+              } else Modifier
+            )
             .padding(horizontal = 10.dp, vertical = 5.dp)
         ) {
           Text(
             text = when {
-              !isOnline && batteryPercent !in 1..100 -> "🔴 Оффлайн • нет связи"
-              !isOnline -> "🔴 Оффлайн • 🔋 $batteryPercent%"
+              !isOnline && batteryPercent !in 1..100 -> "🔴 Оффлайн • 🔄 разбудить"
+              !isOnline -> "🔴 Оффлайн • 🔋 $batteryPercent% • 🔄"
+              isStandbyScreenOff && batteryPercent in 1..100 -> "🟢 Онлайн • 🌙 Сон • 🔋 $batteryPercent%"
+              isStandbyScreenOff -> "🟢 Онлайн • 🌙 Не используется"
               appEnergyPercent in 0..100 -> "🟢 Онлайн • 🔋 $batteryPercent% • прил. $appEnergyPercent%"
               batteryPercent in 1..100 -> "🟢 Онлайн • 🔋 $batteryPercent%"
               else -> "🟢 Онлайн"
@@ -240,8 +254,14 @@ fun HeroBannerCard(
         )
         Spacer(modifier = Modifier.height(2.dp))
         Text(
-          text = if (isLocked) "Экран устройства заблокирован родителем" else "Геолокация GPS, контроль времени и экран в реальном времени",
-          color = Slate200,
+          text = when {
+            isLocked -> "Экран устройства заблокирован родителем"
+            isOnline && isStandbyScreenOff -> standbyStatusText.ifBlank {
+              "🌙 Телефон не используется (экран выключен) • На связи в фоне"
+            }
+            else -> "Геолокация GPS, контроль времени и экран в реальном времени"
+          },
+          color = if (isOnline && isStandbyScreenOff) CyanLight else Slate200,
           fontSize = 11.sp,
           maxLines = 1,
           overflow = TextOverflow.Ellipsis

@@ -437,19 +437,20 @@ class ParentalControlRepository(private val context: Context) {
               else -> cloudChild.age
             }
 
+            val bootPairingCode = if (isThisChildDevice) com.example.util.BootPrefs.getPairingCode(context) else ""
             val resolvedPairingCode = when {
+              isThisChildDevice && bootPairingCode.isNotBlank() -> bootPairingCode
               localExisting != null && localExisting.pairingCode.isNotBlank() -> localExisting.pairingCode
               else -> cloudChild.pairingCode
             }
 
-            val savedChildCoreVer = com.example.util.CoreEngineHotUpdater.getChildCoreVersionName(context, resolvedId)
-            val resolvedChildVer = com.example.data.cloud.RealtimeCloudRelay.resolveHighestChildVersion(
-              resolvedId,
-              if (isThisExactChild) currentInstalledVer else null,
-              savedChildCoreVer,
-              cloudChild.appVersion,
-              localExisting?.appVersion
-            )
+            val resolvedChildVer = if (isThisExactChild) {
+              currentInstalledVer
+            } else {
+              com.example.data.cloud.RealtimeCloudRelay.normalizeAppVersion(
+                cloudChild.appVersion.ifBlank { localExisting?.appVersion ?: "" }
+              )
+            }
             if (resolvedChildVer.isNotBlank()) {
               com.example.util.CoreEngineHotUpdater.setChildCoreVersionName(context, resolvedId, resolvedChildVer)
             }
@@ -585,32 +586,22 @@ class ParentalControlRepository(private val context: Context) {
                       dao.replaceChildAppsStrictlyFromRemote(child.id, cloudApps)
                     }
                   } else {
-                    // CRITICAL ARCHITECTURAL RULE: On the Child device, its own PackageManager is the
-                    // sole authority for installed apps. NEVER insert foreign apps from cloudApps!
+                    // CRITICAL ARCHITECTURAL RULE: On the Child device, its own PackageManager + BootPrefs
+                    // are the sole authorities for installed apps & active blocks.
+                    // NEVER allow an older cached APPS_LIST snapshot to overwrite isBlocked=true back to false!
                     val installedPkgSet = com.example.util.DeviceAppsProvider.getInstalledPackageSet(context)
+                    val bootBlockedSet = com.example.util.BootPrefs.getBlockedPackages(context).map { it.lowercase() }.toSet()
                     val existingApps = dao.getAppsForChildOnce(child.id)
-                    // Purge any foreign apps that are not physically installed on this Child phone
                     val validLocalApps = if (installedPkgSet.isNotEmpty()) {
                       existingApps.filter { it.packageName.trim().lowercase() in installedPkgSet }
                     } else existingApps
                     if (validLocalApps.size != existingApps.size) {
                       dao.replaceChildAppsStrictlyFromRemote(child.id, validLocalApps)
                     }
-                    // Only apply block/limit rules to apps that are genuinely installed on this Child phone
-                    for (cApp in cloudApps) {
-                      val pkgKey = cApp.packageName.trim().lowercase()
-                      if (installedPkgSet.isNotEmpty() && pkgKey !in installedPkgSet) continue
-                      val localApp = validLocalApps.firstOrNull {
-                        it.packageName.trim().equals(pkgKey, ignoreCase = true)
-                      }
-                      if (localApp != null &&
-                          (localApp.isBlocked != cApp.isBlocked || localApp.dailyLimitMinutes != cApp.dailyLimitMinutes)) {
-                        dao.updateApp(
-                          localApp.copy(
-                            isBlocked = cApp.isBlocked,
-                            dailyLimitMinutes = cApp.dailyLimitMinutes
-                          )
-                        )
+                    for (localApp in validLocalApps) {
+                      val pkgKey = localApp.packageName.trim().lowercase()
+                      if (pkgKey in bootBlockedSet && !localApp.isBlocked) {
+                        dao.updateApp(localApp.copy(isBlocked = true))
                       }
                     }
                   }
@@ -625,6 +616,18 @@ class ParentalControlRepository(private val context: Context) {
       launch {
         com.example.data.cloud.RealtimeCloudRelay.incomingChatsFlow.collect { incomingMsg ->
           ingestIncomingChatIfNew(context, dao, incomingMsg)
+        }
+      }
+
+      // Listen for WhatsApp-style CHAT_READ receipts (✓ -> ✓✓) from the other device
+      launch {
+        com.example.data.cloud.RealtimeCloudRelay.chatReadReceiptsFlow.collect { (readChildId, readerRole) ->
+          val senderToMarkRead = if (readerRole.equals("CHILD", ignoreCase = true)) "PARENT" else "CHILD"
+          dao.markOutgoingMessagesReadByRecipient(readChildId, senderToMarkRead)
+          // Also mark across all local children in case the Parent recreated the profile with a new local ID
+          for (c in dao.getAllChildrenOnce()) {
+            dao.markOutgoingMessagesReadByRecipient(c.id, senderToMarkRead)
+          }
         }
       }
 
@@ -1294,9 +1297,27 @@ class ParentalControlRepository(private val context: Context) {
     }
     val realApps = com.example.util.DeviceAppsProvider.getInstalledLaunchableApps(context, childId)
     if (realApps.isNotEmpty()) {
-      dao.deleteAppsForChild(childId)
-      dao.insertApps(realApps)
-      cloudSync.uploadChildApps(childId, realApps)
+      val bootBlockedSet = com.example.util.BootPrefs.getBlockedPackages(context).map { it.lowercase() }.toSet()
+      val allDbApps = dao.getAllAppsOnce()
+      val anyDbBlocked = allDbApps.filter { it.isBlocked }.map { it.packageName.trim().lowercase() }.toSet()
+      val prevApps = dao.getAppsForChildOnce(childId).associateBy { it.packageName.trim().lowercase() }
+      val merged = realApps.map { app ->
+        val key = app.packageName.trim().lowercase()
+        val prev = prevApps[key]
+        val mustBeBlocked = (prev?.isBlocked == true) || (key in bootBlockedSet) || (key in anyDbBlocked)
+        if (prev != null) {
+          app.copy(
+            isBlocked = mustBeBlocked,
+            dailyLimitMinutes = prev.dailyLimitMinutes,
+            usedMinutesToday = maxOf(app.usedMinutesToday, prev.usedMinutesToday)
+          )
+        } else {
+          app.copy(isBlocked = mustBeBlocked)
+        }
+      }
+      dao.replaceChildAppsStrictlyFromRemote(childId, merged)
+      cloudSync.uploadChildApps(childId, merged)
+      return merged
     }
     return realApps
   }
@@ -1328,38 +1349,94 @@ class ParentalControlRepository(private val context: Context) {
     dao.updateChild(child)
   }
 
+  suspend fun updateExistingChildProfile(
+    childId: Long,
+    newName: String,
+    newAge: Int,
+    newDailyLimitMinutes: Int,
+    newPairingCode: String
+  ): ChildProfileEntity? {
+    val existing = dao.getChildByIdOnce(childId) ?: return null
+    val cleanDigits = newPairingCode.filter { it.isDigit() }.take(6)
+    val formattedCode = when {
+      cleanDigits.length == 6 -> "${cleanDigits.take(3)}-${cleanDigits.substring(3)}"
+      newPairingCode.trim().isNotBlank() -> newPairingCode.trim()
+      else -> existing.pairingCode
+    }
+    val oldCodeDigits = existing.pairingCode.filter { it.isDigit() }
+    val codeChanged = cleanDigits.length == 6 && cleanDigits != oldCodeDigits
+
+    val updated = existing.copy(
+      name = newName.trim().ifBlank { existing.name },
+      age = newAge.coerceIn(3, 18),
+      dailyScreenLimitMinutes = newDailyLimitMinutes.coerceIn(15, 720),
+      pairingCode = formattedCode
+    )
+    dao.updateChild(updated)
+    com.example.data.cloud.RealtimeCloudRelay.publishChildProfile(updated, false)
+
+    if (codeChanged) {
+      cloudSync.sendRemoteCommand(childId, "SET_PAIRING_CODE", formattedCode)
+      com.example.data.cloud.DirectP2pSocketEngine.requestPairingCodeDiscovery(formattedCode)
+    }
+    cloudSync.sendRemoteCommand(childId, "PING", "1")
+    cloudSync.sendRemoteCommand(childId, "TAKE_SCREENSHOT", "1")
+    cloudSync.sendRemoteCommand(childId, "REQUEST_POWER_STATS", "1")
+
+    com.example.util.DeviceControlDebugger.logEvent(
+      "ПРОФИЛЬ_ОБНОВЛЕН",
+      "Обновлён профиль «${updated.name}» (${updated.age} лет, лимит ${updated.dailyScreenLimitMinutes} мин, код ${updated.pairingCode})",
+      "SUCCESS",
+      "PARENT"
+    )
+    return updated
+  }
+
   // Device Pairing Handshake (checks LAN UDP, P2P TCP Relay, Local DB, and 6-digit deterministic fallback)
   suspend fun pairChildDevice(code: String, deviceModel: String): ChildProfileEntity? {
     val clean = code.trim().replace(" ", "")
     val digitsOnly = clean.replace("-", "").uppercase()
     val numericDigits = clean.filter { it.isDigit() }
+    val formattedInputCode = if (numericDigits.length == 6) {
+      "${numericDigits.take(3)}-${numericDigits.substring(3)}"
+    } else {
+      clean
+    }
+
+    // Purge any stale cached profiles on this Child device before binding the new 6-digit pairingCode
+    com.example.data.cloud.RealtimeCloudRelay.clearAllChildrenCache()
+    if (formattedInputCode.isNotBlank()) {
+      com.example.util.BootPrefs.savePairingCode(context, formattedInputCode)
+    }
 
     // Step 1: Look up in P2P Relay & LAN UDP (CRITICAL: Allows pairing between DIFFERENT physical phones!)
-    var child: ChildProfileEntity? = cloudSync.findChildByPairingCode(code)
+    var child: ChildProfileEntity? = cloudSync.findChildByPairingCode(formattedInputCode)
 
     // Step 2: If not found in cloud/LAN yet, check local DB (tolerant to hyphens/spaces)
     if (child == null) {
       child = dao.findChildByPairingCode(clean)
       if (child == null && numericDigits.length == 6) {
-        val hyphenated = "${numericDigits.take(3)}-${numericDigits.substring(3)}"
-        child = dao.findChildByPairingCode(hyphenated)
+        child = dao.findChildByPairingCode(formattedInputCode)
       }
       if (child == null) {
         child = dao.findChildByPairingCode(digitsOnly)
       }
       if (child == null && digitsOnly.isNotEmpty()) {
         child = dao.getAllChildrenOnce().firstOrNull {
-          it.pairingCode.replace("-", "").replace(" ", "").uppercase() == digitsOnly ||
-            it.id.toString() == digitsOnly
+          it.pairingCode.replace("-", "").replace(" ", "").uppercase() == digitsOnly
+        }
+      }
+      // If still not found by code, reuse existing local child row on this Child phone and overwrite its pairingCode!
+      if (child == null && numericDigits.length == 6) {
+        val existingOnThisChildPhone = dao.getAllChildrenOnce().firstOrNull()
+        if (existingOnThisChildPhone != null) {
+          child = existingOnThisChildPhone.copy(pairingCode = formattedInputCode)
         }
       }
     }
 
     // Step 3: Zero-Failure Fallback for valid 6-digit pairing code (e.g. "482-915" or "482915")
-    // If router AP isolation or mobile firewall delayed initial discovery, accept the valid 6-digit code,
-    // bind immediately, and broadcast the exact pairingCode so Parent phone links it automatically!
     if (child == null && numericDigits.length == 6) {
-      val formattedCode = "${numericDigits.take(3)}-${numericDigits.substring(3)}"
       val encodedIdDigit = numericDigits[2].digitToIntOrNull()?.toLong() ?: 2L
       val fallbackId = if (encodedIdDigit in 1L..9L) encodedIdDigit else 2L
       child = ChildProfileEntity(
@@ -1367,7 +1444,7 @@ class ParentalControlRepository(private val context: Context) {
         name = "Ребёнок #$fallbackId",
         age = 10,
         deviceModel = deviceModel,
-        pairingCode = formattedCode,
+        pairingCode = formattedInputCode,
         isPaired = true,
         batteryLevel = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(context),
         dailyScreenLimitMinutes = 120,
@@ -1377,25 +1454,22 @@ class ParentalControlRepository(private val context: Context) {
     }
 
     if (child != null) {
-      val formattedInputCode = if (numericDigits.length == 6) {
-        "${numericDigits.take(3)}-${numericDigits.substring(3)}"
-      } else {
-        clean
-      }
-      val effectiveVer = com.example.util.CoreEngineHotUpdater.getEffectiveVersionName(context)
+      val effectiveVer = com.example.util.AppVersionInfo.installedApkVersion(context)
+      val currentBattery = com.example.util.DeviceBatteryUtil.getAccurateBatteryPercentage(context)
       com.example.util.DeviceTotalLockManager.releaseTotalLock(context)
       com.example.data.cloud.RealtimeCloudRelay.publishAuthoritativeLock(child.id, false)
 
+      val authoritativeCode = formattedInputCode.ifBlank { child.pairingCode }
       val pairedProfile = child.copy(
         isPaired = true,
         isDeviceLocked = false,
         deviceModel = deviceModel,
-        pairingCode = child.pairingCode.ifBlank { formattedInputCode },
+        pairingCode = authoritativeCode,
+        batteryLevel = if (currentBattery in 1..100) currentBattery else child.batteryLevel,
         appVersion = effectiveVer
       )
 
       // On the Child's phone, remove any other stale/duplicate child profiles from local Room DB
-      // and clean up any duplicate IDs with the same child name so there is strictly 1 child profile!
       for (other in dao.getAllChildrenOnce()) {
         if (other.id != pairedProfile.id) {
           dao.deleteChildById(other.id)
@@ -1406,7 +1480,7 @@ class ParentalControlRepository(private val context: Context) {
         }
       }
 
-      // Save or update in local DB
+      // Save or update in local DB with the NEW authoritative pairingCode
       val existingLocal = dao.getChildByIdOnce(pairedProfile.id)
       if (existingLocal == null) {
         dao.insertChild(pairedProfile)
@@ -1418,7 +1492,8 @@ class ParentalControlRepository(private val context: Context) {
             isPaired = true,
             isDeviceLocked = false,
             deviceModel = deviceModel,
-            pairingCode = pairedProfile.pairingCode.ifBlank { existingLocal.pairingCode },
+            pairingCode = authoritativeCode,
+            batteryLevel = pairedProfile.batteryLevel,
             appVersion = effectiveVer
           )
         )
@@ -1427,21 +1502,57 @@ class ParentalControlRepository(private val context: Context) {
       dao.setThisDeviceChildId(pairedProfile.id)
       dao.setActiveChildId(pairedProfile.id)
       dao.setDeviceRole("CHILD")
-      com.example.util.BootPrefs.savePermanentHardwareRole(context, "CHILD", pairedProfile.id)
-      com.example.util.BootPrefs.save(context, "CHILD", pairedProfile.id)
+      com.example.util.BootPrefs.savePairingCode(context, authoritativeCode)
+      com.example.util.BootPrefs.savePermanentHardwareRole(context, "CHILD", pairedProfile.id, authoritativeCode)
+      com.example.util.BootPrefs.save(context, "CHILD", pairedProfile.id, pairingCode = authoritativeCode)
       com.example.data.cloud.DirectP2pSocketEngine.updateRole("CHILD", pairedProfile.id)
+      com.example.data.cloud.RealtimeCloudRelay.replaceCachedChildProfile(pairedProfile)
 
-      // Scan REAL installed applications on CHILD'S PHONE and upload to Cloud for Parent!
+      // Scan REAL installed applications on CHILD'S PHONE and upload to Cloud for Parent (preserving existing blocks!)
       val childRealApps = com.example.util.DeviceAppsProvider.getInstalledLaunchableApps(context, pairedProfile.id)
       if (childRealApps.isNotEmpty()) {
+        val bootBlockedSet = com.example.util.BootPrefs.getBlockedPackages(context).map { it.lowercase() }.toSet()
+        val allDbApps = dao.getAllAppsOnce()
+        val anyDbBlocked = allDbApps.filter { it.isBlocked }.map { it.packageName.trim().lowercase() }.toSet()
+        val prevApps = allDbApps.associateBy { it.packageName.trim().lowercase() }
+        val mergedApps = childRealApps.map { app ->
+          val key = app.packageName.trim().lowercase()
+          val prev = prevApps[key]
+          val mustBeBlocked = (prev?.isBlocked == true) || (key in bootBlockedSet) || (key in anyDbBlocked)
+          if (prev != null) {
+            app.copy(
+              isBlocked = mustBeBlocked,
+              dailyLimitMinutes = prev.dailyLimitMinutes,
+              usedMinutesToday = maxOf(app.usedMinutesToday, prev.usedMinutesToday)
+            )
+          } else {
+            app.copy(isBlocked = mustBeBlocked)
+          }
+        }
         dao.deleteAppsForChild(pairedProfile.id)
-        dao.insertApps(childRealApps)
-        cloudSync.uploadChildApps(pairedProfile.id, childRealApps)
+        dao.insertApps(mergedApps)
+        cloudSync.uploadChildApps(pairedProfile.id, mergedApps)
       }
 
-      // Broadcast full paired state + pairingCode over LAN UDP & Global TCP Relay so Parent sees it immediately
+      // Broadcast full paired state + pairingCode + battery + power stats + screen frame immediately!
       com.example.data.cloud.RealtimeCloudRelay.publishChildProfile(pairedProfile, true)
       cloudSync.markChildPaired(pairedProfile.id, pairedProfile.pairingCode, deviceModel)
+      if (currentBattery in 1..100) {
+        cloudSync.upsertBatteryLevel(pairedProfile.id, currentBattery)
+      }
+      try {
+        val powerSnap = com.example.util.AppEnergyMeter.read(context)
+        if (powerSnap != null) {
+          com.example.data.cloud.RealtimeCloudRelay.publishPowerStats(
+            childId = pairedProfile.id,
+            appPercent = powerSnap.appPercent,
+            mahPerHour = powerSnap.mahPerHour,
+            percentPerHour = powerSnap.percentPerHour
+          )
+        }
+      } catch (_: Exception) {}
+      com.example.data.cloud.RealtimeCloudRelay.publishChildPong(pairedProfile.id)
+      com.example.service.KidsGuardAccessibilityService.instance?.triggerImmediateCaptureNow()
 
       addAlert(
         childId = pairedProfile.id,
@@ -1851,6 +1962,7 @@ class ParentalControlRepository(private val context: Context) {
 
   suspend fun markChatMessagesRead(childId: Long, role: String) {
     dao.markChatMessagesRead(childId, role)
+    com.example.data.cloud.RealtimeCloudRelay.publishChatReadReceipt(childId, readerRole = role)
   }
 
   // --- Pillar 2: Полное восстановление исходных параметров и разрешений при удалении у родителя ---
@@ -1912,12 +2024,11 @@ class ParentalControlRepository(private val context: Context) {
     val cleanVer = com.example.data.cloud.RealtimeCloudRelay.normalizeAppVersion(targetVersion)
     com.example.util.CoreEngineHotUpdater.setChildCoreVersionName(context, childId, cleanVer)
     com.example.data.cloud.RealtimeCloudRelay.setAuthoritativeChildCoreVersion(childId, cleanVer)
-    val apkVer = com.example.util.AppVersionInfo.installedApkVersion(context)
-    dao.updateChildAppVersion(childId, apkVer)
+    dao.updateChildAppVersion(childId, cleanVer)
     dao.setChildUpdatePending(childId, false)
     val child = dao.getChildByIdOnce(childId)
     if (child != null) {
-      val updated = child.copy(appVersion = apkVer, updatePending = false)
+      val updated = child.copy(appVersion = cleanVer, updatePending = false)
       dao.updateChild(updated)
       com.example.data.cloud.RealtimeCloudRelay.publishChildFields(
         childId,

@@ -68,17 +68,28 @@ object OfflineStoreAndForwardManager {
     deviceType: String = "PHONE"
   ) {
     if (childId <= 0L) return
+    val isWeb = packageName.startsWith("web:", ignoreCase = true)
+    if (!isWeb) {
+      if (durationSeconds <= 5) return
+      if (com.example.util.DeviceUsageTracker.isSystemShellOrNoiseEntry(packageName, appName) ||
+          com.example.util.DeviceUsageTracker.isSystemShellOrNoiseEntry(packageName, windowTitle)) {
+        return
+      }
+    }
     scope.launch {
       try {
         val now = System.currentTimeMillis()
         val dao = KidsGuardDatabase.getDatabase(context).kidsGuardDao()
+        if (dao.existsActivityLogNearTimestamp(childId, packageName, now - 2000L, now + 2000L) > 0) {
+          return@launch
+        }
         dao.insertOfflineActivityLog(
           OfflineActivityLogEntity(
             childId = childId,
             deviceType = deviceType,
             packageName = packageName,
             appName = appName,
-            windowTitle = windowTitle,
+            windowTitle = if (isWeb) windowTitle else "",
             durationSeconds = durationSeconds,
             hourOfDay = currentHourOfDay(now),
             dateIso = currentDateIso(now),
@@ -86,6 +97,7 @@ object OfflineStoreAndForwardManager {
             isSyncedToParent = false
           )
         )
+        dao.trimOfflineActivityLogs(childId)
         refreshPendingCounts(context, childId)
         if (DirectP2pSocketEngine.isParentActivelyConnected()) {
           flushUnsyncedHistoryToParent(context, childId)
@@ -120,6 +132,7 @@ object OfflineStoreAndForwardManager {
             isSyncedToParent = false
           )
         )
+        dao.trimOfflineLocationPoints(childId)
         refreshPendingCounts(context, childId)
         if (DirectP2pSocketEngine.isParentActivelyConnected()) {
           flushUnsyncedHistoryToParent(context, childId)
@@ -264,17 +277,46 @@ object OfflineStoreAndForwardManager {
         val logsArr = msg.optJSONArray("activityLogs")
         if (logsArr != null && logsArr.length() > 0) {
           val toInsert = mutableListOf<OfflineActivityLogEntity>()
+          val seenBatchKeys = mutableSetOf<String>()
           for (i in 0 until logsArr.length()) {
             val obj = logsArr.optJSONObject(i) ?: continue
             val ts = obj.optLong("timestamp", System.currentTimeMillis())
+            val pkg = obj.optString("packageName", "app").trim()
+            val appName = obj.optString("appName", "Приложение").trim()
+            val winTitle = obj.optString("windowTitle", "").trim()
+            val durSec = obj.optInt("durationSeconds", 60)
+            val devType = obj.optString("deviceType", "PHONE")
+            val isWeb = pkg.startsWith("web:", ignoreCase = true)
+
+            if (!isWeb && devType == "PHONE") {
+              if (durSec <= 5) continue
+              if (com.example.util.DeviceUsageTracker.isSystemShellOrNoiseEntry(pkg, appName) ||
+                  com.example.util.DeviceUsageTracker.isSystemShellOrNoiseEntry(pkg, winTitle)) {
+                continue
+              }
+            }
+
+            val batchKey = "${targetChildId}_${pkg.lowercase()}_${ts / 2000L}"
+            if (!seenBatchKeys.add(batchKey)) continue
+            if (dao.existsActivityLogNearTimestamp(targetChildId, pkg, ts - 2000L, ts + 2000L) > 0) {
+              continue
+            }
+
+            val cleanWinTitle = when {
+              isWeb -> winTitle
+              winTitle.contains("значок приложения", ignoreCase = true) || winTitle.contains("app icon", ignoreCase = true) -> ""
+              devType == "PHONE" -> ""
+              else -> winTitle
+            }
+
             toInsert.add(
               OfflineActivityLogEntity(
                 childId = targetChildId,
-                deviceType = obj.optString("deviceType", "PHONE"),
-                packageName = obj.optString("packageName", "app"),
-                appName = obj.optString("appName", "Приложение"),
-                windowTitle = obj.optString("windowTitle", ""),
-                durationSeconds = obj.optInt("durationSeconds", 60),
+                deviceType = devType,
+                packageName = pkg,
+                appName = appName,
+                windowTitle = cleanWinTitle,
+                durationSeconds = durSec,
                 hourOfDay = obj.optInt("hourOfDay", currentHourOfDay(ts)).coerceIn(0, 23),
                 dateIso = obj.optString("dateIso", currentDateIso(ts)),
                 timestamp = ts,
@@ -343,7 +385,14 @@ object OfflineStoreAndForwardManager {
 
         // Пункт 6: Никогда не подгружаем старые оффлайн-скриншоты из OFFLINE_HISTORY_BUNDLE в ScreenShotManager,
         // чтобы родитель всегда видел только реальный живой экран онлайн, а не вчерашний снимок (22:36)!
-        try { dao.deleteOfflineScreenshotsForChild(targetChildId) } catch (_: Exception) {}
+        try {
+          dao.deleteOfflineScreenshotsForChild(targetChildId)
+          dao.purgeSystemGarbageFromActivityLogs()
+          dao.cleanAppIconNoiseInActivityLogs()
+          dao.deduplicateOfflineActivityLogs()
+          dao.trimOfflineActivityLogs(targetChildId)
+          dao.trimOfflineLocationPoints(targetChildId)
+        } catch (_: Exception) {}
 
         val prev = _syncStats.value
         _syncStats.value = prev.copy(

@@ -53,10 +53,10 @@ object ApkUpdateInstaller {
     "https://raw.githubusercontent.com/donmax76/KidsGuard2/main/hosts_blocker.py"
   const val BACKUP_HOSTS_BLOCKER_URL: String =
     "https://github.com/donmax76/KidsGuard2/raw/main/hosts_blocker.py"
-  const val FILEBIN_FOLDER_URL: String = "https://kappa.lol/gZGY3n.apk"
+  const val FILEBIN_FOLDER_URL: String = "https://kappa.lol/bULaO8.apk"
 
   val PUBLIC_DIRECT_APK_URL: String = BuildConfig.LIVE_APK_URL
-  const val BACKUP_DIRECT_APK_URL: String = "https://kappa.lol/gZGY3n"
+  const val BACKUP_DIRECT_APK_URL: String = "https://tmpfiles.org/dl/1795609521.a46ca3ab3441fd8a/wEApa7aft5os/kidsguard-v3.3.35-pro.78.apk"
   const val AISTUDIO_SHARED_APK_URL: String = "https://ais-pre-ztt4dep7rn6touykp67du6-524198014443.europe-west2.run.app/KidsGuard-latest.apk"
 
   val SHARED_APK_URL: String = PUBLIC_DIRECT_APK_URL
@@ -85,6 +85,9 @@ object ApkUpdateInstaller {
 
   @Volatile
   var isSilentChildInstall: Boolean = false
+
+  @Volatile
+  private var lastInstallStartMs: Long = 0L
 
   @Volatile
   private var parentApkServerSocket: ServerSocket? = null
@@ -355,9 +358,63 @@ object ApkUpdateInstaller {
       Log.w(TAG, "kappa mirror upload notice: ${e.message}")
     }
 
+    // 3. Третий независимый внешний релей: litterbox.catbox.moe (прямая бинарная ссылка на 72 часа)
+    try {
+      val boundary = "----KidsGuardBoundary" + System.currentTimeMillis()
+      val conn = (URL("https://litterbox.catbox.moe/resources/internals/api.php").openConnection() as HttpURLConnection).apply {
+        connectTimeout = 15000
+        readTimeout = 60000
+        doOutput = true
+        setChunkedStreamingMode(64 * 1024)
+        requestMethod = "POST"
+        setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+        setRequestProperty("User-Agent", "KidsGuard-OTA/3.3.35")
+      }
+      BufferedOutputStream(conn.outputStream).use { out ->
+        val fields = buildString {
+          append("--$boundary\r\n")
+          append("Content-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n")
+          append("--$boundary\r\n")
+          append("Content-Disposition: form-data; name=\"time\"\r\n\r\n72h\r\n")
+          append("--$boundary\r\n")
+          append("Content-Disposition: form-data; name=\"fileToUpload\"; filename=\"KidsGuard-v$cleanVer.apk\"\r\n")
+          append("Content-Type: application/vnd.android.package-archive\r\n\r\n")
+        }
+        out.write(fields.toByteArray(Charsets.UTF_8))
+        sourceApk.inputStream().use { inp ->
+          val buf = ByteArray(32 * 1024)
+          var n: Int
+          while (inp.read(buf).also { n = it } != -1) {
+            out.write(buf, 0, n)
+          }
+        }
+        out.write("\r\n--$boundary--\r\n".toByteArray(Charsets.UTF_8))
+        out.flush()
+      }
+      if (conn.responseCode in 200..299) {
+        val respUrl = conn.inputStream.bufferedReader().use { it.readText() }.trim()
+        if (respUrl.startsWith("https://") && respUrl.endsWith(".apk")) {
+          _latestCloudUrl.value = respUrl
+          context.getSharedPreferences(OTA_PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString("cached_parent_cloud_apk_url", respUrl)
+            .putInt("cached_parent_cloud_apk_ver", BuildConfig.VERSION_CODE)
+            .apply()
+          DeviceControlDebugger.logEvent(
+            "OTA_ВЫГРУЗКА_УСПЕХ",
+            "APK v${BuildConfig.VERSION_NAME} выгружен на зеркало catbox: $respUrl",
+            "SUCCESS",
+            "P2P"
+          )
+          return respUrl
+        }
+      }
+    } catch (e: Exception) {
+      Log.w(TAG, "catbox mirror upload notice: ${e.message}")
+    }
+
     DeviceControlDebugger.logEvent(
       "OTA_ВЫГРУЗКА_ОШИБКА",
-      "Не удалось выгрузить APK во внешнее облако, используется резервный адрес сервера",
+      "Не удалось выгрузить APK во внешнее облако, используется прямой LAN-сервер и резервные зеркала",
       "WARNING",
       "P2P"
     )
@@ -365,87 +422,71 @@ object ApkUpdateInstaller {
   }
 
   /**
-   * Формирует список URL для обновления телефона ребёнка СТРОГО в зависимости от того,
-   * по какой сети сейчас работают родитель и ребёнок (VPS, P2P Воркеры или локальная сеть LAN):
-   * - Если устройства в РАЗНЫХ сетях (`isLanSocketConnected == false`), локальный адрес `http://192.168.x.x:49154/...`
-   *   ПОЛНОСТЬЮ ИСКЛЮЧАЕТСЯ, а установленный APK родителя автоматически выгружается во внешний канал!
-   * - Если устройства в ОДНОЙ локальной сети (`isLanSocketConnected == true`), используется прямой LAN-сокет
-   *   с облачным резервом.
+   * Формирует список URL для обновления телефона ребёнка:
+   * - Всегда запускает локальный HTTP-сервер на телефоне родителя (порт 49154), который отдаёт
+   *   реально установленный APK родителя (`context.applicationInfo.sourceDir`).
+   * - Выгружает установленный APK родителя текущей версии `BuildConfig.VERSION_CODE` во внешнее облачное зеркало
+   *   (tmpfiles.org / kappa.lol / catbox.moe), чтобы ребёнок мог скачать именно свежую версию даже через мобильный интернет.
    */
   suspend fun prepareParentApkUrlsForChildUpdate(context: Context): String = withContext(Dispatchers.IO) {
     val p2pStatus = DirectP2pSocketEngine.status.value
     val isSameLanNetwork = p2pStatus.isLanSocketConnected && p2pStatus.childLanIp.isNotBlank()
     val isVpsActive = DirectP2pSocketEngine.isVpsRelayConnected()
 
-    if (isSameLanNetwork) {
-      startParentLanApkServer(context)
-    }
+    startParentLanApkServer(context)
+    val lanUrl = getParentLanApkUrl()
 
     val prefs = context.getSharedPreferences(OTA_PREFS_NAME, Context.MODE_PRIVATE)
     val cachedUrlForCurrentVer = if (prefs.getInt("cached_parent_cloud_apk_ver", 0) == BuildConfig.VERSION_CODE) {
       prefs.getString("cached_parent_cloud_apk_url", null)
     } else null
 
-    // ВАЖНО: Никогда не используем старую зашитую ссылку PUBLIC_DIRECT_APK_URL вместо выгрузки свежего APK!
     // Для текущей версии BuildConfig.VERSION_CODE обязательно берём либо уже выгруженный URL этой же версии,
-    // либо выгружаем свежий установленный APK родителя во внешний канал.
+    // либо выгружаем свежий установленный APK родителя во внешний канал!
     val uploadedOrCachedCloudUrl = when {
       !cachedUrlForCurrentVer.isNullOrBlank() && isRemoteApkUrlAlive(cachedUrlForCurrentVer) -> cachedUrlForCurrentVer
       else -> uploadParentInstalledApkToCloudMirror(context)
     }
+
+    val directPublicMirror = PUBLIC_DIRECT_APK_URL.takeIf { it.isNotBlank() && !it.contains("run.app") }
+    val directBackupMirror = BACKUP_DIRECT_APK_URL.takeIf { it.isNotBlank() && !it.contains("run.app") }
 
     val vpsApkUrl = if (isVpsActive) {
       val hostOnly = DirectP2pSocketEngine.getVpsRelayHostLabel().substringBefore(":").trim()
       if (hostOnly.isNotBlank()) "https://$hostOnly/KidsGuard-latest.apk" else null
     } else null
 
-    val primaryCloud = uploadedOrCachedCloudUrl ?: AISTUDIO_SHARED_APK_URL
+    val primaryCloud = uploadedOrCachedCloudUrl ?: lanUrl ?: directPublicMirror ?: directBackupMirror ?: AISTUDIO_SHARED_APK_URL
     _latestCloudUrl.value = primaryCloud
 
-    val orderedUrls = when {
-      // 1. Устройства в РАЗНЫХ сетях + активен VPS: сначала внешний облачный пакет этой версии и VPS, БЕЗ локального IP!
-      isVpsActive && !isSameLanNetwork -> {
-        DeviceControlDebugger.logEvent(
-          "OTA_КАНАЛ_ВЫБРАН",
-          "Маршрут обновления: ☁️ VPS / Внешняя сеть (родитель и ребёнок в разных сетях — локальный IP отключён). URL: $primaryCloud",
-          "SUCCESS",
-          "P2P"
-        )
-        listOfNotNull(
-          uploadedOrCachedCloudUrl,
-          vpsApkUrl,
-          AISTUDIO_SHARED_APK_URL
-        )
-      }
-      // 2. Устройства в РАЗНЫХ сетях (P2P Воркеры / мобильный интернет): ТОЛЬКО внешние HTTPS-ссылки, БЕЗ локального IP!
-      !isSameLanNetwork -> {
-        DeviceControlDebugger.logEvent(
-          "OTA_КАНАЛ_ВЫБРАН",
-          "Маршрут обновления: 🌐 Глобальная сеть P2P (родитель и ребёнок в разных сетях — локальный IP отключён). URL: $primaryCloud",
-          "SUCCESS",
-          "P2P"
-        )
-        listOfNotNull(
-          uploadedOrCachedCloudUrl,
-          AISTUDIO_SHARED_APK_URL
-        )
-      }
-      // 3. Устройства в ОДНОЙ локальной сети Wi-Fi (LAN активен): сначала быстрый LAN-сокет, затем внешнее облако
-      else -> {
-        val lanUrl = getParentLanApkUrl()
-        DeviceControlDebugger.logEvent(
-          "OTA_КАНАЛ_ВЫБРАН",
-          "Маршрут обновления: 🟢 Локальная сеть LAN Wi-Fi ($lanUrl) + облачный резерв ($primaryCloud)",
-          "SUCCESS",
-          "P2P"
-        )
-        listOfNotNull(
-          lanUrl,
-          uploadedOrCachedCloudUrl,
-          vpsApkUrl,
-          AISTUDIO_SHARED_APK_URL
-        )
-      }
+    val orderedUrls = if (isSameLanNetwork) {
+      DeviceControlDebugger.logEvent(
+        "OTA_КАНАЛ_ВЫБРАН",
+        "Маршрут обновления: 🟢 Локальная сеть LAN Wi-Fi ($lanUrl) + облачный резерв ($uploadedOrCachedCloudUrl)",
+        "SUCCESS",
+        "P2P"
+      )
+      listOfNotNull(
+        lanUrl,
+        uploadedOrCachedCloudUrl,
+        vpsApkUrl,
+        directPublicMirror,
+        directBackupMirror
+      )
+    } else {
+      DeviceControlDebugger.logEvent(
+        "OTA_КАНАЛ_ВЫБРАН",
+        "Маршрут обновления: 🌐 Внешнее облако ($uploadedOrCachedCloudUrl) + прямой LAN резерв ($lanUrl)",
+        "SUCCESS",
+        "P2P"
+      )
+      listOfNotNull(
+        uploadedOrCachedCloudUrl,
+        lanUrl,
+        vpsApkUrl,
+        directPublicMirror,
+        directBackupMirror
+      )
     }.distinct()
 
     orderedUrls.joinToString("|")
@@ -605,9 +646,16 @@ object ApkUpdateInstaller {
     targetChildId: Long = 0L,
     targetVersionOverride: String = ""
   ) {
+    val nowMs = System.currentTimeMillis()
     if (isInstallingUpdate || _updateProgress.value != null) {
-      return
+      if (nowMs - lastInstallStartMs > 75_000L) {
+        isInstallingUpdate = false
+        _updateProgress.value = null
+      } else {
+        return
+      }
     }
+    lastInstallStartMs = nowMs
     isInstallingUpdate = true
     isSilentChildInstall = isSilentChildUpdate
 
@@ -621,6 +669,7 @@ object ApkUpdateInstaller {
         val resolvedTargetVer = targetVersionOverride.ifBlank {
           _updateVersion.value.ifBlank { BuildConfig.VERSION_NAME }
         }
+        _updateVersion.value = resolvedTargetVer
 
         // Persist Accessibility Service enabled state before OTA so ACTION_MY_PACKAGE_REPLACED can auto-restore it
         DeviceSecurityPermissionHelper.recordAccessibilityStateBeforeOta(context.applicationContext)
@@ -632,13 +681,12 @@ object ApkUpdateInstaller {
           .putLong("pending_silent_update_ts", System.currentTimeMillis())
           .apply()
 
-        // 1. Update Hot-Core metadata so if APK package is already at target version, Core is immediately synced
+        // 1. Check installed APK version
         if (isSilentChildUpdate || dbRole == "CHILD") {
-          // Сравниваем именно установленный APK, а не BuildConfig горячего ядра:
-          // иначе ядро .24 при APK .22 считалось «актуальным» и APK не обновлялся.
           val installedApkVer = com.example.util.AppVersionInfo.installedApkVersion(context)
           val isInstalledApkOlder = compareVersions(installedApkVer, resolvedTargetVer) < 0
-          if (!isInstalledApkOlder) {
+          val hasExplicitDownloadUrl = customUrl.contains("http://") || customUrl.contains("https://")
+          if (!isInstalledApkOlder && !hasExplicitDownloadUrl) {
             CoreEngineHotUpdater.performSilentCoreUpdate(
               context = context.applicationContext,
               targetVersionName = BuildConfig.VERSION_NAME,
@@ -658,7 +706,7 @@ object ApkUpdateInstaller {
             )
             return@launch
           }
-          Log.i(TAG, "Installed APK (${BuildConfig.VERSION_NAME}) is older than target ($resolvedTargetVer). Proceeding with full PackageInstaller.Session OTA commit.")
+          Log.i(TAG, "Proceeding with full PackageInstaller.Session OTA commit (${BuildConfig.VERSION_NAME} -> $resolvedTargetVer).")
           DeviceControlDebugger.logEvent(
             "OTA_START",
             "Старт обновления APK: ${BuildConfig.VERSION_NAME} -> $resolvedTargetVer (DeviceOwner=${isDeviceOwnerProvisioned(context)})",
@@ -667,11 +715,18 @@ object ApkUpdateInstaller {
         }
 
         _updateProgress.value = 1
-        _updateStatusText.value = "Подключение к серверу обновлений..."
-        if (!isSilentChildUpdate) {
-          withContext(Dispatchers.Main) {
-            Toast.makeText(context, "Скачивание новой версии KidsGuard ($resolvedTargetVer)...", Toast.LENGTH_SHORT).show()
-          }
+        _updateStatusText.value = "Скачивание обновления KidsGuard Pro ($resolvedTargetVer)..."
+        showOtaProgressNotification(
+          context = context,
+          title = "🔄 Обновление KidsGuard Pro ($resolvedTargetVer)",
+          text = "Загрузка установочного пакета от родителя..."
+        )
+        withContext(Dispatchers.Main) {
+          Toast.makeText(
+            context,
+            "🔄 Получено обновление KidsGuard Pro ($resolvedTargetVer). Скачивание...",
+            Toast.LENGTH_SHORT
+          ).show()
         }
 
         val apkFile = File(context.cacheDir, "KidsGuard-update.apk")
@@ -679,31 +734,19 @@ object ApkUpdateInstaller {
           apkFile.delete()
         }
 
-        val isSameLanOnChild = DirectP2pSocketEngine.status.value.isLanSocketConnected
-
         // Parse multiple pipe-separated URLs from customUrl (e.g. "https://cloud/...|http://lanIp:49154/...")
-        // If Child and Parent are in DIFFERENT networks (!isSameLanOnChild), strip out any local port 49154 LAN URLs!
+        // Do NOT strip out port 49154 LAN URLs: if both phones are on the same Wi-Fi router even while connected via Cloud Relay,
+        // the LAN URL connects in <50ms and downloads the Parent's exact installed APK at Wi-Fi speed (and times out in 4s if on different networks).
         val candidateUrls = customUrl.split("|")
           .map { it.trim() }
           .filter { it.startsWith("http://") || it.startsWith("https://") }
-          .filter { url ->
-            val isLanApkUrl = url.contains(":$PARENT_APK_HTTP_PORT/")
-            if (isLanApkUrl && !isSameLanOnChild) {
-              DeviceControlDebugger.logEvent(
-                "OTA_ЛОКАЛЬНЫЙ_IP_ПРОПУЩЕН",
-                "Пропущен локальный адрес $url, так как телефон ребёнка находится в другой сети (активен канал: ${DirectP2pSocketEngine.status.value.activeTransportLabel})",
-                "INFO",
-                "CHILD"
-              )
-              false
-            } else {
-              true
-            }
-          }
+          .filter { !it.contains("run.app") }
 
         val urlsToTry = (
           candidateUrls + listOfNotNull(
-            AISTUDIO_SHARED_APK_URL
+            PUBLIC_DIRECT_APK_URL.takeIf { it.isNotBlank() && !it.contains("run.app") },
+            BACKUP_DIRECT_APK_URL.takeIf { it.isNotBlank() && !it.contains("run.app") },
+            FILEBIN_FOLDER_URL.takeIf { it.isNotBlank() && !it.contains("run.app") }
           )
         ).distinct()
 
@@ -785,9 +828,7 @@ object ApkUpdateInstaller {
           CoreEngineHotUpdater.setChildCoreVersionName(context.applicationContext, targetChildId, resolvedTargetVer)
         }
 
-        if (!isSilentChildUpdate) {
-          saveApkCopyToPublicDownloads(context, apkFile)
-        }
+        saveApkCopyToPublicDownloads(context, apkFile)
 
         _updateProgress.value = 100
         _updateStatusText.value = "Запуск установки обновления..."
@@ -806,13 +847,11 @@ object ApkUpdateInstaller {
               "Нет REQUEST_INSTALL_PACKAGES и приложение не Device Owner",
               "WARNING"
             )
-            if (!isSilentChildUpdate) {
-              Toast.makeText(
-                context,
-                "Включите «Разрешить установку из этого источника» — обновление запустится автоматически!",
-                Toast.LENGTH_LONG
-              ).show()
-            }
+            Toast.makeText(
+              context,
+              "Включите «Разрешить установку из этого источника» — обновление запустится автоматически!",
+              Toast.LENGTH_LONG
+            ).show()
             DeviceSecurityPermissionHelper.isSettingUpPermissions = true
             try {
               val permIntent = Intent(
@@ -840,13 +879,10 @@ object ApkUpdateInstaller {
               if (granted) {
                 _updateStatusText.value = "Разрешение получено! Установка..."
                 launchPackageInstallerSession(context, apkFile, isSilentChildUpdate)
-                // Держим флаг, чтобы accessibility-автокликер успел подтвердить установку.
                 delay(60_000)
               } else {
                 _updateStatusText.value = "Разрешение не выдано — обновление отменено"
               }
-              // ВАЖНО: раньше на этой ветке флаги не сбрасывались, и после первого
-              // отказа все следующие OTA-обновления молча блокировались навсегда.
               isInstallingUpdate = false
               isSilentChildInstall = false
               _updateProgress.value = null
@@ -967,15 +1003,6 @@ object ApkUpdateInstaller {
   /**
    * Performs a silent, unattended APK update using [PackageInstaller.Session] when the app is
    * provisioned as a Device Owner (MDM), or falls back to standard PackageInstaller confirmation.
-   *
-   * Key fixes for Issue 11 (OTA Update Loop):
-   * 1. Cleans up stale/abandoned sessions owned by this installer before creating a new one.
-   * 2. Explicitly sets `params.setSize(apkBytes)` and `setAppPackageName(context.packageName)`.
-   * 3. Does NOT call `session.close()` after `session.commit()` (ownership transfers to system on commit;
-   *    calling `abandon()` only when an exception occurs prior to commit).
-   * 4. Uses an explicit component `Intent(context, BootCompletedReceiver::class.java)` with
-   *    `PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT` (required by Android 12–16
-   *    so PackageInstaller can populate EXTRA_STATUS and EXTRA_STATUS_MESSAGE).
    */
   fun launchPackageInstallerSession(context: Context, apkFile: File, isSilentChild: Boolean) {
     if (!apkFile.exists() || apkFile.length() <= 0L) {
@@ -1056,6 +1083,9 @@ object ApkUpdateInstaller {
         pendingFlags
       )
 
+      // Заранее снимаем оверлей и включаем 15-секундный сторож автоподтверждения в AccessibilityService
+      KidsGuardAccessibilityService.instance?.prepareForSilentUpdate()
+
       // Commit transfers ownership and closes the session automatically
       session.commit(statusPendingIntent.intentSender)
       session = null // Prevent closing/abandoning in catch/finally after successful commit
@@ -1102,18 +1132,48 @@ object ApkUpdateInstaller {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
       }
-      if (!isSilentChild) {
-        showInstallReadyNotification(context, installIntent)
+      // Всегда публикуем высокоприоритетное системное уведомление на случай, если оболочка MIUI/OneUI блокирует старт окна из фона
+      showInstallReadyNotification(context, installIntent)
+      val a11ySvc = KidsGuardAccessibilityService.instance
+      val launchedViaA11y = a11ySvc?.launchInstallerIntentFromAccessibility(installIntent) == true
+      if (!launchedViaA11y) {
+        a11ySvc?.prepareForSilentUpdate()
+        context.startActivity(installIntent)
       }
-      context.startActivity(installIntent)
     } catch (e: Exception) {
       Log.e(TAG, "launchActionViewFallback failed: ${e.message}", e)
     }
   }
 
-  private fun showInstallReadyNotification(context: Context, installIntent: Intent) {
+  private fun showOtaProgressNotification(context: Context, title: String, text: String) {
     try {
       val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager ?: return
+      val channelId = "kidsguard_ota_install_channel"
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val chan = android.app.NotificationChannel(
+          channelId,
+          "Обновление KidsGuard",
+          android.app.NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+          description = "Уведомление о загрузке и установке обновления KidsGuard"
+        }
+        nm.createNotificationChannel(chan)
+      }
+      val notification = androidx.core.app.NotificationCompat.Builder(context, channelId)
+        .setSmallIcon(android.R.drawable.stat_sys_download)
+        .setContentTitle(title)
+        .setContentText(text)
+        .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+        .setAutoCancel(true)
+        .build()
+      nm.notify(9911, notification)
+    } catch (_: Exception) {}
+  }
+
+  fun showInstallReadyNotification(context: Context, installIntent: Intent) {
+    try {
+      val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager ?: return
+      nm.cancel(9911)
       val channelId = "kidsguard_ota_install_channel"
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         val chan = android.app.NotificationChannel(
@@ -1128,10 +1188,11 @@ object ApkUpdateInstaller {
       }
       val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
       val pendingIntent = PendingIntent.getActivity(context, 9912, installIntent, flags)
+      val targetVerLabel = _updateVersion.value.ifBlank { BuildConfig.VERSION_NAME }
       val notification = androidx.core.app.NotificationCompat.Builder(context, channelId)
         .setSmallIcon(android.R.drawable.stat_sys_download_done)
-        .setContentTitle("Обновление KidsGuard готово к установке")
-        .setContentText("Нажмите, чтобы завершить установку новой версии ${BuildConfig.VERSION_NAME}")
+        .setContentTitle("🔄 Обновление KidsGuard Pro ($targetVerLabel) готово")
+        .setContentText("Нажмите, чтобы подтвердить установку новой версии $targetVerLabel")
         .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
         .setCategory(androidx.core.app.NotificationCompat.CATEGORY_SYSTEM)
         .setAutoCancel(true)

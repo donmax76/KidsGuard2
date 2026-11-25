@@ -61,6 +61,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -91,6 +92,7 @@ import com.example.ui.theme.Slate400
 import com.example.ui.theme.Slate800
 import com.example.ui.theme.Slate900
 import com.example.ui.theme.Slate950
+import kotlinx.coroutines.launch
 
 private data class QuickDomainPreset(
   val domain: String,
@@ -152,6 +154,92 @@ fun ContentFilterScreen(
     matchesSearch && matchesFilter
   }
 
+  val context = androidx.compose.ui.platform.LocalContext.current
+  val dao = remember(context) { com.example.data.local.KidsGuardDatabase.getDatabase(context).kidsGuardDao() }
+  val activeCfg by remember { dao.getFamilyConfig() }.collectAsState(initial = null)
+  val activeChildId = activeCfg?.currentActiveChildId?.takeIf { it > 0L } ?: 1L
+
+  // Фильтр даты и интервала времени для истории посещённых сайтов:
+  var siteDateMode by remember { androidx.compose.runtime.mutableIntStateOf(0) } // 0 = Сегодня, 1 = Вчера, 2 = Дата
+  var siteCustomDateMs by remember { androidx.compose.runtime.mutableLongStateOf(System.currentTimeMillis()) }
+  var siteStartHour by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+  var siteStartMinute by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+  var siteEndHour by remember { androidx.compose.runtime.mutableIntStateOf(23) }
+  var siteEndMinute by remember { androidx.compose.runtime.mutableIntStateOf(59) }
+
+  val (siteStartMs, siteEndMs, sitePeriodLabel) = remember(
+    siteDateMode,
+    siteCustomDateMs,
+    siteStartHour,
+    siteStartMinute,
+    siteEndHour,
+    siteEndMinute
+  ) {
+    val cal = java.util.Calendar.getInstance()
+    when (siteDateMode) {
+      1 -> cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+      2 -> cal.timeInMillis = siteCustomDateMs
+    }
+    cal.set(java.util.Calendar.HOUR_OF_DAY, siteStartHour)
+    cal.set(java.util.Calendar.MINUTE, siteStartMinute)
+    cal.set(java.util.Calendar.SECOND, 0)
+    cal.set(java.util.Calendar.MILLISECOND, 0)
+    val sMs = cal.timeInMillis
+    cal.set(java.util.Calendar.HOUR_OF_DAY, siteEndHour)
+    cal.set(java.util.Calendar.MINUTE, siteEndMinute)
+    cal.set(java.util.Calendar.SECOND, 59)
+    cal.set(java.util.Calendar.MILLISECOND, 999)
+    val eMs = cal.timeInMillis.coerceAtLeast(sMs)
+    val dFmt = java.text.SimpleDateFormat("dd.MM.yyyy", java.util.Locale.getDefault())
+    val dTitle = when (siteDateMode) {
+      0 -> "Сегодня (${dFmt.format(java.util.Date(sMs))})"
+      1 -> "Вчера (${dFmt.format(java.util.Date(sMs))})"
+      else -> dFmt.format(java.util.Date(sMs))
+    }
+    val tTitle = "%02d:%02d–%02d:%02d".format(siteStartHour, siteStartMinute, siteEndHour, siteEndMinute)
+    Triple(sMs, eMs, "$dTitle • $tTitle")
+  }
+
+  val scope = androidx.compose.runtime.rememberCoroutineScope()
+
+  androidx.compose.runtime.LaunchedEffect(activeChildId) {
+    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+      runCatching {
+        dao.purgeSystemGarbageFromActivityLogs()
+        dao.cleanAppIconNoiseInActivityLogs()
+        dao.deduplicateOfflineActivityLogs()
+        dao.purgeSystemGarbageFromAppControls()
+      }
+    }
+  }
+
+  val intervalActivityLogs by remember(activeChildId, siteStartMs, siteEndMs) {
+    dao.getActivityLogsByDateRange(
+      childId = activeChildId,
+      deviceType = "",
+      startTimestamp = siteStartMs,
+      endTimestamp = siteEndMs
+    )
+  }.collectAsState(initial = emptyList())
+
+  val visitedWebsiteLogs = remember(intervalActivityLogs) {
+    val seenBuckets = HashSet<String>()
+    intervalActivityLogs
+      .filter { log ->
+        if (!log.packageName.startsWith("web:", ignoreCase = true)) return@filter false
+        val dom = com.example.util.BootPrefs.normalizeDomain(log.packageName.removePrefix("web:"))
+        dom.isNotBlank() && dom.contains(".")
+      }
+      .filter { log ->
+        val dom = com.example.util.BootPrefs.normalizeDomain(log.packageName.removePrefix("web:"))
+        seenBuckets.add("$dom|${log.timestamp / 2000L}")
+      }
+  }
+
+  val fullDateTimeFormatter = remember {
+    java.text.SimpleDateFormat("dd.MM.yyyy HH:mm:ss", java.util.Locale.getDefault())
+  }
+
   val blockedCategoriesCount = categoryRules.count { it.isBlocked }
   val activeBlacklistedDomainsCount = domainRules.count { it.isBlocked }
   val totalHitsCount = rules.sumOf { it.hitsCount }
@@ -172,13 +260,13 @@ fun ContentFilterScreen(
       ) {
         Column(modifier = Modifier.weight(1f)) {
           Text(
-            text = "Веб-фильтр и Черный список",
+            text = "Веб-фильтр и История сайтов",
             color = Color.White,
             fontSize = 22.sp,
             fontWeight = FontWeight.Bold
           )
           Text(
-            text = "Блокировка категорий сайтов, доменов (URL) и опасных запросов в браузерах ребенка",
+            text = "Контроль всех браузеров (Chrome, Mi Browser, Samsung, Yandex, Opera, Firefox) и блокировка сайтов в 1 клик",
             color = Slate400,
             fontSize = 12.sp
           )
@@ -226,7 +314,7 @@ fun ContentFilterScreen(
                   .background(EmeraldShieldLight)
               )
               Text(
-                text = "АКТИВНЫЙ ПЕРЕХВАТ В БРАУЗЕРАХ (CHROME, YANDEX, OPERA, SAFARI/WEB)",
+                text = "АКТИВНЫЙ ПЕРЕХВАТ ВО ВСЕХ БРАУЗЕРАХ (CHROME, MI, SAMSUNG, YANDEX, OPERA, FIREFOX)",
                 color = EmeraldShieldLight,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.ExtraBold
@@ -239,9 +327,9 @@ fun ContentFilterScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
           ) {
             FilterStatTile(
-              title = "Категории",
-              value = "$blockedCategoriesCount / ${categoryRules.size.coerceAtLeast(8)}",
-              subtitle = "запрещено",
+              title = "Сайтов в логе",
+              value = "${visitedWebsiteLogs.size}",
+              subtitle = "за период",
               accentColor = CyanLight,
               modifier = Modifier.weight(1f)
             )
@@ -253,12 +341,377 @@ fun ContentFilterScreen(
               modifier = Modifier.weight(1f)
             )
             FilterStatTile(
-              title = "Отражено",
-              value = "$totalHitsCount",
-              subtitle = "попыток входа",
+              title = "Категории",
+              value = "$blockedCategoriesCount / ${categoryRules.size.coerceAtLeast(8)}",
+              subtitle = "запрещено",
               accentColor = AmberWarning,
               modifier = Modifier.weight(1f)
             )
+          }
+        }
+      }
+    }
+
+    // 0. ИСТОРИЯ ПОСЕЩЁННЫХ САЙТОВ (ВСЕ БРАУЗЕРЫ) С ФИЛЬТРОМ ПО ДАТЕ И ВРЕМЕНИ + БЛОКИРОВКОЙ В 1 КЛИК
+    item {
+      Card(
+        modifier = Modifier
+          .fillMaxWidth()
+          .border(1.2.dp, CyanLight.copy(alpha = 0.5f), RoundedCornerShape(18.dp)),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Slate900)
+      ) {
+        Column(
+          modifier = Modifier.padding(16.dp),
+          verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = "🌐 История посещённых сайтов (Все браузеры)",
+                color = Color.White,
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = 15.sp
+              )
+              Text(
+                text = "$sitePeriodLabel • Посещений: ${visitedWebsiteLogs.size}",
+                color = CyanLight,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold
+              )
+            }
+            if (visitedWebsiteLogs.isNotEmpty()) {
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(Slate800)
+                  .border(1.dp, Slate400.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                  .clickable {
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                      runCatching {
+                        dao.deleteWebsiteHistoryForChild(activeChildId)
+                        dao.purgeSystemGarbageFromActivityLogs()
+                        dao.deduplicateOfflineActivityLogs()
+                      }
+                    }
+                  }
+                  .padding(horizontal = 10.dp, vertical = 5.dp)
+              ) {
+                Text(
+                  text = "Очистить",
+                  color = Slate200,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.Bold
+                )
+              }
+            }
+          }
+
+          // Фильтр даты (Сегодня / Вчера / 📅 Дата)
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+          ) {
+            listOf(0 to "Сегодня", 1 to "Вчера").forEach { (idx, label) ->
+              val isSel = siteDateMode == idx
+              Box(
+                modifier = Modifier
+                  .weight(1f)
+                  .clip(RoundedCornerShape(9.dp))
+                  .background(if (isSel) CyanContainer else Slate950)
+                  .border(1.dp, if (isSel) CyanLight else Slate800, RoundedCornerShape(9.dp))
+                  .clickable { siteDateMode = idx }
+                  .padding(vertical = 6.dp),
+                contentAlignment = Alignment.Center
+              ) {
+                Text(
+                  text = label,
+                  color = if (isSel) CyanLight else Slate200,
+                  fontSize = 11.sp,
+                  fontWeight = if (isSel) FontWeight.ExtraBold else FontWeight.Medium
+                )
+              }
+            }
+            val isCustom = siteDateMode == 2
+            Box(
+              modifier = Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(9.dp))
+                .background(if (isCustom) CyanContainer else Slate950)
+                .border(1.dp, if (isCustom) CyanLight else Slate800, RoundedCornerShape(9.dp))
+                .clickable {
+                  val cal = java.util.Calendar.getInstance().apply { timeInMillis = siteCustomDateMs }
+                  android.app.DatePickerDialog(
+                    context,
+                    { _, y, m, d ->
+                      val p = java.util.Calendar.getInstance().apply {
+                        set(java.util.Calendar.YEAR, y)
+                        set(java.util.Calendar.MONTH, m)
+                        set(java.util.Calendar.DAY_OF_MONTH, d)
+                      }
+                      siteCustomDateMs = p.timeInMillis
+                      siteDateMode = 2
+                    },
+                    cal.get(java.util.Calendar.YEAR),
+                    cal.get(java.util.Calendar.MONTH),
+                    cal.get(java.util.Calendar.DAY_OF_MONTH)
+                  ).apply {
+                    datePicker.maxDate = System.currentTimeMillis()
+                  }.show()
+                }
+                .padding(vertical = 6.dp),
+              contentAlignment = Alignment.Center
+            ) {
+              Text(
+                text = if (isCustom) {
+                  "📅 " + java.text.SimpleDateFormat("dd.MM.yy", java.util.Locale.getDefault()).format(java.util.Date(siteCustomDateMs))
+                } else "📅 Дата",
+                color = if (isCustom) CyanLight else Slate200,
+                fontSize = 11.sp,
+                fontWeight = if (isCustom) FontWeight.ExtraBold else FontWeight.Medium
+              )
+            }
+          }
+
+          // Фильтр ВРЕМЕНИ (С ЧЧ:ММ по ЧЧ:ММ + быстрые интервалы 00:00–02:00 и др.)
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(RoundedCornerShape(10.dp))
+              .background(Slate950)
+              .border(1.dp, Slate800, RoundedCornerShape(10.dp))
+              .padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+          ) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.spacedBy(6.dp),
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Text(
+                text = "🕒 Время:",
+                color = Slate200,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold
+              )
+              Box(
+                modifier = Modifier
+                  .weight(1f)
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(Color(0xFF16243A))
+                  .border(1.dp, CyanLight.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                  .clickable {
+                    android.app.TimePickerDialog(
+                      context,
+                      { _, h, min ->
+                        siteStartHour = h
+                        siteStartMinute = min
+                      },
+                      siteStartHour,
+                      siteStartMinute,
+                      true
+                    ).show()
+                  }
+                  .padding(vertical = 5.dp),
+                contentAlignment = Alignment.Center
+              ) {
+                Text(
+                  text = "С %02d:%02d".format(siteStartHour, siteStartMinute),
+                  color = CyanLight,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.ExtraBold
+                )
+              }
+              Box(
+                modifier = Modifier
+                  .weight(1f)
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(Color(0xFF16243A))
+                  .border(1.dp, CyanLight.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                  .clickable {
+                    android.app.TimePickerDialog(
+                      context,
+                      { _, h, min ->
+                        siteEndHour = h
+                        siteEndMinute = min
+                      },
+                      siteEndHour,
+                      siteEndMinute,
+                      true
+                    ).show()
+                  }
+                  .padding(vertical = 5.dp),
+                contentAlignment = Alignment.Center
+              ) {
+                Text(
+                  text = "По %02d:%02d".format(siteEndHour, siteEndMinute),
+                  color = CyanLight,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.ExtraBold
+                )
+              }
+            }
+
+            val timePresets = listOf(
+              Triple("Весь день", Pair(0, 0), Pair(23, 59)),
+              Triple("00:00–02:00", Pair(0, 0), Pair(2, 0)),
+              Triple("02:00–06:00", Pair(2, 0), Pair(6, 0)),
+              Triple("06:00–12:00", Pair(6, 0), Pair(12, 0)),
+              Triple("12:00–18:00", Pair(12, 0), Pair(18, 0)),
+              Triple("18:00–24:00", Pair(18, 0), Pair(23, 59))
+            )
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+              timePresets.forEach { (pLabel, sHm, eHm) ->
+                val active = siteStartHour == sHm.first &&
+                  siteStartMinute == sHm.second &&
+                  siteEndHour == eHm.first &&
+                  siteEndMinute == eHm.second
+                Box(
+                  modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (active) CyanContainer else Color(0xFF16243A))
+                    .border(1.dp, if (active) CyanLight else Slate800, RoundedCornerShape(6.dp))
+                    .clickable {
+                      siteStartHour = sHm.first
+                      siteStartMinute = sHm.second
+                      siteEndHour = eHm.first
+                      siteEndMinute = eHm.second
+                    }
+                    .padding(vertical = 4.dp),
+                  contentAlignment = Alignment.Center
+                ) {
+                  Text(
+                    text = pLabel,
+                    color = if (active) CyanLight else Slate400,
+                    fontSize = 9.sp,
+                    fontWeight = if (active) FontWeight.ExtraBold else FontWeight.Medium,
+                    maxLines = 1
+                  )
+                }
+              }
+            }
+          }
+
+          if (visitedWebsiteLogs.isEmpty()) {
+            Box(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(Slate950)
+                .padding(14.dp),
+              contentAlignment = Alignment.Center
+            ) {
+              Text(
+                text = "За выбранный интервал ($sitePeriodLabel) посещений сайтов в браузерах не зафиксировано.",
+                color = Slate400,
+                fontSize = 11.sp
+              )
+            }
+          } else {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+              visitedWebsiteLogs.take(40).forEach { webLog ->
+                val rawDomain = when {
+                  webLog.packageName.startsWith("web:", ignoreCase = true) ->
+                    com.example.util.BootPrefs.normalizeDomain(webLog.packageName.removePrefix("web:"))
+                  else -> {
+                    val m = Regex("""(?:https?://)?(?:www\.)?([a-z0-9.-]+\.[a-z]{2,10})""", RegexOption.IGNORE_CASE)
+                      .find(webLog.windowTitle + " " + webLog.appName)
+                    com.example.util.BootPrefs.normalizeDomain(m?.groupValues?.getOrNull(1))
+                  }
+                }
+                val existingDomainRule = if (rawDomain.isNotBlank()) {
+                  domainRules.find { com.example.util.BootPrefs.normalizeDomain(it.value) == rawDomain }
+                } else null
+                val isDomainBlocked = existingDomainRule?.isBlocked == true
+
+                Row(
+                  modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Slate950)
+                    .border(
+                      1.dp,
+                      if (isDomainBlocked) RoseLock.copy(alpha = 0.55f) else Slate800,
+                      RoundedCornerShape(10.dp)
+                    )
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                  horizontalArrangement = Arrangement.SpaceBetween,
+                  verticalAlignment = Alignment.CenterVertically
+                ) {
+                  Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                      text = if (rawDomain.isNotBlank()) "🌐 $rawDomain" else webLog.appName,
+                      color = Color.White,
+                      fontWeight = FontWeight.Bold,
+                      fontSize = 13.sp,
+                      maxLines = 1
+                    )
+                    if (webLog.windowTitle.isNotBlank()) {
+                      Text(
+                        text = webLog.windowTitle,
+                        color = Slate200,
+                        fontSize = 11.sp,
+                        maxLines = 1
+                      )
+                    }
+                    Text(
+                      text = "🕒 Дата и время: ${fullDateTimeFormatter.format(java.util.Date(webLog.timestamp))}",
+                      color = CyanLight,
+                      fontSize = 10.sp,
+                      fontWeight = FontWeight.SemiBold
+                    )
+                  }
+
+                  if (rawDomain.isNotBlank()) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(
+                      modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (isDomainBlocked) RoseContainer else EmeraldContainer)
+                        .border(
+                          1.dp,
+                          if (isDomainBlocked) RoseLock else EmeraldShield,
+                          RoundedCornerShape(8.dp)
+                        )
+                        .clickable {
+                          if (existingDomainRule != null) {
+                            onToggleRule(existingDomainRule)
+                          } else {
+                            onAddRule("DOMAIN", rawDomain, "Сайт $rawDomain")
+                          }
+                        }
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                      Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                      ) {
+                        Icon(
+                          imageVector = if (isDomainBlocked) Icons.Default.Block else Icons.Default.CheckCircle,
+                          contentDescription = null,
+                          tint = if (isDomainBlocked) RoseLock else EmeraldShieldLight,
+                          modifier = Modifier.size(13.dp)
+                        )
+                        Text(
+                          text = if (isDomainBlocked) "Разблокировать" else "Заблокировать",
+                          color = if (isDomainBlocked) RoseLock else EmeraldShieldLight,
+                          fontSize = 10.sp,
+                          fontWeight = FontWeight.ExtraBold
+                        )
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }

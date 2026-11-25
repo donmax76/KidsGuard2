@@ -61,18 +61,41 @@ fun MyApplicationTheme(
   dynamicColor: Boolean = false,
   content: @Composable () -> Unit,
 ) {
+  val context = LocalContext.current
   val colorScheme = when {
     dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-      val context = LocalContext.current
       if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
     }
     darkTheme -> DarkColorScheme
     else -> LightColorScheme
   }
 
-  MaterialTheme(
-    colorScheme = colorScheme,
-    typography = Typography,
-    content = content
+  // Адаптивная калибровка интерфейса под Xiaomi (MIUI / HyperOS), Redmi, POCO, Samsung и любые размеры экранов:
+  // 1) Фиксируем fontScale = 1.0f, чтобы системное увеличение шрифта на Xiaomi не смещало кнопки, комбо-боксы и тексты.
+  // 2) Автоматически масштабируем плотность пикселей (density) к эталонной ширине 392dp, чтобы на узких,
+  //    нестандартных или крупных экранах все карточки, переключатели и контролы всегда стояли строго на своих местах.
+  val baseDensity = androidx.compose.ui.platform.LocalDensity.current
+  val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+  val dm = context.resources.displayMetrics
+  val shortSidePx = minOf(dm.widthPixels, dm.heightPixels)
+  val shortSideDp = minOf(configuration.screenWidthDp, configuration.screenHeightDp)
+  val adaptiveDensityValue = if (shortSidePx > 0 && shortSideDp in 1..388) {
+    (shortSidePx / 392f).coerceIn(1.35f, baseDensity.density)
+  } else {
+    baseDensity.density
+  }
+  val adaptiveDensity = androidx.compose.ui.unit.Density(
+    density = adaptiveDensityValue,
+    fontScale = 1.0f
   )
+
+  androidx.compose.runtime.CompositionLocalProvider(
+    androidx.compose.ui.platform.LocalDensity provides adaptiveDensity
+  ) {
+    MaterialTheme(
+      colorScheme = colorScheme,
+      typography = Typography,
+      content = content
+    )
+  }
 }

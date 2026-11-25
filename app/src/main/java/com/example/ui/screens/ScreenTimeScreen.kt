@@ -351,11 +351,12 @@ fun ScreenTimeScreen(
       }
     }
 
-    // Interactive Chart of Screen Time Distribution by App Today
+    // Interactive Chart of Screen Time Distribution by App Today / Yesterday / Calendar
     item {
       com.example.ui.components.AppUsageDistributionChartCard(
         apps = apps,
-        totalChildUsedMinutes = usedMinutes
+        totalChildUsedMinutes = usedMinutes,
+        childId = child?.id ?: 0L
       )
     }
 

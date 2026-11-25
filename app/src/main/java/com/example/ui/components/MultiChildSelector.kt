@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.PhoneAndroid
@@ -74,9 +75,11 @@ fun MultiChildSelector(
   onDeleteChild: (ChildProfileEntity) -> Unit,
   onAddChildClick: () -> Unit,
   onConnectExistingChildClick: () -> Unit = onAddChildClick,
+  onEditChildProfile: (childId: Long, newName: String, newAge: Int, newDailyLimitMinutes: Int, newPairingCode: String) -> Unit = { _, _, _, _, _ -> },
   modifier: Modifier = Modifier
 ) {
   var childToDelete by remember { mutableStateOf<ChildProfileEntity?>(null) }
+  var childToEdit by remember { mutableStateOf<ChildProfileEntity?>(null) }
 
   Column(modifier = modifier.fillMaxWidth()) {
     Row(
@@ -190,7 +193,7 @@ fun MultiChildSelector(
             Row(
               modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
               verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.spacedBy(10.dp)
+              horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
               Box(
                 modifier = Modifier
@@ -228,10 +231,28 @@ fun MultiChildSelector(
 
                 val batLabel = if (child.batteryLevel in 1..100) "${child.batteryLevel}%" else "ожидание связи"
                 Text(
-                  text = if (isSelected) "🟢 Активный профиль • $batLabel" else "📱 Нажмите для выбора ($batLabel)",
+                  text = if (isSelected) "🟢 Код ${child.pairingCode} • $batLabel" else "📱 Код ${child.pairingCode} ($batLabel)",
                   color = if (isSelected) EmeraldShieldLight else CyanLight,
                   fontSize = 11.sp,
                   fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                )
+              }
+
+              // Edit Child Profile Button (Name, Age, Daily Limit, 6-Digit Pairing Code)
+              Box(
+                modifier = Modifier
+                  .size(32.dp)
+                  .clip(CircleShape)
+                  .background(CyanContainer.copy(alpha = 0.45f))
+                  .clickable { childToEdit = child }
+                  .testTag("edit_child_button_${child.id}"),
+                contentAlignment = Alignment.Center
+              ) {
+                Icon(
+                  Icons.Default.Edit,
+                  contentDescription = "Редактировать профиль и код",
+                  tint = CyanLight,
+                  modifier = Modifier.size(16.dp)
                 )
               }
 
@@ -273,6 +294,18 @@ fun MultiChildSelector(
         }
       }
     }
+  }
+
+  // Edit Child Profile Dialog
+  childToEdit?.let { child ->
+    EditChildProfileDialog(
+      child = child,
+      onDismiss = { childToEdit = null },
+      onSave = { newName, newAge, newDailyLimit, newPairingCode ->
+        onEditChildProfile(child.id, newName, newAge, newDailyLimit, newPairingCode)
+        childToEdit = null
+      }
+    )
   }
 
   // Delete Confirmation Dialog
@@ -321,9 +354,104 @@ fun MultiChildSelector(
 }
 
 @Composable
+fun EditChildProfileDialog(
+  child: ChildProfileEntity,
+  onDismiss: () -> Unit,
+  onSave: (newName: String, newAge: Int, newDailyLimitMinutes: Int, newPairingCode: String) -> Unit
+) {
+  var name by remember(child.id) { mutableStateOf(child.name) }
+  var ageText by remember(child.id) { mutableStateOf(child.age.toString()) }
+  var limitMinutesText by remember(child.id) { mutableStateOf(child.dailyScreenLimitMinutes.toString()) }
+  var pairingCodeInput by remember(child.id) { mutableStateOf(child.pairingCode) }
+
+  val cleanCodeDigits = pairingCodeInput.filter { it.isDigit() }
+  val isValid = name.trim().isNotBlank() && cleanCodeDigits.length == 6
+
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = {
+      Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Icon(Icons.Default.Edit, contentDescription = null, tint = CyanLight)
+        Text("Редактировать профиль: ${child.name}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+      }
+    },
+    text = {
+      Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+          text = "Вы можете изменить имя, возраст, дневной лимит времени и 6-значный код подключения (если на телефоне ребёнка уже введён другой код или нужно задать свой).",
+          color = Slate400,
+          fontSize = 12.sp,
+          lineHeight = 16.sp
+        )
+
+        OutlinedTextField(
+          value = name,
+          onValueChange = { name = it },
+          label = { Text("Имя ребенка") },
+          singleLine = true,
+          modifier = Modifier.fillMaxWidth().testTag("edit_child_name_input")
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+          OutlinedTextField(
+            value = ageText,
+            onValueChange = { ageText = it.filter { ch -> ch.isDigit() }.take(2) },
+            label = { Text("Возраст (лет)") },
+            singleLine = true,
+            modifier = Modifier.weight(1f).testTag("edit_child_age_input")
+          )
+
+          OutlinedTextField(
+            value = limitMinutesText,
+            onValueChange = { limitMinutesText = it.filter { ch -> ch.isDigit() }.take(3) },
+            label = { Text("Лимит (мин/день)") },
+            singleLine = true,
+            modifier = Modifier.weight(1f).testTag("edit_child_limit_input")
+          )
+        }
+
+        OutlinedTextField(
+          value = pairingCodeInput,
+          onValueChange = { raw ->
+            val digits = raw.filter { it.isDigit() }.take(6)
+            pairingCodeInput = if (digits.length > 3) "${digits.take(3)}-${digits.substring(3)}" else digits
+          },
+          label = { Text("6-значный код подключения (XXX-XXX)") },
+          placeholder = { Text("Например: 102-702") },
+          singleLine = true,
+          modifier = Modifier.fillMaxWidth().testTag("edit_child_code_input")
+        )
+      }
+    },
+    confirmButton = {
+      Button(
+        onClick = {
+          val parsedAge = ageText.toIntOrNull()?.coerceIn(3, 18) ?: child.age
+          val parsedLimit = limitMinutesText.toIntOrNull()?.coerceIn(15, 720) ?: child.dailyScreenLimitMinutes
+          val formattedCode = "${cleanCodeDigits.take(3)}-${cleanCodeDigits.substring(3)}"
+          onSave(name.trim(), parsedAge, parsedLimit, formattedCode)
+        },
+        enabled = isValid,
+        colors = ButtonDefaults.buttonColors(containerColor = EmeraldShieldLight, contentColor = Slate950),
+        modifier = Modifier.testTag("save_edited_child_button")
+      ) {
+        Text("Сохранить изменения", fontWeight = FontWeight.Bold)
+      }
+    },
+    dismissButton = {
+      TextButton(onClick = onDismiss) {
+        Text("Отмена", color = Slate400)
+      }
+    },
+    containerColor = Slate900
+  )
+}
+
+@Composable
 fun PairingCodeDialog(
   child: ChildProfileEntity,
-  onDismiss: () -> Unit
+  onDismiss: () -> Unit,
+  onEditClick: (() -> Unit)? = null
 ) {
   AlertDialog(
     onDismissRequest = onDismiss,
@@ -339,7 +467,7 @@ fun PairingCodeDialog(
         horizontalAlignment = Alignment.CenterHorizontally
       ) {
         Text(
-          text = "Откройте KidsGuard на телефоне ребенка, выберите «Это телефон ребенка» и введите этот код:",
+          text = "Откройте KidsGuard на телефоне ребенка, нажмите «По коду» и введите этот 6-значный код:",
           color = Slate400,
           fontSize = 13.sp,
           textAlign = TextAlign.Center
@@ -370,6 +498,19 @@ fun PairingCodeDialog(
           fontSize = 12.sp,
           textAlign = TextAlign.Center
         )
+
+        if (onEditClick != null) {
+          Spacer(modifier = Modifier.height(12.dp))
+          OutlinedButton(
+            onClick = onEditClick,
+            shape = RoundedCornerShape(10.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, CyanLight)
+          ) {
+            Icon(Icons.Default.Edit, contentDescription = null, tint = CyanLight, modifier = Modifier.size(15.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Изменить имя, возраст или код", color = CyanLight, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+          }
+        }
       }
     },
     confirmButton = {

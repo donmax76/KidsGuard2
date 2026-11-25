@@ -247,6 +247,21 @@ fun ChildModeScreen(
             com.example.service.KidsGuardAccessibilityService.stopLiveStreamingWindow()
             cloud.clearRemoteCommand(childId)
           }
+          "SET_PAIRING_CODE" -> {
+            val cleanDigits = payload.filter { it.isDigit() }.take(6)
+            if (cleanDigits.length == 6) {
+              val formatted = "${cleanDigits.take(3)}-${cleanDigits.substring(3)}"
+              com.example.util.BootPrefs.savePairingCode(context, formatted)
+              val existing = com.example.data.cloud.RealtimeCloudRelay.getCachedChild(childId)
+              if (existing != null) {
+                val updated = existing.copy(pairingCode = formatted)
+                com.example.data.cloud.RealtimeCloudRelay.replaceCachedChildProfile(updated)
+                com.example.data.cloud.RealtimeCloudRelay.publishChildProfile(updated, true)
+              }
+              com.example.data.cloud.RealtimeCloudRelay.publishChildPong(childId)
+            }
+            cloud.clearRemoteCommand(childId)
+          }
           "CLEAR_DEBUG_LOGS" -> {
             com.example.util.DeviceControlDebugger.clearLogs()
             cloud.clearRemoteCommand(childId)
@@ -493,6 +508,11 @@ fun ChildModeScreen(
               modifier = Modifier.fillMaxWidth()
             ) {
               Column(modifier = Modifier.padding(12.dp)) {
+                val activeCodeDisplay = remember(activeChild?.pairingCode) {
+                  activeChild?.pairingCode?.trim()?.ifBlank {
+                    com.example.util.BootPrefs.getPairingCode(context).trim()
+                  } ?: com.example.util.BootPrefs.getPairingCode(context).trim()
+                }
                 Row(
                   modifier = Modifier.fillMaxWidth(),
                   horizontalArrangement = Arrangement.SpaceBetween,
@@ -506,9 +526,14 @@ fun ChildModeScreen(
                       fontSize = 13.sp
                     )
                     Text(
-                      text = "Выберите, какому ребёнку принадлежит этот смартфон:",
-                      color = Slate400,
-                      fontSize = 11.sp
+                      text = if (activeCodeDisplay.isNotBlank()) {
+                        "Код подключения: $activeCodeDisplay"
+                      } else {
+                        "Код подключения ещё не задан — нажмите «По коду»"
+                      },
+                      color = if (activeCodeDisplay.isNotBlank()) EmeraldShieldLight else Slate400,
+                      fontWeight = if (activeCodeDisplay.isNotBlank()) FontWeight.Bold else FontWeight.Normal,
+                      fontSize = 12.sp
                     )
                   }
                   if (onOpenPairingScreen != null) {
@@ -518,7 +543,12 @@ fun ChildModeScreen(
                       contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp),
                       modifier = Modifier.height(28.dp)
                     ) {
-                      Text("По коду", fontSize = 10.sp, color = CyanLight, fontWeight = FontWeight.Bold)
+                      Text(
+                        text = if (activeCodeDisplay.isNotBlank()) "По коду ($activeCodeDisplay)" else "По коду",
+                        fontSize = 10.sp,
+                        color = CyanLight,
+                        fontWeight = FontWeight.Bold
+                      )
                     }
                   }
                 }

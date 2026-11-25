@@ -49,34 +49,7 @@ class LockOverlayService : Service() {
       val database = KidsGuardDatabase.getDatabase(applicationContext)
       val dao = database.kidsGuardDao()
 
-      // Fast 1-second authoritative lock state watcher so UNLOCK takes effect in <1s
-      launch {
-        while (isActive) {
-          delay(900L)
-          val currentCfg = dao.getFamilyConfigOnce()
-          if (currentCfg?.selectedRole != "CHILD") {
-            launch(Dispatchers.Main) {
-              hideLockOverlay()
-              stopSelf()
-            }
-            break
-          }
-          val cid = currentCfg.thisDeviceChildId.takeIf { it > 0L }
-            ?: currentCfg.currentActiveChildId.takeIf { it > 0L }
-            ?: activeChildId
-          if (cid > 0L) {
-            val authLocked = com.example.data.cloud.RealtimeCloudRelay.getAuthoritativeLock(cid)?.first
-            if (authLocked == false && overlayView != null) {
-              dao.setChildDeviceLocked(cid, false)
-              launch(Dispatchers.Main) {
-                hideLockOverlay()
-                stopSelf()
-              }
-            }
-          }
-        }
-      }
-
+      // Полностью событийное наблюдение за состоянием блокировки без опроса SQLite в цикле (0% фоновой нагрузки)
       dao.getFamilyConfig().collectLatest { config ->
         val isChildRole = config?.selectedRole == "CHILD"
         val childId = if (isChildRole && config != null && config.thisDeviceChildId > 0) {

@@ -34,6 +34,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -72,13 +73,58 @@ fun FamilyChatScreen(
   isRemoteUpdating: Boolean = false,
   modifier: Modifier = Modifier
 ) {
+  val context = androidx.compose.ui.platform.LocalContext.current
   var messageInput by remember { mutableStateOf("") }
+  var lastTypingSentMs by remember { mutableStateOf(0L) }
   val listState = rememberLazyListState()
+  val childId = child?.id?.takeIf { it > 0L } ?: 1L
+  val myRole = if (isParentRole) "PARENT" else "CHILD"
+  val remoteRole = if (isParentRole) "CHILD" else "PARENT"
 
-  // Auto-scroll to bottom when new messages arrive
-  LaunchedEffect(messages.size) {
+  val typingMap by com.example.data.cloud.RealtimeCloudRelay.chatTypingFlow.collectAsState()
+  val isRemoteTyping = remember(typingMap, childId, remoteRole) {
+    com.example.data.cloud.RealtimeCloudRelay.isRemotePartyTyping(childId, remoteRole)
+  }
+
+  // Анимация трёх точек «печатает •••» как в WhatsApp
+  var animatedDotsStep by remember { mutableStateOf(0) }
+  LaunchedEffect(isRemoteTyping) {
+    while (isRemoteTyping) {
+      animatedDotsStep = (animatedDotsStep + 1) % 3
+      kotlinx.coroutines.delay(380L)
+    }
+  }
+
+  // Автоматическая отправка квитанции о прочтении (✓ -> ✓✓), когда экран чата открыт или пришло новое сообщение
+  LaunchedEffect(childId, messages.size, isParentRole) {
     if (messages.isNotEmpty()) {
       listState.animateScrollToItem(messages.size - 1)
+    }
+    val hasUnreadFromRemote = messages.any {
+      it.senderRole.equals(remoteRole, ignoreCase = true) && !it.isRead
+    }
+    if (hasUnreadFromRemote || messages.isNotEmpty()) {
+      kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        try {
+          val dao = com.example.data.local.KidsGuardDatabase.getDatabase(context).kidsGuardDao()
+          dao.markChatMessagesRead(childId, myRole)
+        } catch (_: Exception) {}
+        com.example.data.cloud.RealtimeCloudRelay.publishChatReadReceipt(
+          childId = childId,
+          readerRole = myRole
+        )
+      }
+    }
+  }
+
+  // Сбрасываем статус «печатает...» при выходе из чата или очистке поля
+  androidx.compose.runtime.DisposableEffect(childId, myRole) {
+    onDispose {
+      com.example.data.cloud.RealtimeCloudRelay.publishChatTypingStatus(
+        childId = childId,
+        senderRole = myRole,
+        isTyping = false
+      )
     }
   }
 
@@ -111,7 +157,7 @@ fun FamilyChatScreen(
             modifier = Modifier
               .size(10.dp)
               .clip(CircleShape)
-              .background(EmeraldShield)
+              .background(if (isRemoteTyping) CyanLight else EmeraldShield)
           )
           Column {
             Text(
@@ -120,11 +166,25 @@ fun FamilyChatScreen(
               fontWeight = FontWeight.Bold,
               fontSize = 14.sp
             )
-            Text(
-              text = if (isParentRole) "Прямой облачный канал связи" else "Защищенный семейный чат",
-              color = Slate400,
-              fontSize = 11.sp
-            )
+            if (isRemoteTyping) {
+              val dotsStr = when (animatedDotsStep) {
+                0 -> "● ○ ○"
+                1 -> "● ● ○"
+                else -> "● ● ●"
+              }
+              Text(
+                text = if (isParentRole) "${child?.name ?: "Ребёнок"} печатает $dotsStr" else "Родитель печатает $dotsStr",
+                color = EmeraldShield,
+                fontWeight = FontWeight.Bold,
+                fontSize = 11.5.sp
+              )
+            } else {
+              Text(
+                text = if (isParentRole) "Прямой канал связи • ✓ отправлено • ✓✓ прочитано" else "Защищенный семейный чат",
+                color = Slate400,
+                fontSize = 11.sp
+              )
+            }
           }
         }
 
@@ -230,7 +290,7 @@ fun FamilyChatScreen(
                   )
                   Text(
                     text = timeStr,
-                    color = Slate400,
+                    color = Slate200.copy(alpha = 0.75f),
                     fontSize = 10.sp
                   )
                 }
@@ -243,7 +303,71 @@ fun FamilyChatScreen(
                   fontSize = 13.sp,
                   lineHeight = 17.sp
                 )
+
+                // WhatsApp-style checkmarks for outgoing messages:
+                // ✓ (одна галочка) — отправлено, но ещё не прочитано
+                // ✓✓ (две яркие галочки) — прочитано получателем
+                if (isMyMessage) {
+                  Spacer(modifier = Modifier.height(4.dp))
+                  Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                  ) {
+                    Text(
+                      text = if (msg.isRead) "Прочитано" else "Отправлено",
+                      color = if (msg.isRead) Color(0xFF6EE7B7) else Slate200.copy(alpha = 0.7f),
+                      fontSize = 9.5.sp
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                      text = if (msg.isRead) "✓✓" else "✓",
+                      color = if (msg.isRead) Color(0xFF34D399) else Slate200,
+                      fontWeight = FontWeight.ExtraBold,
+                      fontSize = 12.sp
+                    )
+                  }
+                }
               }
+            }
+          }
+        }
+      }
+    }
+
+    // Живой пузырёк «печатает •••» над полем ввода (как в WhatsApp)
+    if (isRemoteTyping) {
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(horizontal = 16.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Start
+      ) {
+        Card(
+          shape = RoundedCornerShape(14.dp),
+          colors = CardDefaults.cardColors(containerColor = Color(0xFF112233)),
+          border = androidx.compose.foundation.BorderStroke(1.dp, EmeraldShield.copy(alpha = 0.5f))
+        ) {
+          Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+          ) {
+            Text(
+              text = if (isParentRole) "${child?.name ?: "Ребёнок"} пишет" else "Родитель пишет",
+              color = Slate200,
+              fontSize = 11.5.sp,
+              fontWeight = FontWeight.SemiBold
+            )
+            for (dotIdx in 0..2) {
+              val isLit = dotIdx <= animatedDotsStep
+              Box(
+                modifier = Modifier
+                  .size(if (isLit) 7.dp else 5.dp)
+                  .clip(CircleShape)
+                  .background(if (isLit) EmeraldShield else Slate400.copy(alpha = 0.45f))
+              )
             }
           }
         }
@@ -267,7 +391,25 @@ fun FamilyChatScreen(
       ) {
         OutlinedTextField(
           value = messageInput,
-          onValueChange = { messageInput = it },
+          onValueChange = { newText ->
+            messageInput = newText
+            val now = System.currentTimeMillis()
+            if (newText.isBlank()) {
+              lastTypingSentMs = 0L
+              com.example.data.cloud.RealtimeCloudRelay.publishChatTypingStatus(
+                childId = childId,
+                senderRole = myRole,
+                isTyping = false
+              )
+            } else if (now - lastTypingSentMs >= 1_600L) {
+              lastTypingSentMs = now
+              com.example.data.cloud.RealtimeCloudRelay.publishChatTypingStatus(
+                childId = childId,
+                senderRole = myRole,
+                isTyping = true
+              )
+            }
+          },
           placeholder = {
             Text(
               if (isParentRole) "Сообщение для ребенка..." else "Сообщение родителям...",
@@ -291,6 +433,12 @@ fun FamilyChatScreen(
         IconButton(
           onClick = {
             if (messageInput.isNotBlank()) {
+              lastTypingSentMs = 0L
+              com.example.data.cloud.RealtimeCloudRelay.publishChatTypingStatus(
+                childId = childId,
+                senderRole = myRole,
+                isTyping = false
+              )
               onSendMessage(messageInput.trim())
               messageInput = ""
             }

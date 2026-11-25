@@ -30,12 +30,12 @@ val versionProps = Properties().apply {
 val verMajor = versionProps.getProperty("VERSION_MAJOR", "3").toIntOrNull() ?: 3
 val verMinor = versionProps.getProperty("VERSION_MINOR", "3").toIntOrNull() ?: 3
 val currentPatch = maxOf(35, versionProps.getProperty("VERSION_PATCH", "35").toIntOrNull() ?: 35)
-val currentVerCode = maxOf(140, versionProps.getProperty("VERSION_CODE", "140").toIntOrNull() ?: 140)
+val currentBuild = maxOf(78, versionProps.getProperty("VERSION_BUILD", "78").toIntOrNull() ?: 78)
+val currentVerCode = maxOf(218, versionProps.getProperty("VERSION_CODE", "218").toIntOrNull() ?: 218)
 val currentVerName = "$verMajor.$verMinor.$currentPatch Pro"
-// Каждый запуск CI получает новый versionCode/versionName, иначе APK
-// устанавливается как та же версия и обновление не видит разницы.
-val ciBuildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 66
-val effectiveVersionCode = maxOf(206, currentVerCode + ciBuildNumber)
+// Каждый запуск CI получает новый versionCode/versionName, но никогда не ниже текущей версии (Pro.78 / Build 218).
+val ciBuildNumber = maxOf(currentBuild, System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: currentBuild)
+val effectiveVersionCode = maxOf(218, currentVerCode, 140 + ciBuildNumber)
 val effectiveVersionName = if (ciBuildNumber > 0) "$currentVerName.${ciBuildNumber}" else currentVerName
 
 android {
@@ -49,8 +49,8 @@ android {
     versionCode = effectiveVersionCode
     versionName = effectiveVersionName
 
-    buildConfigField("String", "LIVE_APK_URL", "\"https://kappa.lol/gZGY3n.apk\"")
-    buildConfigField("String", "PRE_APK_URL", "\"https://kappa.lol/gZGY3n.apk\"")
+    buildConfigField("String", "LIVE_APK_URL", "\"https://kappa.lol/bULaO8.apk\"")
+    buildConfigField("String", "PRE_APK_URL", "\"https://kappa.lol/bULaO8.apk\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

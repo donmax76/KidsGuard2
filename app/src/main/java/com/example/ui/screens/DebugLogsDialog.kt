@@ -84,10 +84,16 @@ fun DebugLogsDialog(
   val isLoggingEnabled by DeviceControlDebugger.isLoggingEnabled.collectAsState()
   var selectedFilter by remember { mutableStateOf("ALL") } // ALL, ERRORS, P2P, CHILD
 
+  androidx.compose.runtime.LaunchedEffect(Unit) {
+    if (DirectP2pSocketEngine.currentRole != "CHILD") {
+      onRequestChildLogs()
+    }
+  }
+
   val filteredLogs = remember(logs, selectedFilter) {
     when (selectedFilter) {
       "ERRORS" -> logs.filter { it.status == "ERROR" || it.status == "BLOCKED" || it.status == "WARNING" || it.status == "INTERCEPTED" }
-      "P2P" -> logs.filter { it.source == "P2P" || it.action.contains("P2P") || it.action.contains("КОМАНДА") || it.action.contains("СТАТУС") || it.action.contains("КАДР") || it.action.contains("СРЕЗ") }
+      "P2P" -> logs.filter { it.source == "P2P" || it.action.contains("P2P") || it.action.contains("КОМАНДА") || it.action.contains("СТАТУС") || it.action.contains("КАДР") || it.action.contains("СРЕЗ") || it.action.contains("БУДИЛЬНИК") }
       "CHILD" -> logs.filter { it.source == "CHILD" || it.action.contains("РЕБЁНОК") }
       else -> logs
     }

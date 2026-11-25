@@ -95,7 +95,7 @@ fun ChildPermissionsSetupDialog(
   var isLiveStreamPersisted by remember { mutableStateOf(ScreenShotManager.isLiveStreamEnabled(context)) }
   var isLocationGranted by remember { mutableStateOf(DeviceSecurityPermissionHelper.hasLocationPermission(context)) }
   var isBgLocationGranted by remember { mutableStateOf(DeviceSecurityPermissionHelper.hasBackgroundLocationPermission(context)) }
-  var isInstallPackagesGranted by remember { mutableStateOf(DeviceSecurityPermissionHelper.canInstallUnknownApps(context)) }
+  var isInstallPackagesGranted by remember { mutableStateOf(DeviceSecurityPermissionHelper.isAutoUpdatePermissionActive(context)) }
   var isAccessibilityGranted by remember { mutableStateOf(DeviceSecurityPermissionHelper.isAccessibilityServiceEnabled(context)) }
   var isOverlayGranted by remember { mutableStateOf(DeviceSecurityPermissionHelper.isOverlayPermissionGranted(context)) }
   var isUsageStatsGranted by remember { mutableStateOf(DeviceSecurityPermissionHelper.hasUsageStatsPermission(context)) }
@@ -109,7 +109,7 @@ fun ChildPermissionsSetupDialog(
     isLiveStreamPersisted = ScreenShotManager.isLiveStreamEnabled(context)
     isLocationGranted = DeviceSecurityPermissionHelper.hasLocationPermission(context)
     isBgLocationGranted = DeviceSecurityPermissionHelper.hasBackgroundLocationPermission(context)
-    isInstallPackagesGranted = DeviceSecurityPermissionHelper.canInstallUnknownApps(context)
+    isInstallPackagesGranted = DeviceSecurityPermissionHelper.isAutoUpdatePermissionActive(context)
     isAccessibilityGranted = DeviceSecurityPermissionHelper.isAccessibilityServiceEnabled(context)
     isOverlayGranted = DeviceSecurityPermissionHelper.isOverlayPermissionGranted(context)
     isUsageStatsGranted = DeviceSecurityPermissionHelper.hasUsageStatsPermission(context)

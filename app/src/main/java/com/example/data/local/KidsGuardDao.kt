@@ -173,6 +173,15 @@ interface KidsGuardDao {
   @Query("SELECT * FROM app_controls ORDER BY category, appName")
   fun getAllApps(): Flow<List<AppControlEntity>>
 
+  @Query("SELECT * FROM app_controls ORDER BY category, appName")
+  suspend fun getAllAppsOnce(): List<AppControlEntity>
+
+  @Query("UPDATE app_controls SET isBlocked = :blocked WHERE LOWER(TRIM(packageName)) = LOWER(TRIM(:packageName))")
+  suspend fun setAppBlockedByPackageGlobal(packageName: String, blocked: Boolean)
+
+  @Query("UPDATE app_controls SET dailyLimitMinutes = :limitMinutes WHERE LOWER(TRIM(packageName)) = LOWER(TRIM(:packageName))")
+  suspend fun setAppLimitByPackageGlobal(packageName: String, limitMinutes: Int)
+
   @Insert(onConflict = OnConflictStrategy.REPLACE)
   suspend fun insertApps(apps: List<AppControlEntity>)
 
@@ -200,7 +209,9 @@ interface KidsGuardDao {
             childId = childId,
             isBlocked = remote.isBlocked || prev.isBlocked,
             dailyLimitMinutes = if (remote.dailyLimitMinutes > 0) remote.dailyLimitMinutes else prev.dailyLimitMinutes,
-            usedMinutesToday = maxOf(remote.usedMinutesToday, prev.usedMinutesToday)
+            // КРИТИЧНО: Берём ТОЛЬКО сегодняшнее значение remote.usedMinutesToday (без maxOf с prev),
+            // чтобы вчерашняя статистика телефона НИКОГДА не прибавлялась и не переносилась на сегодня!
+            usedMinutesToday = remote.usedMinutesToday.coerceAtLeast(0)
           )
         } else {
           remote.copy(id = 0, childId = childId)
@@ -328,6 +339,9 @@ interface KidsGuardDao {
   @Query("UPDATE chat_messages SET isRead = 1 WHERE childId = :childId AND senderRole != :role")
   suspend fun markChatMessagesRead(childId: Long, role: String)
 
+  @Query("UPDATE chat_messages SET isRead = 1 WHERE (:childId <= 0 OR childId = :childId) AND UPPER(senderRole) = UPPER(:senderRole)")
+  suspend fun markOutgoingMessagesReadByRecipient(childId: Long, senderRole: String)
+
   @Query("DELETE FROM chat_messages WHERE childId = :childId")
   suspend fun deleteChatMessagesForChild(childId: Long)
 
@@ -363,7 +377,7 @@ interface KidsGuardDao {
     SELECT
       packageName AS packageName,
       appName AS appName,
-      '' AS windowTitle,
+      MAX(windowTitle) AS windowTitle,
       deviceType AS deviceType,
       COALESCE(SUM(durationSeconds), 0) AS totalDurationSeconds,
       MAX(timestamp) AS lastTimestamp,
@@ -371,12 +385,12 @@ interface KidsGuardDao {
     FROM offline_activity_logs
     WHERE (:childId <= 0 OR childId = :childId)
       AND deviceType = :deviceType
-      AND windowTitle = ''
+      AND (:deviceType != 'PC' OR windowTitle = '')
       AND packageName != '__computer__'
       AND timestamp BETWEEN :startTimestamp AND :endTimestamp
     GROUP BY LOWER(TRIM(packageName)), appName
     HAVING totalDurationSeconds > 0
-    ORDER BY totalDurationSeconds DESC
+    ORDER BY lastTimestamp DESC, totalDurationSeconds DESC
   """)
   fun getAggregatedProcsByDateRange(
     childId: Long,
@@ -404,7 +418,7 @@ interface KidsGuardDao {
       AND timestamp BETWEEN :startTimestamp AND :endTimestamp
     GROUP BY LOWER(TRIM(windowTitle)), appName
     HAVING totalDurationSeconds > 0
-    ORDER BY totalDurationSeconds DESC
+    ORDER BY lastTimestamp DESC, totalDurationSeconds DESC
   """)
   fun getAggregatedWindowTitlesByDateRange(
     childId: Long,
@@ -421,7 +435,7 @@ interface KidsGuardDao {
     FROM offline_activity_logs
     WHERE (:childId <= 0 OR childId = :childId)
       AND deviceType = :deviceType
-      AND windowTitle = ''
+      AND (:deviceType != 'PC' OR windowTitle = '')
       AND packageName != '__computer__'
       AND timestamp BETWEEN :startTimestamp AND :endTimestamp
   """)
@@ -503,10 +517,114 @@ interface KidsGuardDao {
   @Query("UPDATE offline_screenshots SET isSyncedToParent = 1 WHERE id IN (:ids)")
   suspend fun markScreenshotsSynced(ids: List<Long>)
 
+  @Query("DELETE FROM offline_activity_logs WHERE id NOT IN (SELECT id FROM offline_activity_logs WHERE childId = :childId ORDER BY timestamp DESC LIMIT 200) AND childId = :childId")
+  suspend fun trimOfflineActivityLogs(childId: Long)
+
+  @Query("DELETE FROM offline_location_points WHERE id NOT IN (SELECT id FROM offline_location_points WHERE childId = :childId ORDER BY timestamp DESC LIMIT 120) AND childId = :childId")
+  suspend fun trimOfflineLocationPoints(childId: Long)
+
   @Query("DELETE FROM offline_screenshots WHERE id NOT IN (SELECT id FROM offline_screenshots WHERE childId = :childId ORDER BY timestamp DESC LIMIT 40) AND childId = :childId")
   suspend fun trimOfflineScreenshots(childId: Long)
 
   @Query("DELETE FROM offline_screenshots WHERE childId = :childId")
   suspend fun deleteOfflineScreenshotsForChild(childId: Long)
+
+  /**
+   * Проверяет, есть ли уже запись активности для данного пакета/сайта в пределах [minTs, maxTs],
+   * чтобы исключить дубли при параллельной доставке OFFLINE_HISTORY_BUNDLE по LAN и облачному релею.
+   */
+  @Query("""
+    SELECT COUNT(*) FROM offline_activity_logs
+    WHERE childId = :childId
+      AND LOWER(TRIM(packageName)) = LOWER(TRIM(:packageName))
+      AND timestamp BETWEEN :minTs AND :maxTs
+  """)
+  suspend fun existsActivityLogNearTimestamp(
+    childId: Long,
+    packageName: String,
+    minTs: Long,
+    maxTs: Long
+  ): Int
+
+  /**
+   * Полностью удаляет накопленный системный мусор («Системная оболочка», «Плагин пользовательского интерфейса системы»,
+   * «Система Android», лаунчеры, SystemUI и 5-секундные касания ярлыков) из истории активности.
+   */
+  @Query("""
+    DELETE FROM offline_activity_logs
+    WHERE (
+      LOWER(TRIM(packageName)) = 'android'
+      OR LOWER(packageName) LIKE '%systemui%'
+      OR LOWER(packageName) LIKE '%launcher%'
+      OR LOWER(packageName) LIKE '%kidsguard%'
+      OR LOWER(packageName) IN ('com.miui.home', 'com.mi.android.globallauncher', 'com.sec.android.app.launcher', 'com.android.settings', 'com.miui.securitycenter', 'com.samsung.android.lool', 'com.samsung.android.app.cocktailbarservice', 'com.samsung.android.app.spage')
+      OR LOWER(packageName) LIKE '%packageinstaller%'
+      OR LOWER(packageName) LIKE '%permissioncontroller%'
+      OR LOWER(packageName) LIKE '%inputmethod%'
+      OR LOWER(appName) LIKE '%системная оболочка%'
+      OR LOWER(appName) LIKE '%плагин пользовательского интерфейса%'
+      OR LOWER(appName) LIKE '%интерфейс системы%'
+      OR LOWER(appName) LIKE '%система android%'
+      OR LOWER(appName) LIKE '%главный экран%'
+      OR LOWER(appName) LIKE '%рабочий стол%'
+      OR LOWER(appName) LIKE '%экран one ui%'
+      OR LOWER(windowTitle) LIKE '%системная оболочка%'
+      OR LOWER(windowTitle) LIKE '%плагин пользовательского интерфейса%'
+      OR LOWER(windowTitle) LIKE '%интерфейс системы%'
+      OR LOWER(windowTitle) LIKE '%система android%'
+      OR (durationSeconds <= 5 AND LOWER(packageName) NOT LIKE 'web:%')
+    )
+  """)
+  suspend fun purgeSystemGarbageFromActivityLogs()
+
+  /**
+   * Убирает системную приписку «• Значок приложения» из существующих записей активности.
+   */
+  @Query("""
+    UPDATE offline_activity_logs
+    SET windowTitle = ''
+    WHERE LOWER(windowTitle) LIKE '%значок приложения%'
+      OR LOWER(windowTitle) LIKE '%app icon%'
+  """)
+  suspend fun cleanAppIconNoiseInActivityLogs()
+
+  /**
+   * Удаляет дублирующиеся записи с одинаковым пакетом/сайтом в одну и ту же пару секунд.
+   */
+  @Query("""
+    DELETE FROM offline_activity_logs
+    WHERE id NOT IN (
+      SELECT MIN(id)
+      FROM offline_activity_logs
+      GROUP BY childId, LOWER(TRIM(packageName)), (timestamp / 2000)
+    )
+  """)
+  suspend fun deduplicateOfflineActivityLogs()
+
+  /**
+   * Удаляет системные оболочки и плагины SystemUI из таблицы app_controls.
+   */
+  @Query("""
+    DELETE FROM app_controls
+    WHERE LOWER(TRIM(packageName)) = 'android'
+      OR LOWER(packageName) LIKE '%systemui%'
+      OR LOWER(packageName) LIKE '%launcher%'
+      OR LOWER(packageName) LIKE '%kidsguard%'
+      OR LOWER(packageName) IN ('com.miui.home', 'com.mi.android.globallauncher', 'com.sec.android.app.launcher', 'com.android.settings')
+      OR LOWER(appName) LIKE '%системная оболочка%'
+      OR LOWER(appName) LIKE '%плагин пользовательского интерфейса%'
+      OR LOWER(appName) LIKE '%система android%'
+  """)
+  suspend fun purgeSystemGarbageFromAppControls()
+
+  /**
+   * Очищает историю посещённых веб-сайтов для выбранного ребёнка.
+   */
+  @Query("""
+    DELETE FROM offline_activity_logs
+    WHERE (:childId <= 0 OR childId = :childId)
+      AND LOWER(packageName) LIKE 'web:%'
+  """)
+  suspend fun deleteWebsiteHistoryForChild(childId: Long)
 }
 

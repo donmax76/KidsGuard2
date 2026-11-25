@@ -57,7 +57,8 @@ object ScreenShotManager {
   private var virtualDisplay: VirtualDisplay? = null
   private var imageReader: ImageReader? = null
   private val mainHandler = Handler(Looper.getMainLooper())
-  private val screenshotExecutor = Executors.newSingleThreadExecutor()
+  private val screenshotExecutor = Executors.newFixedThreadPool(2)
+  private val takeScreenshotCallbackExecutor = Executors.newSingleThreadExecutor()
 
   @Volatile
   private var latestProjectionBitmap: Bitmap? = null
@@ -133,7 +134,12 @@ object ScreenShotManager {
         .getSharedPreferences(PREFS_LIVE_STREAM, Context.MODE_PRIVATE)
         .getBoolean(KEY_LIVE_STREAM_ENABLED, false)
       val fileVal = java.io.File(context.applicationContext.filesDir, "live_stream_enabled.flag").exists()
-      prefsVal || fileVal
+      val bootVal = BootPrefs.isLiveStreamGranted(context)
+      val enabled = prefsVal || fileVal || bootVal
+      if (enabled && !bootVal) {
+        BootPrefs.setLiveStreamGranted(context, true)
+      }
+      enabled
     } catch (_: Exception) {
       false
     }
@@ -144,6 +150,7 @@ object ScreenShotManager {
     // иначе AccessibilityService думает, что MediaProjection уже шлёт видео, и перестаёт делать скриншоты!
     _isMediaProjectionActive.value = enabled && (mediaProjection != null && virtualDisplay != null)
     try {
+      BootPrefs.setLiveStreamGranted(context, enabled)
       context.applicationContext
         .getSharedPreferences(PREFS_LIVE_STREAM, Context.MODE_PRIVATE)
         .edit()
@@ -242,16 +249,19 @@ object ScreenShotManager {
       projectionWidth = targetW
       projectionHeight = targetH
       projectionDpi = metrics.densityDpi
-      isProjectionSurfaceAttached = true
+      val liveWantedInitially = com.example.service.KidsGuardAccessibilityService.isLiveStreamingActiveNow()
+      isProjectionSurfaceAttached = liveWantedInitially
       reader.setOnImageAvailableListener({ ir ->
         val img = try { ir.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
         try {
           val now = System.currentTimeMillis()
-          // КЛЮЧЕВАЯ ЭКОНОМИЯ БАТАРЕИ: пока родитель не смотрит живой экран — вообще не
-          // копируем кадры из ImageReader (без отцепления Surface, т.к. отцепление Surface
-          // на Android 12–14+ навсегда ломает VirtualDisplay до перезапуска!).
-          val liveWanted = com.example.service.KidsGuardAccessibilityService.isLiveStreamingActiveNow()
-          if (!liveWanted || now - lastProjectionCopyMs < 450L) {
+          val liveWanted = com.example.service.KidsGuardAccessibilityService.isLiveStreamingActiveNow() ||
+            pendingCallbacks.isNotEmpty()
+          if (!liveWanted) {
+            setProjectionSurfaceAttached(false)
+            return@setOnImageAvailableListener
+          }
+          if (now - lastProjectionCopyMs < 450L) {
             return@setOnImageAvailableListener
           }
           lastProjectionCopyMs = now
@@ -274,7 +284,23 @@ object ScreenShotManager {
             lastHardwareBitmapMs = now
             lastProjectionFrameMs = now
 
-            if (now - lastAutoStreamMs >= 650L) {
+            if (pendingCallbacks.isNotEmpty()) {
+              screenshotExecutor.execute {
+                try {
+                  val b64 = bitmapToBase64(cropped)
+                  val item = CapturedScreenItem(
+                    activeAppName = "Экран устройства",
+                    timestamp = now,
+                    statusNote = "Живой кадр экрана",
+                    base64Bitmap = b64
+                  )
+                  addCapturedItem(item)
+                  deliverToPendingCallbacks(item)
+                } catch (_: Exception) {}
+              }
+            }
+
+            if (com.example.service.KidsGuardAccessibilityService.isLiveStreamingActiveNow() && now - lastAutoStreamMs >= 650L) {
               lastAutoStreamMs = now
               screenshotExecutor.execute {
                 try {
@@ -298,7 +324,7 @@ object ScreenShotManager {
         targetH,
         metrics.densityDpi,
         DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-        reader.surface,
+        if (liveWantedInitially) reader.surface else null,
         null,
         mainHandler
       )
@@ -311,7 +337,7 @@ object ScreenShotManager {
         return
       }
       _isMediaProjectionActive.value = true
-      Log.d(TAG, "MediaProjection VirtualDisplay started ($targetW x $targetH)")
+      Log.d(TAG, "MediaProjection VirtualDisplay started ($targetW x $targetH, surfaceAttached=$liveWantedInitially)")
     } catch (e: Exception) {
       Log.e(TAG, "startMediaProjection error: ${e.message}")
       _isMediaProjectionActive.value = false
@@ -323,33 +349,43 @@ object ScreenShotManager {
 
   /**
    * Включает/выключает реальную отдачу кадров экрана.
-   * Не вызываем vd.setSurface(null), так как на Android 12–14+ повторный attach перестаёт
-   * присылать кадры до пересоздания MediaProjection.
+   * Когда родитель не смотрит прямой эфир (active = false), отсоединяем Surface (`vd.setSurface(null)`),
+   * чтобы системный композитор SurfaceFlinger вообще не рендерил 60 кадров/сек в ImageReader (0% расхода батареи!).
    */
   fun setLiveCaptureActive(active: Boolean) {
     mainHandler.post {
       if (mediaProjection == null) return@post
-      if (active) {
-        setProjectionSurfaceAttached(true)
-      }
+      setProjectionSurfaceAttached(active)
     }
   }
 
   private fun setProjectionSurfaceAttached(attached: Boolean) {
     val vd = virtualDisplay ?: return
     val reader = imageReader ?: return
-    if (!attached) return
-    if (isProjectionSurfaceAttached) return
-    try {
-      vd.setSurface(reader.surface)
-      isProjectionSurfaceAttached = true
-    } catch (_: Exception) {}
+    if (attached) {
+      if (isProjectionSurfaceAttached) return
+      try {
+        vd.setSurface(reader.surface)
+        isProjectionSurfaceAttached = true
+      } catch (_: Exception) {}
+    } else {
+      if (!isProjectionSurfaceAttached) return
+      try {
+        vd.setSurface(null)
+        isProjectionSurfaceAttached = false
+      } catch (_: Exception) {}
+    }
   }
 
   private fun ensureProjectionAttachedTemporarily() {
     if (mediaProjection == null) return
     mainHandler.post {
       setProjectionSurfaceAttached(true)
+      mainHandler.postDelayed({
+        if (!com.example.service.KidsGuardAccessibilityService.isLiveStreamingActiveNow() && pendingCallbacks.isEmpty()) {
+          setProjectionSurfaceAttached(false)
+        }
+      }, 2_200L)
     }
   }
 
@@ -368,11 +404,50 @@ object ScreenShotManager {
   }
 
   private fun releaseVirtualDisplay() {
+    try { virtualDisplay?.setSurface(null) } catch (_: Exception) {}
     try { virtualDisplay?.release() } catch (_: Exception) {}
     virtualDisplay = null
     isProjectionSurfaceAttached = false
     try { imageReader?.close() } catch (_: Exception) {}
     imageReader = null
+  }
+
+  @Volatile
+  private var lastHardwareBase64: String? = null
+
+  @Volatile
+  private var lastDiskFrameSaveMs: Long = 0L
+
+  private const val CACHED_FRAME_FILE = "kidsguard_last_screen_frame.b64"
+
+  private fun saveLastBase64ToDiskIfNeeded(context: Context?, b64: String) {
+    if (b64.isBlank()) return
+    lastHardwareBase64 = b64
+    val now = System.currentTimeMillis()
+    if (now - lastDiskFrameSaveMs < 20_000L) return
+    val ctx = context?.applicationContext ?: com.example.data.cloud.DirectP2pSocketEngine.appContext ?: return
+    lastDiskFrameSaveMs = now
+    try {
+      File(ctx.filesDir, CACHED_FRAME_FILE).writeText(b64)
+    } catch (_: Exception) {}
+  }
+
+  private fun loadLastBase64FromDisk(context: Context?): String? {
+    lastHardwareBase64?.takeIf { it.isNotBlank() }?.let { return it }
+    val ctx = context?.applicationContext
+      ?: com.example.service.KidsGuardAccessibilityService.instance?.applicationContext
+      ?: com.example.data.cloud.DirectP2pSocketEngine.appContext
+      ?: return null
+    return try {
+      val f = File(ctx.filesDir, CACHED_FRAME_FILE)
+      if (f.exists()) {
+        f.readText().trim().takeIf { it.isNotBlank() }?.also {
+          lastHardwareBase64 = it
+        }
+      } else null
+    } catch (_: Exception) {
+      null
+    }
   }
 
   fun triggerHardwareScreenCapture(
@@ -391,17 +466,16 @@ object ScreenShotManager {
     if (_isMediaProjectionActive.value && mediaProjection != null && projBmp != null && !projBmp.isRecycled && freshProjection) {
       screenshotExecutor.execute {
         val b64 = bitmapToBase64(projBmp)
+        val svc = com.example.service.KidsGuardAccessibilityService.instance
+        saveLastBase64ToDiskIfNeeded(svc?.applicationContext, b64)
         val item = CapturedScreenItem(
           activeAppName = appName,
           statusNote = "Живой видеопоток MediaProjection ($appName)",
           base64Bitmap = b64
         )
         addCapturedItem(item)
-        if (saveToDeviceGallery) {
-          val svc = com.example.service.KidsGuardAccessibilityService.instance
-          if (svc != null) {
-            saveBitmapToGallery(svc.applicationContext, projBmp, "KidsGuard_${System.currentTimeMillis()}")
-          }
+        if (saveToDeviceGallery && svc != null) {
+          saveBitmapToGallery(svc.applicationContext, projBmp, "KidsGuard_${System.currentTimeMillis()}")
         }
         deliverToPendingCallbacks(item)
       }
@@ -412,7 +486,7 @@ object ScreenShotManager {
     val recentHw = lastHardwareBitmap
     if (recentHw != null && !recentHw.isRecycled && (nowMs - lastHardwareBitmapMs < 850L)) {
       screenshotExecutor.execute {
-        val b64 = bitmapToBase64(recentHw)
+        val b64 = lastHardwareBase64?.takeIf { it.isNotBlank() } ?: bitmapToBase64(recentHw)
         val item = CapturedScreenItem(
           activeAppName = appName,
           statusNote = "Реальный экран устройства ($appName)",
@@ -433,28 +507,22 @@ object ScreenShotManager {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && svc != null) {
       if (isTakingScreenshot) {
         if (nowMs - lastTakeScreenshotStartMs > 2_200L) {
-          // Сторожевой таймер (Watchdog): если системный коллбэк takeScreenshot завис дольше 2.2 с,
-          // принудительно сбрасываем флаг, чтобы захват экрана никогда не зависал навсегда!
           Log.w(TAG, "Watchdog reset stuck isTakingScreenshot flag after 2.2s")
           isTakingScreenshot = false
         } else {
-          // Снимок уже выполняется прямо сейчас — наш onCaptured уже добавлен в pendingCallbacks
-          // и получит этот свежий кадр сразу по завершении takeScreenshot!
           return
         }
       }
       val elapsedSinceLastAttempt = nowMs - lastAttemptTimeMs
-      if (elapsedSinceLastAttempt < 1100L) {
-        // Android 11+ лимитирует takeScreenshot до ~1 раза в секунду.
-        // Планируем захват сразу после окончания кулдауна, сохраняя все pendingCallbacks!
+      if (elapsedSinceLastAttempt < 1180L) {
+        // Android 11+ лимитирует takeScreenshot до ~1 раза в 1.15–1.25 секунды.
+        // Обязательно выполняем захват сразу после окончания кулдауна (даже если прямой эфир выключен)!
         if (!isDelayedCaptureScheduled) {
           isDelayedCaptureScheduled = true
-          val waitMs = (1120L - elapsedSinceLastAttempt).coerceIn(150L, 1120L)
+          val waitMs = (1220L - elapsedSinceLastAttempt).coerceIn(220L, 1220L)
           mainHandler.postDelayed({
             isDelayedCaptureScheduled = false
-            if (pendingCallbacks.isNotEmpty()) {
-              triggerHardwareScreenCapture(appName, saveToDeviceGallery, null)
-            }
+            triggerHardwareScreenCapture(appName, saveToDeviceGallery, null)
           }, waitMs)
         }
         return
@@ -465,22 +533,23 @@ object ScreenShotManager {
       val attemptStamp = nowMs
       isTakingScreenshot = true
 
-      // Сторожевой таймер (2.3 с): если Android не вызвал ни onSuccess, ни onFailure —
-      // автоматически освобождаем флаг и отдаём кадр, чтобы стрим никогда не умирал.
+      // Сторожевой таймер (2.5 с): если Android не вызвал ни onSuccess, ни onFailure —
+      // освобождаем флаг и отдаём кадр.
       mainHandler.postDelayed({
         if (isTakingScreenshot && lastTakeScreenshotStartMs == attemptStamp) {
-          Log.w(TAG, "takeScreenshot callback timed out (2.3s) — delivering fallback frame")
           isTakingScreenshot = false
           fallbackToCachedBitmapOrText(appName, saveToDeviceGallery)
         }
-      }, 2_300L)
+      }, 2_500L)
 
       try {
         svc.takeScreenshot(
           Display.DEFAULT_DISPLAY,
-          screenshotExecutor,
+          takeScreenshotCallbackExecutor,
           object : AccessibilityService.TakeScreenshotCallback {
             override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
+              val finishedAt = System.currentTimeMillis()
+              lastAttemptTimeMs = finishedAt
               isTakingScreenshot = false
               var softBmp: Bitmap? = null
               val hwBuffer = try { screenshot.hardwareBuffer } catch (_: Exception) { null }
@@ -500,46 +569,52 @@ object ScreenShotManager {
                 try { hwBuffer?.close() } catch (_: Exception) {}
               }
 
-              if (softBmp != null) {
-                val capturedAt = System.currentTimeMillis()
-                lastHardwareBitmap = softBmp
-                lastHardwareBitmapMs = capturedAt
-                lastCaptureDeliveredMs = capturedAt
-                val b64 = bitmapToBase64(softBmp)
-                val item = CapturedScreenItem(
-                  activeAppName = appName,
-                  timestamp = capturedAt,
-                  statusNote = "Реальный экран устройства ($appName)",
-                  base64Bitmap = b64
-                )
-                addCapturedItem(item)
-                if (saveToDeviceGallery) {
-                  saveBitmapToGallery(svc.applicationContext, softBmp, "KidsGuard_${capturedAt}")
+              val capturedBmp = softBmp
+              if (capturedBmp != null) {
+                lastHardwareBitmap = capturedBmp
+                lastHardwareBitmapMs = finishedAt
+                lastCaptureDeliveredMs = finishedAt
+                screenshotExecutor.execute {
+                  val b64 = bitmapToBase64(capturedBmp)
+                  saveLastBase64ToDiskIfNeeded(svc.applicationContext, b64)
+                  val item = CapturedScreenItem(
+                    activeAppName = appName,
+                    timestamp = finishedAt,
+                    statusNote = "Реальный экран устройства ($appName)",
+                    base64Bitmap = b64
+                  )
+                  addCapturedItem(item)
+                  if (saveToDeviceGallery) {
+                    saveBitmapToGallery(svc.applicationContext, capturedBmp, "KidsGuard_${finishedAt}")
+                  }
+                  if (pendingCallbacks.isNotEmpty()) {
+                    deliverToPendingCallbacks(item)
+                  }
+                  if (b64.isNotBlank()) {
+                    val cid = com.example.data.cloud.DirectP2pSocketEngine.thisDeviceBoundChildId.takeIf { it > 0L } ?: 1L
+                    com.example.data.cloud.DirectP2pSocketEngine.pushDirectScreenFrame(cid, appName, b64)
+                  }
                 }
-                deliverToPendingCallbacks(item)
                 return
               }
               fallbackToCachedBitmapOrText(appName, saveToDeviceGallery)
             }
 
             override fun onFailure(errorCode: Int) {
+              lastAttemptTimeMs = System.currentTimeMillis()
               isTakingScreenshot = false
-              // errorCode == 3 (ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) -> повторим через 950 мс
-              if (errorCode == 3 && !isDelayedCaptureScheduled) {
-                isDelayedCaptureScheduled = true
-                mainHandler.postDelayed({
-                  isDelayedCaptureScheduled = false
-                  if (pendingCallbacks.isNotEmpty()) {
+              // errorCode == 3 (ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) -> ждём 1250 мс, чтобы системный кулдаун истёк,
+              // и ГАРАНТИРОВАННО делаем реальный снимок (НЕ очищая pendingCallbacks текстовой заглушкой!)
+              if (errorCode == 3) {
+                if (!isDelayedCaptureScheduled) {
+                  isDelayedCaptureScheduled = true
+                  mainHandler.postDelayed({
+                    isDelayedCaptureScheduled = false
                     triggerHardwareScreenCapture(appName, saveToDeviceGallery, null)
-                  }
-                }, 950L)
+                  }, 1_250L)
+                }
                 return
               }
-              DeviceControlDebugger.logEvent(
-                "СКРИНШОТ_СИСТЕМНЫЙ_КОД",
-                "Системный захват вернул код $errorCode — используем резервный кадр экрана",
-                "WARNING"
-              )
               fallbackToCachedBitmapOrText(appName, saveToDeviceGallery)
             }
           }
@@ -550,81 +625,8 @@ object ScreenShotManager {
       }
     }
 
-    // 4. Fallback: отдаём свежий аппаратный кадр (до 12 с) либо синтезируем живой визуальный снимок окна
+    // 4. Fallback: отдаём последний реальный аппаратный кадр экрана (из ОЗУ или диска) без замены на текстовую заглушку
     fallbackToCachedBitmapOrText(appName, saveToDeviceGallery)
-  }
-
-  private fun synthesizeLiveVisualFrameBitmap(rawAppSummary: String): Bitmap {
-    val w = 540
-    val h = 960
-    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-    val canvas = Canvas(bmp)
-    canvas.drawColor(android.graphics.Color.parseColor("#0F172A"))
-
-    val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-    paint.color = android.graphics.Color.parseColor("#1E293B")
-    canvas.drawRoundRect(28f, 70f, (w - 28).toFloat(), (h - 70).toFloat(), 28f, 28f, paint)
-
-    val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-    paint.color = android.graphics.Color.parseColor("#34D399")
-    paint.textSize = 22f
-    paint.typeface = android.graphics.Typeface.DEFAULT_BOLD
-    canvas.drawText("KIDSGUARD LIVE • ПРЯМОЙ ЭФИР", 54f, 128f, paint)
-
-    paint.color = android.graphics.Color.parseColor("#94A3B8")
-    paint.textSize = 18f
-    paint.typeface = android.graphics.Typeface.DEFAULT
-    canvas.drawText("Обновлено: $timeStr", 54f, 162f, paint)
-
-    val mainPart = rawAppSummary.substringBefore(" ||").trim()
-    val appTitle = mainPart.substringBefore(" •").trim().ifBlank { "Главный экран Android" }
-    val watchedTitle = if (mainPart.contains(" • ")) mainPart.substringAfter(" • ").trim() else ""
-    val extraLines = if (rawAppSummary.contains(" || ")) {
-      rawAppSummary.substringAfter(" || ").split(" | ").map { it.trim() }.filter { it.isNotBlank() }
-    } else {
-      emptyList()
-    }
-
-    paint.color = android.graphics.Color.parseColor("#38BDF8")
-    paint.textSize = 20f
-    paint.typeface = android.graphics.Typeface.DEFAULT_BOLD
-    canvas.drawText("Открытое приложение:", 54f, 226f, paint)
-
-    paint.color = android.graphics.Color.WHITE
-    paint.textSize = 28f
-    canvas.drawText(appTitle.take(26), 54f, 268f, paint)
-
-    var y = 330f
-    if (watchedTitle.isNotBlank()) {
-      paint.color = android.graphics.Color.parseColor("#38BDF8")
-      paint.textSize = 19f
-      canvas.drawText("Активное окно / видео:", 54f, y, paint)
-      y += 34f
-      paint.color = android.graphics.Color.WHITE
-      paint.textSize = 22f
-      watchedTitle.chunked(30).take(3).forEach { chunk ->
-        canvas.drawText(chunk, 54f, y, paint)
-        y += 32f
-      }
-      y += 18f
-    }
-
-    if (extraLines.isNotEmpty()) {
-      paint.color = android.graphics.Color.parseColor("#94A3B8")
-      paint.textSize = 18f
-      canvas.drawText("Содержимое экрана сейчас:", 54f, y, paint)
-      y += 32f
-      paint.color = android.graphics.Color.parseColor("#E2E8F0")
-      paint.textSize = 19f
-      paint.typeface = android.graphics.Typeface.DEFAULT
-      extraLines.take(10).forEach { line ->
-        if (y < h - 100f) {
-          canvas.drawText("• ${line.take(34)}", 54f, y, paint)
-          y += 30f
-        }
-      }
-    }
-    return bmp
   }
 
   private fun fallbackToCachedBitmapOrText(
@@ -632,23 +634,31 @@ object ScreenShotManager {
     saveToDeviceGallery: Boolean
   ) {
     val now = System.currentTimeMillis()
-    val freshProj = latestProjectionBitmap?.takeIf { !it.isRecycled && (now - lastProjectionFrameMs < 12_000L) }
-    val freshHw = lastHardwareBitmap?.takeIf { !it.isRecycled && (now - lastHardwareBitmapMs < 12_000L) }
-    val realPixelBitmap = freshProj ?: freshHw
+    val proj = latestProjectionBitmap?.takeIf { !it.isRecycled }
+    val hw = lastHardwareBitmap?.takeIf { !it.isRecycled }
+    val realPixelBitmap = when {
+      proj != null && hw != null -> if (lastProjectionFrameMs >= lastHardwareBitmapMs) proj else hw
+      proj != null -> proj
+      else -> hw
+    }
     screenshotExecutor.execute {
-      val bmpToUse = realPixelBitmap ?: try { synthesizeLiveVisualFrameBitmap(appName) } catch (_: Exception) { null }
-      val b64 = bmpToUse?.let { bitmapToBase64(it) }
+      val b64 = realPixelBitmap?.let { bitmapToBase64(it) }
+        ?: loadLastBase64FromDisk(null)
       val item = CapturedScreenItem(
         activeAppName = appName,
         timestamp = now,
-        statusNote = if (realPixelBitmap != null) "Экран устройства ($appName)" else "Живой экран ($appName)",
+        statusNote = "Экран устройства ($appName)",
         base64Bitmap = b64
       )
-      addCapturedItem(item)
-      if (saveToDeviceGallery && bmpToUse != null) {
+      if (!b64.isNullOrBlank()) {
+        addCapturedItem(item)
+        val cid = com.example.data.cloud.DirectP2pSocketEngine.thisDeviceBoundChildId.takeIf { it > 0L } ?: 1L
+        com.example.data.cloud.DirectP2pSocketEngine.pushDirectScreenFrame(cid, appName, b64)
+      }
+      if (saveToDeviceGallery && realPixelBitmap != null) {
         val svc = com.example.service.KidsGuardAccessibilityService.instance
         if (svc != null) {
-          saveBitmapToGallery(svc.applicationContext, bmpToUse, "KidsGuard_${now}")
+          saveBitmapToGallery(svc.applicationContext, realPixelBitmap, "KidsGuard_${now}")
         }
       }
       deliverToPendingCallbacks(item)
@@ -678,7 +688,7 @@ object ScreenShotManager {
     val now = System.currentTimeMillis()
     val freshBmp = (lastHardwareBitmap?.takeIf { !it.isRecycled && now - lastHardwareBitmapMs < 5_000L })
       ?: (latestProjectionBitmap?.takeIf { !it.isRecycled && now - lastProjectionFrameMs < 5_000L })
-    val resolvedB64 = base64 ?: freshBmp?.let { bitmapToBase64(it) }
+    val resolvedB64 = base64 ?: freshBmp?.let { bitmapToBase64(it) } ?: loadLastBase64FromDisk(null)
     val item = CapturedScreenItem(
       activeAppName = appName,
       timestamp = now,
@@ -694,12 +704,11 @@ object ScreenShotManager {
   fun addCapturedItem(item: CapturedScreenItem) {
     val list = _capturedScreens.value.toMutableList()
     list.add(0, item)
-    if (list.size > 30) {
-      _capturedScreens.value = list.take(30)
+    if (list.size > 12) {
+      _capturedScreens.value = list.take(12)
     } else {
       _capturedScreens.value = list
     }
-    DeviceControlDebugger.logEvent("СКРИНШОТ_ЭКРАНА", "Зафиксирован снимок: «${item.activeAppName}»", "SUCCESS")
   }
 
   fun clearForChild(childId: Long) {

@@ -707,6 +707,29 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     }
   }
 
+  fun updateExistingChildProfile(
+    childId: Long,
+    newName: String,
+    newAge: Int,
+    newDailyLimitMinutes: Int,
+    newPairingCode: String
+  ) {
+    viewModelScope.launch {
+      val updated = repository.updateExistingChildProfile(
+        childId = childId,
+        newName = newName,
+        newAge = newAge,
+        newDailyLimitMinutes = newDailyLimitMinutes,
+        newPairingCode = newPairingCode
+      )
+      if (updated != null) {
+        showToast("Профиль «${updated.name}» (${updated.age} лет, код ${updated.pairingCode}) сохранён!")
+      } else {
+        showToast("Не удалось обновить профиль", isError = true)
+      }
+    }
+  }
+
   fun connectSecondParentByCode(pairingCode: String, customName: String = "") {
     viewModelScope.launch {
       val linkedId = repository.connectSecondParentByCode(pairingCode, customName)
@@ -798,17 +821,17 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
     }
   }
 
-  // Pillar 3: Удаленное фоновое обновление программы ребенка (Горячая замена Ядра без переустановки оболочки)
+  // Pillar 3: Удаленное фоновое обновление программы ребенка
   fun triggerRemoteSilentUpdate(childId: Long, targetVersion: String = "") {
     val child = allChildren.value.find { it.id == childId } ?: return
     viewModelScope.launch {
       _isRemoteUpdating.value = true
       val resolvedTargetVersion = targetVersion.ifBlank {
-        com.example.util.CoreEngineHotUpdater.getEffectiveVersionName(getApplication())
+        com.example.util.AppVersionInfo.installedApkVersion(getApplication())
       }
 
       showToast(
-        "Синхронизация и горячая замена Ядра v$resolvedTargetVersion на телефоне «${child.name}»..."
+        "Отправка обновления APK v$resolvedTargetVersion на телефон «${child.name}»..."
       )
 
       // Prepare multi-channel APK/Core URLs (Direct P2P LAN HTTP URL from Parent's installed APK + Cloud Mirror)
@@ -823,19 +846,20 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
         apkUrl = primaryCloudUrl
       )
 
-      // Mark updatePending = true in DB and log alert
+      // Mark updatePending = true in DB and log alert (shows real child.appVersion -> resolvedTargetVersion)
       repository.triggerRemoteSilentUpdate(childId, resolvedTargetVersion)
 
-      // Send real P2P TCP + Cloud OTA Core Engine update command to child's phone
+      // Send real P2P TCP + Cloud OTA APK update command to child's phone
       repository.cloudSync.triggerRemoteAppUpdate(
         childId = childId,
         latestVersion = resolvedTargetVersion,
         downloadUrl = multiApkUrls
       )
 
-      // Wait up to 4.5 seconds for hot-swap confirmation (or complete hot-swap state sync)
+      // Wait up to 8 seconds for confirmation from child phone
       val startWaitMs = System.currentTimeMillis()
-      while (System.currentTimeMillis() - startWaitMs < 4_500L) {
+      var confirmedByChild = false
+      while (System.currentTimeMillis() - startWaitMs < 8_000L) {
         delay(500L)
         val latestChild = allChildren.value.find { it.id == childId }
         val latestChildVer = com.example.data.cloud.RealtimeCloudRelay.normalizeAppVersion(latestChild?.appVersion)
@@ -848,24 +872,37 @@ class ParentControlViewModel(application: Application) : AndroidViewModel(applic
           completedAlert ||
           (com.example.util.ApkUpdateInstaller.compareVersions(latestChildVer, resolvedTargetVersion) >= 0 && latestChild?.updatePending == false)
         ) {
+          confirmedByChild = true
           break
         }
       }
 
-      // Finalize authoritative Core Engine version so older shell heartbeats (e.g. 3.3.7) never revert it
-      repository.completeRemoteSilentUpdate(childId, resolvedTargetVersion)
       _isRemoteUpdating.value = false
 
-      _updateCompletedReport.value = RemoteUpdateReport(
-        childName = child.name,
-        newVersion = resolvedTargetVersion,
-        changes = listOf(
-          "✅ Модуль Ядра v$resolvedTargetVersion успешно передан и активирован на телефоне «${child.name}» без переустановки оболочки!",
-          "Фоновые службы защиты (24/7 мониторинг, точный GPS, блокировка, Accessibility) перезапущены с новым Ядром.",
-          "Все выданные системные разрешения (включая п. 4 «Живая трансляция экрана LIVE») и привязка профиля сохранены на 100%."
+      if (confirmedByChild) {
+        repository.completeRemoteSilentUpdate(childId, resolvedTargetVersion)
+        _updateCompletedReport.value = RemoteUpdateReport(
+          childName = child.name,
+          newVersion = resolvedTargetVersion,
+          changes = listOf(
+            "✅ Телефон «${child.name}» подтвердил установку и запуск новой версии v$resolvedTargetVersion!",
+            "Фоновые службы защиты (24/7 мониторинг, точный GPS, блокировка, Accessibility) перезапущены.",
+            "Все выданные системные разрешения и привязка профиля сохранены."
+          )
         )
-      )
-      showToast("Успешно! Ядро на телефоне «${child.name}» обновлено до v$resolvedTargetVersion!")
+        showToast("Успешно! Телефон «${child.name}» подтвердил обновление до v$resolvedTargetVersion!")
+      } else {
+        _updateCompletedReport.value = RemoteUpdateReport(
+          childName = child.name,
+          newVersion = resolvedTargetVersion,
+          changes = listOf(
+            "📦 Пакет обновления APK v$resolvedTargetVersion передан на телефон «${child.name}» (текущая установленная версия ребёнка: v${child.appVersion}).",
+            "На телефоне ребёнка выполняется скачивание и установка APK (при включённых Спец. возможностях кнопка «Установить» нажимается автоматически).",
+            "Версия на карточке ребёнка изменится на v$resolvedTargetVersion сразу после фактического завершения установки APK на телефоне ребёнка."
+          )
+        )
+        showToast("Пакет APK v$resolvedTargetVersion отправлен на «${child.name}». Ожидание завершения установки...")
+      }
     }
   }
 

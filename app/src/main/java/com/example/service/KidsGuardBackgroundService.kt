@@ -47,25 +47,142 @@ class KidsGuardBackgroundService : Service() {
   private var isGpsTrackingStarted = false
 
   // Окно измерения расхода энергии приложения начинается при отключении зарядки.
+  // При подключении или отключении зарядки мгновенно будим сокет и отправляем родителю актуальный заряд и PONG!
   private val powerConnectionReceiver = object : android.content.BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
       when (intent?.action) {
         Intent.ACTION_POWER_CONNECTED -> com.example.util.AppEnergyMeter.reset(applicationContext)
         Intent.ACTION_POWER_DISCONNECTED -> com.example.util.AppEnergyMeter.startWindow(applicationContext)
       }
+      wakeSocketAndSendHeartbeatNow("POWER_STATE_CHANGED")
     }
   }
 
+  @Volatile
+  private var screenOffSinceMs: Long = 0L
+
+  private val dozeHeartbeatReceiver = object : android.content.BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+      if (intent?.action == ACTION_DOZE_STANDBY_PULSE) {
+        if (!DeviceUsageTracker.isInteractive(applicationContext)) {
+          scheduleNextDozeStandbyPulse()
+          wakeSocketAndSendHeartbeatNow("DOZE_STANDBY_PULSE")
+        } else {
+          cancelDozeStandbyPulse()
+        }
+      }
+    }
+  }
+
+  private fun scheduleNextDozeStandbyPulse() {
+    try {
+      val am = getSystemService(Context.ALARM_SERVICE) as? android.app.AlarmManager ?: return
+      val intent = Intent(ACTION_DOZE_STANDBY_PULSE).apply {
+        setPackage(packageName)
+      }
+      val pi = PendingIntent.getBroadcast(
+        applicationContext,
+        9402,
+        intent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+      )
+      val triggerAt = System.currentTimeMillis() + 210_000L // раз в 3.5 минуты только при выключенном экране
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        am.setAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, triggerAt, pi)
+      } else {
+        am.set(android.app.AlarmManager.RTC_WAKEUP, triggerAt, pi)
+      }
+    } catch (_: Exception) {}
+  }
+
+  private fun cancelDozeStandbyPulse() {
+    try {
+      val am = getSystemService(Context.ALARM_SERVICE) as? android.app.AlarmManager ?: return
+      val intent = Intent(ACTION_DOZE_STANDBY_PULSE).apply {
+        setPackage(packageName)
+      }
+      val pi = PendingIntent.getBroadcast(
+        applicationContext,
+        9402,
+        intent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+      )
+      am.cancel(pi)
+    } catch (_: Exception) {}
+  }
+
   // Погас экран — живого просмотра быть не может: сразу гасим стрим и GPS,
-  // чтобы телефон ребёнка не тратил батарею, пока лежит заблокированным.
+  // включаем редкий Doze-пульс (раз в 3.5 мин) и шлём родителю PONG + статус «Телефон не используется • Экран выключен»,
+  // чтобы телефон ребёнка ВСЕГДА оставался на связи даже после многих часов бездействия!
   private val screenOffReceiver = object : android.content.BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
-      if (intent?.action == Intent.ACTION_SCREEN_OFF) {
-        try {
-          KidsGuardAccessibilityService.stopLiveStreamingWindow()
-        } catch (_: Exception) {}
-        stopGpsTracking()
+      when (intent?.action) {
+        Intent.ACTION_SCREEN_OFF -> {
+          screenOffSinceMs = System.currentTimeMillis()
+          try {
+            KidsGuardAccessibilityService.stopLiveStreamingWindow()
+          } catch (_: Exception) {}
+          stopGpsTracking()
+          scheduleNextDozeStandbyPulse()
+          wakeSocketAndSendHeartbeatNow("SCREEN_OFF")
+        }
+        Intent.ACTION_SCREEN_ON,
+        Intent.ACTION_USER_PRESENT -> {
+          screenOffSinceMs = 0L
+          cancelDozeStandbyPulse()
+          wakeSocketAndSendHeartbeatNow("SCREEN_ON")
+        }
       }
+    }
+  }
+
+  private fun wakeSocketAndSendHeartbeatNow(reason: String) {
+    if (com.example.location.LiveLocationTracker.isEmulator()) return
+    try {
+      val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+      val wl = pm?.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "KidsGuard:BgPulseWake")
+      wl?.setReferenceCounted(false)
+      wl?.acquire(4_500L)
+    } catch (_: Exception) {}
+
+    serviceScope.launch(Dispatchers.IO) {
+      try {
+        val dao = KidsGuardDatabase.getDatabase(applicationContext).kidsGuardDao()
+        val bootCfg = com.example.util.BootPrefs.load(applicationContext)
+        val cfg = dao.getFamilyConfigOnce()
+        if (cfg?.selectedRole != "CHILD" && bootCfg.permanentHardwareRole != "CHILD" && bootCfg.role != "CHILD") return@launch
+        val cid = activeChildId.takeIf { it > 0 }
+          ?: cfg?.thisDeviceChildId?.takeIf { it > 0 }
+          ?: bootCfg.childId.takeIf { it > 0 }
+          ?: cfg?.currentActiveChildId?.takeIf { it > 0 }
+          ?: 1L
+        activeChildId = cid
+
+        com.example.data.cloud.DirectP2pSocketEngine.appContext = applicationContext
+        com.example.data.cloud.DirectP2pSocketEngine.startEngine("CHILD", cid)
+        com.example.data.cloud.DirectP2pSocketEngine.ensureConnectedAndWake()
+        val batt = readBatteryLevel()
+        if (batt in 1..100) {
+          dao.updateChildBattery(cid, batt)
+          cloudSync.upsertBatteryLevel(cid, batt)
+        }
+        com.example.data.cloud.RealtimeCloudRelay.publishChildPong(cid)
+        if (!DeviceUsageTracker.isInteractive(applicationContext)) {
+          cloudSync.updateActiveAppOnly(cid, buildStandbyScreenOffLabel(batt))
+        }
+      } catch (_: Exception) {}
+    }
+  }
+
+  private fun buildStandbyScreenOffLabel(batt: Int): String {
+    if (screenOffSinceMs == 0L) screenOffSinceMs = System.currentTimeMillis()
+    val idleMin = ((System.currentTimeMillis() - screenOffSinceMs) / 60_000L).coerceAtLeast(0L)
+    val idleSuffix = if (idleMin >= 1L) " • не используется $idleMin мин." else ""
+    val isCharging = com.example.util.AppEnergyMeter.isCharging(applicationContext)
+    return if (isCharging) {
+      "🌙 Экран выключен (на зарядке ${if (batt in 1..100) "$batt%" else ""}$idleSuffix)"
+    } else {
+      "🌙 Телефон не используется • Экран выключен$idleSuffix"
     }
   }
 
@@ -190,8 +307,41 @@ class KidsGuardBackgroundService : Service() {
     } catch (_: Exception) {}
   }
 
+  private fun isDeviceStorageUnlocked(): Boolean {
+    return try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        val um = getSystemService(Context.USER_SERVICE) as? android.os.UserManager
+        um?.isUserUnlocked != false
+      } else true
+    } catch (_: Exception) {
+      true
+    }
+  }
+
   private fun startProtectionLoops() {
     serviceScope.launch {
+      // 0. Мгновенный старт сетевого движка из BootPrefs (Device Protected Storage) даже до разблокировки экрана после ребута
+      val initialBootCfg = com.example.util.BootPrefs.load(applicationContext)
+      if (!com.example.location.LiveLocationTracker.isEmulator() &&
+          (initialBootCfg.permanentHardwareRole == "CHILD" || initialBootCfg.role == "CHILD")) {
+        if (initialBootCfg.childId > 0L) {
+          activeChildId = initialBootCfg.childId
+        } else if (activeChildId <= 0L) {
+          activeChildId = 1L
+        }
+        com.example.data.cloud.DirectP2pSocketEngine.appContext = applicationContext
+        try {
+          com.example.data.cloud.DirectP2pSocketEngine.startEngine("CHILD", activeChildId)
+          com.example.data.cloud.DirectP2pSocketEngine.ensureConnectedAndWake()
+          com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+        } catch (_: Exception) {}
+      }
+
+      // Ждём разблокировки хранилища после рестарта телефона, прежде чем обращаться к Room SQLite
+      while (isActive && !isDeviceStorageUnlocked()) {
+        delay(2_000L)
+      }
+
       val database = KidsGuardDatabase.getDatabase(applicationContext)
       val dao = database.kidsGuardDao()
 
@@ -201,27 +351,37 @@ class KidsGuardBackgroundService : Service() {
           delay(5000)
           continue
         }
-        val config = dao.getFamilyConfigOnce()
-        val isChildRole = config?.selectedRole == "CHILD"
+        val bootCfg = com.example.util.BootPrefs.load(applicationContext)
+        val config = try { dao.getFamilyConfigOnce() } catch (_: Exception) { null }
+        val isChildRole = config?.selectedRole == "CHILD" ||
+          bootCfg.permanentHardwareRole == "CHILD" ||
+          bootCfg.role == "CHILD"
         if (!isChildRole) {
           activeChildId = 0L
           LockOverlayService.stop(applicationContext)
           stopSelf()
           return@launch
         }
-        val children = dao.getAllChildrenOnce()
+        val children = try { dao.getAllChildrenOnce() } catch (_: Exception) { emptyList() }
         val resolvedId = when {
           config != null && config.thisDeviceChildId > 0 && children.any { it.id == config.thisDeviceChildId } -> config.thisDeviceChildId
+          bootCfg.childId > 0 && (children.isEmpty() || children.any { it.id == bootCfg.childId }) -> bootCfg.childId
           activeChildId > 0 && children.any { it.id == activeChildId } -> activeChildId
           config != null && config.currentActiveChildId > 0 && children.any { it.id == config.currentActiveChildId } -> config.currentActiveChildId
+          children.any { it.isPaired } -> children.first { it.isPaired }.id
           children.isNotEmpty() -> children.last().id
           else -> 1L
         }
         if (resolvedId > 0) {
           activeChildId = resolvedId
-          if (config != null && config.thisDeviceChildId != resolvedId) {
-            dao.setThisDeviceChildId(resolvedId)
-          }
+          try {
+            if (config != null && config.thisDeviceChildId != resolvedId) {
+              dao.setThisDeviceChildId(resolvedId)
+            }
+            if (config != null && config.selectedRole != "CHILD" && bootCfg.permanentHardwareRole == "CHILD") {
+              dao.setDeviceRole("CHILD")
+            }
+          } catch (_: Exception) {}
           break
         }
         delay(1500)
@@ -229,33 +389,45 @@ class KidsGuardBackgroundService : Service() {
 
       Log.d(TAG, "Background service running for Child ID: $activeChildId")
       com.example.data.cloud.DirectP2pSocketEngine.appContext = applicationContext
-      // Сервис может быть перезапущен системой (START_STICKY) без MainActivity —
-      // тогда P2P-движок не стартовал и ребёнок числился «Оффлайн». Явно поднимаем.
       try {
         com.example.data.cloud.DirectP2pSocketEngine.startEngine("CHILD", activeChildId)
       } catch (_: Exception) {}
       com.example.util.CoreEngineHotUpdater.initializeHotCore(applicationContext)
 
-      // Сохраняем минимальный boot-конфиг в Device Protected Storage, чтобы после
-      // глубокого разряда/перезагрузки (LOCKED_BOOT_COMPLETED) сервис поднимался без Room.
+      // Сохраняем минимальный boot-конфиг и кэш кода привязки в Device Protected Storage и RealtimeCloudRelay,
+      // чтобы сразу после обновления APK телефон соединялся с родителем в фоне БЕЗ открытия главного окна!
       try {
         val bootCfg = dao.getFamilyConfigOnce()
-        val bootChild = dao.getChildByIdOnce(activeChildId)
+        val bootChild = dao.getChildByIdOnce(activeChildId) ?: dao.getAllChildrenOnce().firstOrNull()
+        val resolvedCode = bootChild?.pairingCode?.trim()?.takeIf { it.length >= 6 }
+          ?: com.example.util.BootPrefs.getPairingCode(applicationContext)
+        if (resolvedCode.length >= 6) {
+          com.example.util.BootPrefs.savePairingCode(applicationContext, resolvedCode)
+        }
+        if (bootChild != null) {
+          com.example.data.cloud.RealtimeCloudRelay.replaceCachedChildProfile(
+            if (resolvedCode.length >= 6 && bootChild.pairingCode != resolvedCode) {
+              bootChild.copy(pairingCode = resolvedCode, isPaired = true)
+            } else {
+              bootChild
+            }
+          )
+        }
         com.example.util.BootPrefs.save(
           context = applicationContext,
           role = "CHILD",
           childId = activeChildId,
           allowMobileData = bootChild?.allowMobileData ?: true,
-          familyId = bootCfg?.familyId ?: ""
+          familyId = bootCfg?.familyId ?: "",
+          permanentHardwareRole = "CHILD",
+          masterPin = bootCfg?.parentMasterPin
         )
       } catch (_: Exception) {}
 
-      // Снимаем ограничения оптимизации батареи, чтобы Android не переводил агент
-      // в Restricted Bucket при падении заряда ниже 15% и не убивал связь.
+      // Мгновенно будим сокет и отправляем PONG + первый кадр экрана родителю при старте сервиса
       try {
-        if (!com.example.util.DeviceSecurityPermissionHelper.isBatteryOptimizationIgnored(applicationContext)) {
-          com.example.util.DeviceSecurityPermissionHelper.requestIgnoreBatteryOptimization(applicationContext)
-        }
+        com.example.data.cloud.DirectP2pSocketEngine.ensureConnectedAndWake()
+        com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
       } catch (_: Exception) {}
 
       // Never auto-lock on service startup unless a fresh authoritative lock was explicitly sent
@@ -265,22 +437,41 @@ class KidsGuardBackgroundService : Service() {
         com.example.util.DeviceTotalLockManager.releaseTotalLock(applicationContext)
       }
 
-      // Sync real installed apps from Child's physical phone to Cloud on service start (PRESERVING existing isBlocked & dailyLimitMinutes!)
+      // Sync real installed apps from Child's physical phone to Cloud on service start (PRESERVING existing isBlocked & BootPrefs!)
       launch(Dispatchers.IO) {
         try {
           DeviceUsageTracker.ensureDailyMidnightReset(applicationContext, activeChildId)
           val realApps = com.example.util.DeviceAppsProvider.getInstalledLaunchableApps(applicationContext, activeChildId)
           if (realApps.isNotEmpty()) {
+            val bootBlockedSet = com.example.util.BootPrefs.getBlockedPackages(applicationContext).map { it.lowercase() }.toSet()
+            val bootLimits = com.example.util.BootPrefs.getAppLimitsMap(applicationContext)
+            val allDbApps = dao.getAllAppsOnce()
+            val anyDbBlocked = allDbApps.filter { it.isBlocked }.map { it.packageName.trim().lowercase() }.toSet()
             val prevApps = dao.getAppsForChildOnce(activeChildId).associateBy { it.packageName.trim().lowercase() }
             val merged = realApps.map { app ->
-              val prev = prevApps[app.packageName.trim().lowercase()]
+              val key = app.packageName.trim().lowercase()
+              val prev = prevApps[key]
+              val mustBeBlocked = (prev?.isBlocked == true) || (key in bootBlockedSet) || (key in anyDbBlocked)
+              if (mustBeBlocked) {
+                com.example.util.BootPrefs.saveBlockedPackage(applicationContext, app.packageName, true)
+              }
+              val effectiveLimit = if ((prev?.dailyLimitMinutes ?: 0) > 0) {
+                prev!!.dailyLimitMinutes
+              } else {
+                bootLimits[app.packageName] ?: 0
+              }
               if (prev != null) {
                 app.copy(
-                  isBlocked = prev.isBlocked,
-                  dailyLimitMinutes = prev.dailyLimitMinutes,
-                  usedMinutesToday = maxOf(app.usedMinutesToday, prev.usedMinutesToday)
+                  isBlocked = mustBeBlocked,
+                  dailyLimitMinutes = effectiveLimit,
+                  usedMinutesToday = prev.usedMinutesToday
                 )
-              } else app
+              } else {
+                app.copy(
+                  isBlocked = mustBeBlocked,
+                  dailyLimitMinutes = effectiveLimit
+                )
+              }
             }
             dao.replaceChildAppsStrictlyFromRemote(activeChildId, merged)
             if (com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()) {
@@ -305,6 +496,10 @@ class KidsGuardBackgroundService : Service() {
 
       launch {
         dao.getChildById(activeChildId).collect { child ->
+          if (child != null && child.pairingCode.length >= 6) {
+            com.example.util.BootPrefs.savePairingCode(applicationContext, child.pairingCode)
+            com.example.data.cloud.RealtimeCloudRelay.replaceCachedChildProfile(child)
+          }
           val gpsEnabled = child?.gpsTrackingEnabled ?: false
           com.example.location.LiveLocationTracker.setGpsTrackingAllowed(gpsEnabled)
           launch(Dispatchers.Main) {
@@ -317,7 +512,7 @@ class KidsGuardBackgroundService : Service() {
         }
       }
 
-      // 2. Active Foreground App, On-Demand Live Screen & App Block Enforcement Loop (Battery-Optimized)
+      // 2. Fallback Foreground App & Block Enforcement Loop (runs frequently ONLY if AccessibilityService is disabled)
       launch(Dispatchers.IO) {
         var lastUploadedAppLabel = ""
         var lastAppUploadTimeMs = 0L
@@ -326,10 +521,10 @@ class KidsGuardBackgroundService : Service() {
           val isLiveStreamActive = KidsGuardAccessibilityService.isLiveStreamingActiveNow()
           val isA11yActive = KidsGuardAccessibilityService.isAccessibilityEnabled()
           val loopDelayMs = when {
-            !isScreenInteractive -> 120_000L
-            isLiveStreamActive -> 3_500L
-            isA11yActive -> 20_000L // AccessibilityService already intercepts apps instantaneously
-            else -> 6_000L
+            !isScreenInteractive -> 60_000L
+            isA11yActive -> 30_000L
+            isLiveStreamActive -> 3_000L
+            else -> 4_000L
           }
           delay(loopDelayMs)
           try {
@@ -340,13 +535,15 @@ class KidsGuardBackgroundService : Service() {
             if (boundId > 0) activeChildId = boundId
             if (activeChildId <= 0) continue
 
-            val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
-            val activePkg = DeviceUsageTracker.resolveCurrentForegroundPackage(applicationContext)
-
             // Check 00:00 Midnight Reset before evaluating any daily limit
             DeviceUsageTracker.ensureDailyMidnightReset(applicationContext, activeChildId)
 
-            // Enforce Phone Lock ONLY when an authoritative lock is active; release immediately if unlocked!
+            // Если AccessibilityService активен — он сам перехватывает окна по событиям (0 мс) без опроса
+            if (isA11yActive) continue
+
+            val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
+            val activePkg = DeviceUsageTracker.resolveCurrentForegroundPackage(applicationContext)
+
             val authLocked = com.example.data.cloud.RealtimeCloudRelay.getAuthoritativeLock(activeChildId)?.first
             val isLockedNow = authLocked == true
             val isCoreWhitelisted = DeviceUsageTracker.isWhitelistedCoreMdmPackage(applicationContext, activePkg)
@@ -357,19 +554,24 @@ class KidsGuardBackgroundService : Service() {
             } else if (isLockedNow && !com.example.util.DeviceTotalLockManager.isCurrentlyLocked) {
               com.example.util.DeviceTotalLockManager.enforceTotalLock(applicationContext, "Экран заблокирован родителем")
             } else if (!isLockedNow && !activePkg.isNullOrBlank() && !isCoreWhitelisted) {
-              // Explicitly whitelist KidsGuard & core system UI so KidsGuard NEVER blocks or kills its own MDM service!
               val childProfile = dao.getChildByIdOnce(activeChildId)
               val dailyLimit = childProfile?.dailyScreenLimitMinutes ?: 0
               val usedToday = childProfile?.usedScreenTimeMinutes ?: 0
               val appEntity = dao.getAppByPackageOnce(activeChildId, activePkg)
-              if (appEntity?.isBlocked == true) {
+              val isPkgBlocked = (appEntity?.isBlocked == true) ||
+                com.example.util.BootPrefs.isPackageBlocked(applicationContext, activePkg)
+              val isUnlockedByPin = KidsGuardAccessibilityService.instance?.isPackageTemporarilyUnlockedByPin(activePkg) == true
+              if (isPkgBlocked && !isUnlockedByPin) {
+                val friendly = appEntity?.appName?.takeIf { it.isNotBlank() }
+                  ?: DeviceUsageTracker.getFriendlyAppLabel(applicationContext, activePkg)
+                KidsGuardAccessibilityService.killBlockedPackageCompletely(applicationContext, activePkg)
                 com.example.ui.screens.ChildLockScreenActivity.launch(
                   context = applicationContext,
-                  reason = "Приложение «${appEntity.appName}» заблокировано родительским контролем KidsGuard",
+                  reason = "Программа «$friendly» заблокирована родителем.\nВведите PIN-код родителя, чтобы открыть программу.",
                   isDeviceTotalLock = false,
                   blockedPackageName = activePkg
                 )
-              } else if (dailyLimit in 1..usedToday) {
+              } else if (dailyLimit in 1..usedToday && !isUnlockedByPin) {
                 com.example.ui.screens.ChildLockScreenActivity.launch(
                   context = applicationContext,
                   reason = "Дневной лимит экранного времени ($dailyLimit мин) на сегодня исчерпан!",
@@ -379,11 +581,10 @@ class KidsGuardBackgroundService : Service() {
               }
             }
 
-            // CRITICAL BATTERY FIX: Only capture & stream live screen frames when the Parent is actively watching Live Stream!
             val nowMs = System.currentTimeMillis()
             val isParentWatchingLive = KidsGuardAccessibilityService.isLiveStreamingActiveNow()
             val isParentConnected = com.example.data.cloud.DirectP2pSocketEngine.isParentActivelyConnected()
-            if (!isLockedNow && isParentWatchingLive && !isA11yActive) {
+            if (!isLockedNow && isParentWatchingLive) {
               ScreenShotManager.triggerHardwareScreenCapture(appLabel, false) { item ->
                 serviceScope.launch(Dispatchers.IO) {
                   if (!item.base64Bitmap.isNullOrBlank()) {
@@ -393,11 +594,18 @@ class KidsGuardBackgroundService : Service() {
               }
               lastUploadedAppLabel = appLabel
               lastAppUploadTimeMs = nowMs
-            } else if (isParentConnected && appLabel.isNotBlank() && (appLabel != lastUploadedAppLabel || (nowMs - lastAppUploadTimeMs) >= 180_000L)) {
-              // Parent-presence gated telemetry: only transmit over network when Parent is actively connected
+            } else if (isParentConnected && appLabel.isNotBlank() && (appLabel != lastUploadedAppLabel || (nowMs - lastAppUploadTimeMs) >= 20_000L)) {
               lastUploadedAppLabel = appLabel
               lastAppUploadTimeMs = nowMs
-              cloudSync.updateActiveAppOnly(activeChildId, appLabel)
+              ScreenShotManager.triggerHardwareScreenCapture(appLabel, false) { item ->
+                serviceScope.launch(Dispatchers.IO) {
+                  if (!item.base64Bitmap.isNullOrBlank()) {
+                    cloudSync.uploadScreenSnapshot(activeChildId, appLabel, item.base64Bitmap)
+                  } else {
+                    cloudSync.updateActiveAppOnly(activeChildId, appLabel)
+                  }
+                }
+              }
             }
           } catch (e: Exception) {
             Log.e(TAG, "Active app sync loop error: ${e.message}")
@@ -405,26 +613,25 @@ class KidsGuardBackgroundService : Service() {
         }
       }
 
-      // 3. Screen Usage Loop (45 с при включённом экране, 120 с при выключенном — экономия батареи)
+      // 3. Screen Usage Loop (60 с при включённом экране, 120 с при выключенном — экономия батареи)
       launch {
         var screenOnSeconds = 0
         while (isActive) {
           val isScreenOn = DeviceUsageTracker.isInteractive(applicationContext)
-          delay(if (isScreenOn) 45_000L else 120_000L)
+          delay(if (isScreenOn) 60_000L else 120_000L)
           try {
             if (com.example.location.LiveLocationTracker.isEmulator()) continue
             val latestCfg = dao.getFamilyConfigOnce()
             val boundId = latestCfg?.thisDeviceChildId?.takeIf { it > 0 } ?: activeChildId
             if (boundId > 0) activeChildId = boundId
-            // Полуночный сброс проверяем всегда, но при выключенном экране — реже (120 с).
             DeviceUsageTracker.ensureDailyMidnightReset(applicationContext, activeChildId)
             if (!isScreenOn) continue
             if (!isGpsTrackingStarted && com.example.location.LiveLocationTracker.isGpsTrackingAllowed) {
               launch(Dispatchers.Main) { startGpsTracking(requestImmediateFix = false) }
             }
             if (activeChildId > 0) {
-              screenOnSeconds += 45
-              if (screenOnSeconds >= 90) {
+              screenOnSeconds += 60
+              if (screenOnSeconds >= 120) {
                 screenOnSeconds = 0
                 DeviceUsageTracker.syncRealUsageStats(applicationContext, activeChildId)
               }
@@ -435,28 +642,27 @@ class KidsGuardBackgroundService : Service() {
         }
       }
 
-      // 4. Smart Battery & Online Heartbeat loop:
-      // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (Этап 4): Ребёнок отправляет легкий CHILD_PONG каждые 30 секунд
-      // даже когда родитель закрыл приложение более чем на 1 час (isParentActivelyConnected == false).
-      // Благодаря этому телефон ребёнка НИКОГДА не уходит в «Оффлайн» через 1 час!
+      // 4. Энергоэффективный цикл синхронизации батареи (БЕЗ периодических WakeLock и без дублирования пульса с AccessibilityService!):
       launch {
         var lastSyncedBattery = -1
         var lastSyncedChildId = -1L
         var lastSyncTimeMs = 0L
         while (isActive) {
+          val screenInteractive = DeviceUsageTracker.isInteractive(applicationContext)
+          val a11yRunning = KidsGuardAccessibilityService.isAccessibilityEnabled()
           try {
             val latestCfg = dao.getFamilyConfigOnce()
             val boundId = latestCfg?.thisDeviceChildId?.takeIf { it > 0 }
               ?: latestCfg?.currentActiveChildId?.takeIf { it > 0 }
               ?: activeChildId
             if (boundId > 0) activeChildId = boundId
-            val screenInteractive = DeviceUsageTracker.isInteractive(applicationContext)
             if (!com.example.location.LiveLocationTracker.isEmulator() && activeChildId > 0) {
               val batteryLevel = readBatteryLevel()
               val now = System.currentTimeMillis()
-              // Экран выключен — батарея почти не меняется, обновляем её реже.
               val batterySyncInterval = if (screenInteractive) 120_000L else 300_000L
-              if (batteryLevel != lastSyncedBattery || activeChildId != lastSyncedChildId || (now - lastSyncTimeMs) >= batterySyncInterval) {
+              if ((batteryLevel != lastSyncedBattery && screenInteractive) ||
+                  activeChildId != lastSyncedChildId ||
+                  (now - lastSyncTimeMs) >= batterySyncInterval) {
                 lastSyncedBattery = batteryLevel
                 lastSyncedChildId = activeChildId
                 lastSyncTimeMs = now
@@ -472,14 +678,27 @@ class KidsGuardBackgroundService : Service() {
           } catch (e: Exception) {
             Log.e(TAG, "Battery sync error: ${e.message}")
           }
-          // Ребёнок всегда сообщает о своём онлайне каждые 30–45 секунд (независимо от таймера присутствия родителя!).
-          try {
-            if (activeChildId > 0) {
-              com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+          // Если AccessibilityService активен — он сам ведёт редкий пульс онлайна, поэтому не дублируем сетевые пакеты
+          if (!a11yRunning) {
+            try {
+              com.example.data.cloud.DirectP2pSocketEngine.appContext = applicationContext
+              if (activeChildId > 0) {
+                com.example.data.cloud.DirectP2pSocketEngine.startEngine("CHILD", activeChildId)
+              }
+              com.example.data.cloud.DirectP2pSocketEngine.ensureConnectedAndWake()
+              if (activeChildId > 0) {
+                com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+              }
+            } catch (_: Exception) {}
+          }
+          delay(
+            when {
+              a11yRunning && screenInteractive -> 120_000L
+              a11yRunning -> 240_000L
+              screenInteractive -> 35_000L
+              else -> 58_000L
             }
-          } catch (_: Exception) {}
-          val screenInteractiveForDelay = DeviceUsageTracker.isInteractive(applicationContext)
-          delay(if (screenInteractiveForDelay) 30_000L else 45_000L)
+          )
         }
       }
 
@@ -487,15 +706,18 @@ class KidsGuardBackgroundService : Service() {
       launch {
         var currentObservedId = -1L
         var cmdJob: kotlinx.coroutines.Job? = null
+        var lastPingCaptureMs = 0L
         dao.getFamilyConfig().collect { currentCfg ->
-          if (currentCfg?.selectedRole != "CHILD") {
+          val bootCfg = com.example.util.BootPrefs.load(applicationContext)
+          if (currentCfg?.selectedRole != "CHILD" && bootCfg.permanentHardwareRole != "CHILD" && bootCfg.role != "CHILD") {
             cmdJob?.cancel()
             LockOverlayService.stop(applicationContext)
             stopSelf()
             return@collect
           }
-          val boundId = currentCfg.thisDeviceChildId.takeIf { it > 0 }
-            ?: currentCfg.currentActiveChildId.takeIf { it > 0 }
+          val boundId = currentCfg?.thisDeviceChildId?.takeIf { it > 0 }
+            ?: bootCfg.childId.takeIf { it > 0 }
+            ?: currentCfg?.currentActiveChildId?.takeIf { it > 0 }
             ?: activeChildId
           if (boundId > 0) activeChildId = boundId
           if (!com.example.location.LiveLocationTracker.isEmulator() && activeChildId > 0 && (cmdJob == null || !cmdJob!!.isActive || currentObservedId != activeChildId)) {
@@ -507,12 +729,15 @@ class KidsGuardBackgroundService : Service() {
                 cloudSync.observeRemoteCommands(targetObservedId).collect { cmdPair ->
                   if (com.example.location.LiveLocationTracker.isEmulator()) return@collect
                   val latestCfg = dao.getFamilyConfigOnce()
-                  if (latestCfg?.selectedRole != "CHILD") {
+                  val latestBoot = com.example.util.BootPrefs.load(applicationContext)
+                  if (latestCfg?.selectedRole != "CHILD" && latestBoot.permanentHardwareRole != "CHILD" && latestBoot.role != "CHILD") {
                     LockOverlayService.stop(applicationContext)
                     stopSelf()
                     return@collect
                   }
-                  val latestId = latestCfg.thisDeviceChildId.takeIf { it > 0 } ?: targetObservedId
+                  val latestId = latestCfg?.thisDeviceChildId?.takeIf { it > 0 }
+                    ?: latestBoot.childId.takeIf { it > 0 }
+                    ?: targetObservedId
                   if (latestId > 0) activeChildId = latestId
                   cmdPair?.let { (cmd, payload) ->
                     Log.d(TAG, "Background received remote command for child $activeChildId: $cmd")
@@ -534,38 +759,66 @@ class KidsGuardBackgroundService : Service() {
                         val isBlocked = cmd == "BLOCK_APP"
                         val pkg = payload.trim()
                         if (pkg.isNotBlank()) {
+                          com.example.util.BootPrefs.saveBlockedPackage(applicationContext, pkg, isBlocked)
+                          KidsGuardAccessibilityService.instance?.setPackageBlockedImmediate(pkg, isBlocked)
+                          dao.setAppBlockedByPackageGlobal(pkg, isBlocked)
                           val existing = dao.getAppByPackageOnce(activeChildId, pkg)
-                          if (existing != null) {
-                            dao.setAppBlocked(existing.id, isBlocked)
-                          } else {
-                            // Strictly verify that the package is actually installed on this Child device before inserting
-                            val installedSet = com.example.util.DeviceAppsProvider.getInstalledPackageSet(applicationContext)
-                            if (pkg.lowercase() in installedSet) {
-                              val label = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, pkg)
-                              dao.insertApp(
-                                com.example.data.model.AppControlEntity(
-                                  childId = activeChildId,
-                                  packageName = pkg,
-                                  appName = label,
-                                  iconType = "generic",
-                                  category = "Приложения",
-                                  dailyLimitMinutes = 0,
-                                  usedMinutesToday = 0,
-                                  isBlocked = isBlocked
-                                )
+                          if (existing == null) {
+                            val label = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, pkg)
+                            dao.insertApp(
+                              com.example.data.model.AppControlEntity(
+                                childId = activeChildId,
+                                packageName = pkg,
+                                appName = label,
+                                iconType = "generic",
+                                category = "Приложения",
+                                dailyLimitMinutes = 0,
+                                usedMinutesToday = 0,
+                                isBlocked = isBlocked
                               )
-                            }
+                            )
                           }
                           cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
                           if (isBlocked && DeviceUsageTracker.resolveCurrentForegroundPackage(applicationContext) == pkg) {
                             val label = DeviceUsageTracker.getFriendlyAppLabel(applicationContext, pkg)
                             com.example.ui.screens.ChildLockScreenActivity.launch(
                               context = applicationContext,
-                              reason = "Приложение «$label» заблокировано родительским контролем KidsGuard",
+                              reason = "Программа «$label» заблокирована родителем.\nВведите PIN-код родителя, чтобы открыть программу.",
                               isDeviceTotalLock = false,
                               blockedPackageName = pkg
                             )
                           }
+                        }
+                      }
+                      "BLOCK_DOMAIN", "UNBLOCK_DOMAIN" -> {
+                        val isBlocked = cmd == "BLOCK_DOMAIN"
+                        val cleanDomain = com.example.util.BootPrefs.normalizeDomain(payload)
+                        if (cleanDomain.isNotBlank() && cleanDomain.contains(".")) {
+                          com.example.util.BootPrefs.saveBlockedDomain(applicationContext, cleanDomain, isBlocked)
+                          KidsGuardAccessibilityService.instance?.setDomainBlockedImmediate(cleanDomain, isBlocked)
+                          if (isBlocked) {
+                            val existing = dao.getAllContentRulesOnce()
+                              .firstOrNull { it.ruleType == "DOMAIN" && com.example.util.BootPrefs.normalizeDomain(it.value) == cleanDomain }
+                            if (existing == null) {
+                              dao.insertContentRule(
+                                com.example.data.model.ContentRuleEntity(
+                                  ruleType = "DOMAIN",
+                                  value = cleanDomain,
+                                  displayName = "🌐 $cleanDomain",
+                                  isBlocked = true
+                                )
+                              )
+                            } else if (!existing.isBlocked) {
+                              dao.updateContentRule(existing.copy(isBlocked = true))
+                            }
+                          } else {
+                            val matches = dao.getAllContentRulesOnce()
+                              .filter { it.ruleType == "DOMAIN" && com.example.util.BootPrefs.normalizeDomain(it.value) == cleanDomain }
+                            for (rule in matches) {
+                              dao.deleteContentRule(rule)
+                            }
+                          }
+                          cloudSync.syncContentRulesToCloud(dao.getAllContentRulesOnce())
                         }
                       }
                       "LIMIT_APP", "SET_APP_LIMIT" -> {
@@ -573,17 +826,15 @@ class KidsGuardBackgroundService : Service() {
                         val pkg = payload.substringBefore(delim).trim()
                         val mins = payload.substringAfter(delim, "0").trim().toIntOrNull() ?: 0
                         if (pkg.isNotBlank()) {
-                          val existing = dao.getAppByPackageOnce(activeChildId, pkg)
-                          if (existing != null) {
-                            dao.setAppLimit(existing.id, mins)
-                            cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
-                            com.example.util.DeviceControlDebugger.logEvent(
-                              "ЛИМИТ_ПРОГРАММЫ",
-                              "Установлен лимит для ${existing.appName} ($pkg): $mins мин/день",
-                              "SUCCESS",
-                              "CHILD"
-                            )
-                          }
+                          com.example.util.BootPrefs.saveAppLimit(applicationContext, pkg, mins)
+                          dao.setAppLimitByPackageGlobal(pkg, mins)
+                          cloudSync.uploadChildApps(activeChildId, dao.getAppsForChildOnce(activeChildId))
+                          com.example.util.DeviceControlDebugger.logEvent(
+                            "ЛИМИТ_ПРОГРАММЫ",
+                            "Установлен лимит для $pkg: $mins мин/день",
+                            "SUCCESS",
+                            "CHILD"
+                          )
                         }
                       }
                       "LOUD_RING" -> {
@@ -675,32 +926,63 @@ class KidsGuardBackgroundService : Service() {
                       }
                       "PARENT_SESSION_START" -> {
                         // Родитель открыл приложение: выходим из тихого режима и сразу
-                        // отдаём актуальный стейт/батарею.
+                        // отдаём актуальный стейт, батарею, статус разрешений и живой снимок экрана!
                         com.example.data.cloud.DirectP2pSocketEngine.setParentSessionActive(true)
                         com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
                         val sessBatt = readBatteryLevel()
                         dao.updateChildBattery(activeChildId, sessBatt)
                         cloudSync.upsertBatteryLevel(activeChildId, sessBatt)
                         com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+                        // Мгновенно отправляем 1 стартовый снимок экрана родителю при старте сессии (если экран включён)
+                        if (DeviceUsageTracker.isInteractive(applicationContext)) {
+                          KidsGuardAccessibilityService.instance?.triggerImmediateCaptureNow()
+                        } else {
+                          cloudSync.updateActiveAppOnly(activeChildId, buildStandbyScreenOffLabel(sessBatt))
+                        }
+                        com.example.util.AppEnergyMeter.read(applicationContext)?.let { reading ->
+                          com.example.data.cloud.RealtimeCloudRelay.publishPowerStats(
+                            activeChildId,
+                            reading.appPercent,
+                            reading.mahPerHour,
+                            reading.percentPerHour
+                          )
+                        }
                         cloudSync.clearRemoteCommand(activeChildId)
                       }
                       "PARENT_SESSION_STOP" -> {
-                        // Родитель свернул/закрыл приложение: переходим в тихий режим.
                         com.example.data.cloud.DirectP2pSocketEngine.setParentSessionActive(false)
                         cloudSync.clearRemoteCommand(activeChildId)
                       }
                       "PING" -> {
-                        // Дешёвый ping-pong: только присутствие и свежая батарея.
                         android.util.Log.d("P2P", "receive PING childId=$activeChildId")
                         com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
                         val pingBatt = readBatteryLevel()
                         dao.updateChildBattery(activeChildId, pingBatt)
                         cloudSync.upsertBatteryLevel(activeChildId, pingBatt)
                         com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+                        val nowPingMs = System.currentTimeMillis()
+                        val hasInitialSnap = !ScreenShotManager.capturedScreens.value.firstOrNull()?.base64Bitmap.isNullOrBlank()
+                        if (DeviceUsageTracker.isInteractive(applicationContext)) {
+                          // Экономия батареи: при обычном PING делаем снимок только если ещё нет ни одного кадра или идёт Live-эфир
+                          if ((!hasInitialSnap || KidsGuardAccessibilityService.isLiveStreamingActiveNow()) &&
+                              (nowPingMs - lastPingCaptureMs >= 15_000L)) {
+                            lastPingCaptureMs = nowPingMs
+                            KidsGuardAccessibilityService.instance?.triggerImmediateCaptureNow()
+                          }
+                        } else {
+                          cloudSync.updateActiveAppOnly(activeChildId, buildStandbyScreenOffLabel(pingBatt))
+                        }
+                        com.example.util.AppEnergyMeter.read(applicationContext)?.let { reading ->
+                          com.example.data.cloud.RealtimeCloudRelay.publishPowerStats(
+                            activeChildId,
+                            reading.appPercent,
+                            reading.mahPerHour,
+                            reading.percentPerHour
+                          )
+                        }
                         cloudSync.clearRemoteCommand(activeChildId)
                       }
                       "REQUEST_POWER_STATS" -> {
-                        // Мгновенный ответ родителю на запрос расхода энергии приложения.
                         com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
                         com.example.util.AppEnergyMeter.read(applicationContext)?.let { reading ->
                           com.example.data.cloud.RealtimeCloudRelay.publishPowerStats(
@@ -749,7 +1031,6 @@ class KidsGuardBackgroundService : Service() {
                         cloudSync.clearRemoteCommand(activeChildId)
                       }
                       "CONFIGURE_VPS" -> {
-                        // Родитель передал настройки VPS/Cloudflare Relay — применяем на ребёнке.
                         try {
                           val j = org.json.JSONObject(payload)
                           com.example.data.cloud.DirectP2pSocketEngine.configureVpsRelay(
@@ -771,22 +1052,39 @@ class KidsGuardBackgroundService : Service() {
                         }
                         cloudSync.clearRemoteCommand(activeChildId)
                       }
+                      "SET_PAIRING_CODE" -> {
+                        val newCode = payload.trim()
+                        if (newCode.length >= 6) {
+                          com.example.util.BootPrefs.savePairingCode(applicationContext, newCode)
+                          val existing = dao.getChildByIdOnce(activeChildId) ?: dao.getAllChildrenOnce().firstOrNull()
+                          if (existing != null) {
+                            val updated = existing.copy(pairingCode = newCode, isPaired = true)
+                            dao.updateChild(updated)
+                            com.example.data.cloud.RealtimeCloudRelay.replaceCachedChildProfile(updated)
+                            com.example.data.cloud.RealtimeCloudRelay.publishChildProfile(updated, true)
+                            com.example.data.cloud.RealtimeCloudRelay.publishChildPong(updated.id)
+                          }
+                        }
+                        cloudSync.clearRemoteCommand(activeChildId)
+                      }
                       "PARENT_ONLINE_HEARTBEAT", "REQUEST_GPS_NOW", "REQUEST_OFFLINE_SYNC", "MAP_VIEWING" -> {
                         com.example.data.cloud.DirectP2pSocketEngine.markParentPresenceActive(activeChildId)
                         val isImmediateGpsRequest = (cmd == "REQUEST_GPS_NOW" || cmd == "MAP_VIEWING")
                         val freshBatt = readBatteryLevel()
                         dao.updateChildBattery(activeChildId, freshBatt)
                         cloudSync.upsertBatteryLevel(activeChildId, freshBatt)
-                        if (com.example.location.LiveLocationTracker.isGpsTrackingAllowed) {
+                        com.example.data.cloud.RealtimeCloudRelay.publishChildPong(activeChildId)
+                        if (cmd == "PARENT_ONLINE_HEARTBEAT") {
+                          if (!DeviceUsageTracker.isInteractive(applicationContext)) {
+                            cloudSync.updateActiveAppOnly(activeChildId, buildStandbyScreenOffLabel(freshBatt))
+                          }
+                        }
+                        if (isImmediateGpsRequest && com.example.location.LiveLocationTracker.isGpsTrackingAllowed) {
                           launch(Dispatchers.Main) {
-                            startGpsTracking(requestImmediateFix = isImmediateGpsRequest)
+                            startGpsTracking(requestImmediateFix = true)
                           }
-                          val freshLoc = if (isImmediateGpsRequest) {
-                            com.example.location.LiveLocationTracker.awaitHighAccuracyLocation(applicationContext, 4_000L)
-                              ?: com.example.location.LiveLocationTracker.getBestImmediateLocation(applicationContext)
-                          } else {
-                            com.example.location.LiveLocationTracker.getBestImmediateLocation(applicationContext)
-                          }
+                          val freshLoc = com.example.location.LiveLocationTracker.awaitHighAccuracyLocation(applicationContext, 4_000L)
+                            ?: com.example.location.LiveLocationTracker.getBestImmediateLocation(applicationContext)
                           if (freshLoc != null) {
                             onNewLocation(freshLoc, forceUpload = true)
                           }
@@ -829,18 +1127,38 @@ class KidsGuardBackgroundService : Service() {
                       }
                       "REFRESH_APPS" -> {
                         serviceScope.launch(Dispatchers.IO) {
+                          DeviceUsageTracker.ensureDailyMidnightReset(applicationContext, activeChildId)
                           val realApps = com.example.util.DeviceAppsProvider.getInstalledLaunchableApps(applicationContext, activeChildId)
                           if (realApps.isNotEmpty()) {
+                            val bootBlockedSet = com.example.util.BootPrefs.getBlockedPackages(applicationContext).map { it.lowercase() }.toSet()
+                            val bootLimits = com.example.util.BootPrefs.getAppLimitsMap(applicationContext)
+                            val allDbApps = dao.getAllAppsOnce()
+                            val anyDbBlocked = allDbApps.filter { it.isBlocked }.map { it.packageName.trim().lowercase() }.toSet()
                             val prevApps = dao.getAppsForChildOnce(activeChildId).associateBy { it.packageName.trim().lowercase() }
                             val merged = realApps.map { app ->
-                              val prev = prevApps[app.packageName.trim().lowercase()]
+                              val key = app.packageName.trim().lowercase()
+                              val prev = prevApps[key]
+                              val mustBeBlocked = (prev?.isBlocked == true) || (key in bootBlockedSet) || (key in anyDbBlocked)
+                              if (mustBeBlocked) {
+                                com.example.util.BootPrefs.saveBlockedPackage(applicationContext, app.packageName, true)
+                              }
+                              val effectiveLimit = if ((prev?.dailyLimitMinutes ?: 0) > 0) {
+                                prev!!.dailyLimitMinutes
+                              } else {
+                                bootLimits[app.packageName] ?: 0
+                              }
                               if (prev != null) {
                                 app.copy(
-                                  isBlocked = prev.isBlocked,
-                                  dailyLimitMinutes = prev.dailyLimitMinutes,
-                                  usedMinutesToday = app.usedMinutesToday
+                                  isBlocked = mustBeBlocked,
+                                  dailyLimitMinutes = effectiveLimit,
+                                  usedMinutesToday = prev.usedMinutesToday
                                 )
-                              } else app
+                              } else {
+                                app.copy(
+                                  isBlocked = mustBeBlocked,
+                                  dailyLimitMinutes = effectiveLimit
+                                )
+                              }
                             }
                             dao.replaceChildAppsStrictlyFromRemote(activeChildId, merged)
                             cloudSync.uploadChildApps(activeChildId, merged)
@@ -850,8 +1168,11 @@ class KidsGuardBackgroundService : Service() {
                         }
                       }
                       "START_LIVE_STREAM" -> {
-                        if (KidsGuardAccessibilityService.instance == null) {
-                          KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
+                        KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
+                        val accSvc = KidsGuardAccessibilityService.instance
+                        if (accSvc != null) {
+                          accSvc.triggerImmediateCaptureNow()
+                        } else {
                           val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
                           ScreenShotManager.triggerHardwareScreenCapture(appLabel, false) { item ->
                             serviceScope.launch(Dispatchers.IO) {
@@ -865,8 +1186,11 @@ class KidsGuardBackgroundService : Service() {
                         }
                       }
                       "TAKE_SCREENSHOT" -> {
-                        if (KidsGuardAccessibilityService.instance == null) {
-                          KidsGuardAccessibilityService.activateLiveStreamingWindow(90_000L)
+                        // Одиночный снимок экрана НЕ включает 90-секундный цикл видеопотока (экономия батареи!)
+                        val accSvc = KidsGuardAccessibilityService.instance
+                        if (accSvc != null) {
+                          accSvc.triggerImmediateCaptureNow()
+                        } else {
                           val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
                           ScreenShotManager.triggerHardwareScreenCapture(appLabel, false) { item ->
                             serviceScope.launch(Dispatchers.IO) {
@@ -882,6 +1206,7 @@ class KidsGuardBackgroundService : Service() {
                       "QUERY_ACTIVE_APP" -> {
                         val appLabel = DeviceUsageTracker.resolveCurrentForegroundApp(applicationContext)
                         cloudSync.updateActiveAppOnly(activeChildId, appLabel)
+                        KidsGuardAccessibilityService.instance?.triggerImmediateCaptureNow()
                       }
                       "STOP_LIVE_STREAM" -> {
                         KidsGuardAccessibilityService.stopLiveStreamingWindow()
@@ -968,19 +1293,18 @@ class KidsGuardBackgroundService : Service() {
       return
     }
 
-    // КЛЮЧЕВАЯ ЭКОНОМИЯ: непрерывные обновления координат включаем ТОЛЬКО пока родитель
-    // реально смотрит карту (команда MAP_VIEWING). В остальное время GNSS-радио должно
-    // спать — фоновый GPS каждые 25–60 секунд был главной причиной разряда и нагрева.
+    // КЛЮЧЕВАЯ ЭКОНОМИЯ БАТАРЕИ: непрерывные обновления координат (requestLocationUpdates) включаем
+    // ИСКЛЮЧИТЕЛЬНО пока родитель реально открыл вкладку «Карта» (команда MAP_VIEWING).
+    // Для первого фикса при старте или разового запроса REQUEST_GPS_NOW используем ТОЛЬКО однократный
+    // запрос getCurrentLocation / lastLocation без бесконечного поиска спутников в помещении!
     val parentOnMap = com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()
     val hasInitialFix = lastBgLocation != null
-    val shouldStartUpdates = parentOnMap || requestImmediateFix || !hasInitialFix
-    if (!shouldStartUpdates && isGpsTrackingStarted) {
+    val shouldRunContinuousUpdates = parentOnMap
+    if (!shouldRunContinuousUpdates && isGpsTrackingStarted) {
       stopGpsTracking()
-      return
     }
 
     try {
-      // 1. Primary Eco-Smart FusedLocationProviderClient
       val fc = fusedClient
       if (fc != null) {
         try {
@@ -990,22 +1314,31 @@ class KidsGuardBackgroundService : Service() {
             }
           }
           if (requestImmediateFix || parentOnMap || !hasInitialFix) {
-            val highAccReq = com.google.android.gms.location.CurrentLocationRequest.Builder()
-              .setPriority(com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY)
-              .setMaxUpdateAgeMillis(10_000L)
-              .setDurationMillis(6_000L)
+            val priority = if (parentOnMap || requestImmediateFix) {
+              com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY
+            } else {
+              com.google.android.gms.location.Priority.PRIORITY_BALANCED_POWER_ACCURACY
+            }
+            val oneShotReq = com.google.android.gms.location.CurrentLocationRequest.Builder()
+              .setPriority(priority)
+              .setMaxUpdateAgeMillis(20_000L)
+              .setDurationMillis(5_500L)
               .build()
-            fc.getCurrentLocation(highAccReq, null)
+            fc.getCurrentLocation(oneShotReq, null)
               .addOnSuccessListener { loc ->
                 if (loc != null && !com.example.location.LiveLocationTracker.isEmulatorSyntheticUsLocation(loc.latitude, loc.longitude)) {
                   onNewLocation(loc, forceUpload = true)
                 }
               }
           }
-          if (shouldStartUpdates && !isGpsTrackingStarted) {
+          if (shouldRunContinuousUpdates && !isGpsTrackingStarted) {
             fusedCallback?.let { prev -> try { fc.removeLocationUpdates(prev) } catch (_: Exception) {} }
             val cb = object : com.google.android.gms.location.LocationCallback() {
               override fun onLocationResult(result: com.google.android.gms.location.LocationResult) {
+                if (!com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()) {
+                  stopGpsTracking()
+                  return
+                }
                 val bestInBatch = result.locations
                   .filter { !com.example.location.LiveLocationTracker.isEmulatorSyntheticUsLocation(it.latitude, it.longitude) }
                   .minByOrNull { if (it.accuracy > 0f) it.accuracy else 999f }
@@ -1018,9 +1351,9 @@ class KidsGuardBackgroundService : Service() {
             fusedCallback = cb
             val req = com.google.android.gms.location.LocationRequest.Builder(
               com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY,
-              12_000L
+              15_000L
             )
-              .setMinUpdateIntervalMillis(8_000L)
+              .setMinUpdateIntervalMillis(10_000L)
               .setMinUpdateDistanceMeters(10f)
               .setWaitForAccurateLocation(false)
               .build()
@@ -1032,11 +1365,14 @@ class KidsGuardBackgroundService : Service() {
       }
 
       // 2. Fallback LocationManager
-      if (!shouldStartUpdates) return
+      val bestImmediate = com.example.location.LiveLocationTracker.getBestImmediateLocation(this)
+      bestImmediate?.let { onNewLocation(it, forceUpload = requestImmediateFix || !hasInitialFix) }
+      if (!shouldRunContinuousUpdates) return
       val lm = locationManager ?: return
       val listener = bgLocationListener ?: object : LocationListener {
         override fun onLocationChanged(location: Location) {
-          if (!com.example.location.LiveLocationTracker.isGpsTrackingAllowed) {
+          if (!com.example.location.LiveLocationTracker.isGpsTrackingAllowed ||
+              !com.example.data.cloud.DirectP2pSocketEngine.isParentMapViewing()) {
             stopGpsTracking()
             return
           }
@@ -1047,16 +1383,13 @@ class KidsGuardBackgroundService : Service() {
         override fun onProviderDisabled(provider: String) {}
       }.also { bgLocationListener = it }
 
-      val bestImmediate = com.example.location.LiveLocationTracker.getBestImmediateLocation(this)
-      bestImmediate?.let { onNewLocation(it, forceUpload = requestImmediateFix || !hasInitialFix) }
-
       if (!isGpsTrackingStarted) {
         try { lm.removeUpdates(listener) } catch (_: Exception) {}
         val bgProviders = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
         for (provider in bgProviders) {
           try {
             if (lm.allProviders.contains(provider)) {
-              lm.requestLocationUpdates(provider, 12_000L, 10f, listener, android.os.Looper.getMainLooper())
+              lm.requestLocationUpdates(provider, 15_000L, 10f, listener, android.os.Looper.getMainLooper())
             }
           } catch (_: Exception) {}
         }
@@ -1189,6 +1522,8 @@ class KidsGuardBackgroundService : Service() {
     try {
       val filter = android.content.IntentFilter().apply {
         addAction(Intent.ACTION_SCREEN_OFF)
+        addAction(Intent.ACTION_SCREEN_ON)
+        addAction(Intent.ACTION_USER_PRESENT)
       }
       androidx.core.content.ContextCompat.registerReceiver(
         applicationContext,
@@ -1196,17 +1531,26 @@ class KidsGuardBackgroundService : Service() {
         filter,
         androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
       )
+      val dozeFilter = android.content.IntentFilter(ACTION_DOZE_STANDBY_PULSE)
+      androidx.core.content.ContextCompat.registerReceiver(
+        applicationContext,
+        dozeHeartbeatReceiver,
+        dozeFilter,
+        androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+      )
+      if (!DeviceUsageTracker.isInteractive(applicationContext)) {
+        if (screenOffSinceMs == 0L) screenOffSinceMs = System.currentTimeMillis()
+        scheduleNextDozeStandbyPulse()
+      }
     } catch (_: Exception) {
     }
   }
 
   override fun onDestroy() {
     isRunning = false
-    if (activeChildId > 0L) {
-      try {
-        com.example.data.cloud.RealtimeCloudRelay.publishChildOffline(activeChildId)
-      } catch (_: Exception) {}
-    }
+    cancelDozeStandbyPulse()
+    // КРИТИЧНО: НЕ отправляем publishChildOffline при остановке/перезапуске фонового сервиса,
+    // так как системный KidsGuardAccessibilityService продолжает держать связь 24/7 и тут же перезапустит FGS!
     try {
       unregisterReceiver(powerConnectionReceiver)
     } catch (_: Exception) {
@@ -1215,10 +1559,16 @@ class KidsGuardBackgroundService : Service() {
       unregisterReceiver(screenOffReceiver)
     } catch (_: Exception) {
     }
+    try {
+      unregisterReceiver(dozeHeartbeatReceiver)
+    } catch (_: Exception) {
+    }
     super.onDestroy()
   }
 
   companion object {
+    private const val ACTION_DOZE_STANDBY_PULSE = "com.example.ACTION_DOZE_STANDBY_PULSE"
+
     /** True, пока фоновый сервис жив. Watchdog в AccessibilityService проверяет его. */
     @Volatile
     var isRunning = false
