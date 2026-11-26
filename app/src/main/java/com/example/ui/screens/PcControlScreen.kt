@@ -33,9 +33,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
@@ -1595,6 +1597,281 @@ fun PcControlScreen(
       }
     }
 
+    // 3.5. ЧАТ С КОМПЬЮТЕРОМ (РОДИТЕЛЬ <-> WINDOWS ПК) + УПРАВЛЕНИЕ ИКОНКОЙ В ТРЕЕ
+    item {
+      var pcChatInput by rememberSaveable { mutableStateOf("") }
+      var showAllPcChat by remember { mutableStateOf(false) }
+      val pcChatList = pcState.chatMessages
+      val visiblePcChat = remember(pcChatList, showAllPcChat) {
+        if (showAllPcChat) pcChatList else pcChatList.takeLast(5)
+      }
+      val isLegacyPcScript = remember(pcState.pcScriptVersion) {
+        val ver = pcState.pcScriptVersion.trim()
+        ver.isNotBlank() && ver < "5.6"
+      }
+
+      Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = Slate900),
+        border = BorderStroke(1.dp, CyanLight.copy(alpha = 0.35f)),
+        modifier = Modifier
+          .fillMaxWidth()
+          .testTag("pc_chat_card")
+      ) {
+        Column(
+          modifier = Modifier.padding(16.dp),
+          verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+              modifier = Modifier.weight(1f)
+            ) {
+              Icon(Icons.Default.Chat, contentDescription = null, tint = CyanLight, modifier = Modifier.size(20.dp))
+              Column {
+                Text(
+                  text = "💬 Чат с компьютером (ПК)",
+                  color = Color.White,
+                  fontWeight = FontWeight.ExtraBold,
+                  fontSize = 15.sp
+                )
+                Text(
+                  text = "Сообщение всплывёт поверх экрана ПК • Ребёнок сможет ответить и закрыть",
+                  color = Slate400,
+                  fontSize = 11.sp
+                )
+              }
+            }
+            if (pcChatList.isNotEmpty()) {
+              Text(
+                text = "${pcChatList.size}",
+                color = CyanLight,
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = 11.sp,
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(CyanContainer)
+                  .padding(horizontal = 8.dp, vertical = 3.dp)
+              )
+            }
+          }
+
+          // Переключатель иконки чата в системном трее Windows (по умолчанию ВЫКЛ)
+          Row(
+            modifier = Modifier
+              .fillMaxWidth()
+              .clip(RoundedCornerShape(12.dp))
+              .background(Slate950)
+              .border(
+                1.dp,
+                if (pcState.chatTrayEnabled) EmeraldShield.copy(alpha = 0.55f) else Slate800,
+                RoundedCornerShape(12.dp)
+              )
+              .padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+              Text(
+                text = "Иконка чата в трее ПК (ребёнок может писать сам)",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.5.sp
+              )
+              Spacer(modifier = Modifier.height(2.dp))
+              Text(
+                text = if (pcState.chatTrayEnabled) {
+                  "🟢 ВКЛ: в системном трее Windows видна иконка. Ребёнок может сам открыть чат и написать вам."
+                } else {
+                  "🔒 ВЫКЛ (по умолчанию): иконки нигде нет. Окно открывается только когда пишете вы, после закрытия ребёнок открыть его не может."
+                },
+                color = if (pcState.chatTrayEnabled) EmeraldShieldLight else Slate400,
+                fontSize = 10.5.sp,
+                lineHeight = 14.sp
+              )
+            }
+            Switch(
+              checked = pcState.chatTrayEnabled,
+              onCheckedChange = { enabled ->
+                PcBlockerClient.setPcChatTrayEnabled(enabled)
+              },
+              colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.White,
+                checkedTrackColor = EmeraldShield,
+                uncheckedThumbColor = Slate400,
+                uncheckedTrackColor = Slate800
+              ),
+              modifier = Modifier.testTag("pc_chat_tray_switch")
+            )
+          }
+
+          if (isLegacyPcScript) {
+            Text(
+              text = "ℹ️ На ПК установлена версия агента v${pcState.pcScriptVersion}. Для работы чата и иконки в трее обновите hosts_blocker.py на ПК до v5.6.",
+              color = AmberWarning,
+              fontSize = 11.sp,
+              lineHeight = 15.sp,
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(AmberWarning.copy(alpha = 0.12f))
+                .padding(horizontal = 10.dp, vertical = 7.dp)
+            )
+          }
+
+          // Лента последних сообщений чата с ПК
+          if (pcChatList.isEmpty()) {
+            Box(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(Slate950)
+                .padding(horizontal = 12.dp, vertical = 14.dp),
+              contentAlignment = Alignment.Center
+            ) {
+              Text(
+                text = "Напишите первое сообщение ниже — оно сразу появится на экране компьютера. Все ответы с ПК также дублируются в «Семейный чат» с пометкой 💻 ПК.",
+                color = Slate400,
+                fontSize = 11.5.sp,
+                lineHeight = 16.sp
+              )
+            }
+          } else {
+            Column(
+              modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(Slate950)
+                .padding(10.dp),
+              verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+              if (pcChatList.size > 5) {
+                TextButton(
+                  onClick = { showAllPcChat = !showAllPcChat },
+                  contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                  modifier = Modifier.align(Alignment.CenterHorizontally)
+                ) {
+                  Text(
+                    text = if (showAllPcChat) "Свернуть историю" else "Показать всю переписку (${pcChatList.size})",
+                    color = CyanLight,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                  )
+                }
+              }
+              visiblePcChat.forEach { cm ->
+                val isParentMsg = cm.sender.equals("PARENT", ignoreCase = true)
+                val timeStr = try {
+                  java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+                    .format(java.util.Date(cm.timestampMs))
+                } catch (_: Exception) { "" }
+                Row(
+                  modifier = Modifier.fillMaxWidth(),
+                  horizontalArrangement = if (isParentMsg) Arrangement.End else Arrangement.Start
+                ) {
+                  Column(
+                    modifier = Modifier
+                      .fillMaxWidth(0.86f)
+                      .clip(RoundedCornerShape(12.dp))
+                      .background(if (isParentMsg) Color(0xFF0369A1) else Color(0xFF1E293B))
+                      .border(
+                        1.dp,
+                        if (isParentMsg) CyanLight.copy(alpha = 0.4f) else EmeraldShield.copy(alpha = 0.45f),
+                        RoundedCornerShape(12.dp)
+                      )
+                      .padding(horizontal = 10.dp, vertical = 7.dp)
+                  ) {
+                    Row(
+                      modifier = Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
+                    ) {
+                      Text(
+                        text = if (isParentMsg) "Вы → 💻 ПК" else "💻 ПК • ${cm.user.ifBlank { "Ребёнок" }}",
+                        color = if (isParentMsg) CyanLight else EmeraldShieldLight,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 10.5.sp
+                      )
+                      Text(
+                        text = timeStr,
+                        color = Slate200.copy(alpha = 0.7f),
+                        fontSize = 9.5.sp
+                      )
+                    }
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Text(
+                      text = cm.text,
+                      color = Color.White,
+                      fontSize = 12.5.sp,
+                      lineHeight = 16.sp
+                    )
+                  }
+                }
+              }
+            }
+          }
+
+          // Поле ввода и кнопка отправки сообщения на ПК
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+          ) {
+            OutlinedTextField(
+              value = pcChatInput,
+              onValueChange = { pcChatInput = it },
+              placeholder = {
+                Text("Написать на экран ПК...", color = Slate400, fontSize = 12.5.sp)
+              },
+              singleLine = false,
+              maxLines = 3,
+              colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = CyanLight,
+                unfocusedBorderColor = Slate800,
+                focusedContainerColor = Slate950,
+                unfocusedContainerColor = Slate950,
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                cursorColor = CyanLight
+              ),
+              shape = RoundedCornerShape(12.dp),
+              modifier = Modifier
+                .weight(1f)
+                .testTag("pc_chat_input_field")
+            )
+            IconButton(
+              onClick = {
+                val txt = pcChatInput.trim()
+                if (txt.isNotBlank()) {
+                  PcBlockerClient.sendPcChatMessage(txt, alsoRecordInFamilyChat = true)
+                  pcChatInput = ""
+                  Toast.makeText(context, "💬 Сообщение отправлено на экран ПК", Toast.LENGTH_SHORT).show()
+                }
+              },
+              enabled = pcChatInput.isNotBlank(),
+              modifier = Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(if (pcChatInput.isNotBlank()) CyanLight else Slate800)
+                .testTag("pc_chat_send_button")
+            ) {
+              Icon(
+                imageVector = Icons.AutoMirrored.Filled.Send,
+                contentDescription = "Отправить на ПК",
+                tint = if (pcChatInput.isNotBlank()) Slate950 else Slate400,
+                modifier = Modifier.size(19.dp)
+              )
+            }
+          }
+        }
+      }
+    }
+
     // 4. SECTION HEADER: BLOCK RULES (HOSTS + BROWSER POLICIES + FIREWALL + PROCESS KILLER)
     item {
       Row(
@@ -1718,25 +1995,24 @@ fun PcControlScreen(
       }
 
       val displayTitles: List<PcActivityItem> = remember(filteredSqlTitles, fallbackDatedUsers, fallbackTitleStart) {
-        val rawItems = if (filteredSqlTitles.isNotEmpty()) {
-          filteredSqlTitles.map {
-            PcActivityItem(
-              label = cleanPcWindowTitle(it.windowTitle),
-              seconds = it.totalDurationSeconds.toInt(),
-              startedAtMs = it.startedAtMs.takeIf { s -> s > 0L }
-                ?: fallbackTitleStart[it.windowTitle.lowercase().trim()]
-                ?: 0L,
-              userName = it.appName
-            )
-          }
-        } else {
-          fallbackDatedUsers
-            .flatMap { u -> u.titles.map { t -> t.copy(label = cleanPcWindowTitle(t.label), userName = u.user) } }
+        val sqlItems = filteredSqlTitles.map {
+          PcActivityItem(
+            label = cleanPcWindowTitle(it.windowTitle),
+            seconds = it.totalDurationSeconds.toInt(),
+            startedAtMs = it.startedAtMs.takeIf { s -> s > 0L }
+              ?: fallbackTitleStart[it.windowTitle.lowercase().trim()]
+              ?: 0L,
+            userName = it.appName
+          )
         }
-        rawItems
+        val liveItems = fallbackDatedUsers.flatMap { u ->
+          u.titles.map { t -> t.copy(label = cleanPcWindowTitle(t.label), userName = u.user) } +
+            u.sites.map { s -> s.copy(label = cleanPcWindowTitle(s.label), userName = u.user) }
+        }
+        val sqlGrouped = sqlItems
           .filter { it.label.isNotBlank() && it.seconds > 0 }
           .groupBy { buildPcWindowTitleGroupKey(it.userName, it.label) }
-          .map { (_, items) ->
+          .mapValues { (_, items) ->
             val bestLabel = items.minByOrNull { it.label.length }?.label ?: items.first().label
             PcActivityItem(
               label = bestLabel,
@@ -1745,7 +2021,31 @@ fun PcControlScreen(
               userName = items.first().userName
             )
           }
-          .sortedByDescending { it.seconds }
+        val liveGrouped = liveItems
+          .filter { it.label.isNotBlank() && it.seconds > 0 }
+          .groupBy { buildPcWindowTitleGroupKey(it.userName, it.label) }
+          .mapValues { (_, items) ->
+            val bestLabel = items.minByOrNull { it.label.length }?.label ?: items.first().label
+            PcActivityItem(
+              label = bestLabel,
+              seconds = items.sumOf { it.seconds },
+              startedAtMs = items.mapNotNull { i -> i.startedAtMs.takeIf { it > 0L } }.maxOrNull() ?: 0L,
+              userName = items.first().userName
+            )
+          }
+        val mergedMap = LinkedHashMap<String, PcActivityItem>(sqlGrouped)
+        for ((k, liveItem) in liveGrouped) {
+          val existing = mergedMap[k]
+          if (existing == null) {
+            mergedMap[k] = liveItem
+          } else {
+            mergedMap[k] = existing.copy(
+              seconds = maxOf(existing.seconds, liveItem.seconds),
+              startedAtMs = maxOf(existing.startedAtMs, liveItem.startedAtMs)
+            )
+          }
+        }
+        mergedMap.values.sortedByDescending { it.seconds }
       }
 
       val historyUsers = remember(

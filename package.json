@@ -1,7 +1,7 @@
 {
   "name": "kidsguard",
   "private": true,
-  "version": "3.3.35-pro.78",
+  "version": "3.3.35-pro.80",
   "type": "module",
   "scripts": {
     "dev": "python3 server.py",

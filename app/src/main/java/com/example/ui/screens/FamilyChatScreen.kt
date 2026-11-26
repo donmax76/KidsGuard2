@@ -76,6 +76,9 @@ fun FamilyChatScreen(
   val context = androidx.compose.ui.platform.LocalContext.current
   var messageInput by remember { mutableStateOf("") }
   var lastTypingSentMs by remember { mutableStateOf(0L) }
+  // Получатель для Родителя: PHONE (телефон ребёнка), PC (экран Windows ПК), BOTH (телефон + ПК)
+  var parentChatTarget by remember { mutableStateOf("PHONE") }
+  val pcState by com.example.data.pc.PcBlockerClient.state.collectAsState()
   val listState = rememberLazyListState()
   val childId = child?.id?.takeIf { it > 0L } ?: 1L
   val myRole = if (isParentRole) "PARENT" else "CHILD"
@@ -250,6 +253,7 @@ fun FamilyChatScreen(
       ) {
         items(messages, key = { it.id }) { msg ->
           val isMyMessage = if (isParentRole) msg.senderRole == "PARENT" else msg.senderRole == "CHILD"
+          val isPcTagged = msg.senderName.contains("ПК") || msg.senderName.contains("💻")
           val timeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(msg.timestamp))
 
           Row(
@@ -267,12 +271,18 @@ fun FamilyChatScreen(
                 containerColor = when {
                   msg.isAttentionSignal -> Color(0xFF7F1D1D)
                   isMyMessage -> Color(0xFF0369A1) // Deep Cyan / Blue for me
+                  isPcTagged -> Color(0xFF132238) // Subtle teal-slate for PC replies
                   else -> Slate900 // Dark Slate for other
                 }
               ),
               border = androidx.compose.foundation.BorderStroke(
                 1.dp,
-                if (msg.isAttentionSignal) RoseLock else if (isMyMessage) CyanLight.copy(alpha = 0.4f) else Slate800
+                when {
+                  msg.isAttentionSignal -> RoseLock
+                  isPcTagged && !isMyMessage -> CyanLight.copy(alpha = 0.55f)
+                  isMyMessage -> CyanLight.copy(alpha = 0.4f)
+                  else -> Slate800
+                }
               ),
               modifier = Modifier.fillMaxWidth(0.82f)
             ) {
@@ -282,12 +292,29 @@ fun FamilyChatScreen(
                   horizontalArrangement = Arrangement.SpaceBetween,
                   verticalAlignment = Alignment.CenterVertically
                 ) {
-                  Text(
-                    text = msg.senderName,
-                    color = if (isMyMessage) CyanLight else EmeraldShield,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 11.sp
-                  )
+                  Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                  ) {
+                    Text(
+                      text = msg.senderName,
+                      color = if (isMyMessage) CyanLight else if (isPcTagged) CyanLight else EmeraldShield,
+                      fontWeight = FontWeight.Bold,
+                      fontSize = 11.sp
+                    )
+                    if (isPcTagged) {
+                      Text(
+                        text = "ПК",
+                        color = Slate950,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 9.sp,
+                        modifier = Modifier
+                          .clip(RoundedCornerShape(4.dp))
+                          .background(CyanLight)
+                          .padding(horizontal = 4.dp, vertical = 1.dp)
+                      )
+                    }
+                  }
                   Text(
                     text = timeStr,
                     color = Slate200.copy(alpha = 0.75f),
@@ -374,6 +401,44 @@ fun FamilyChatScreen(
       }
     }
 
+    // Переключатель адресата для Родителя: 📱 Телефон / 💻 ПК / 📱+💻 Оба
+    if (isParentRole) {
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(horizontal = 12.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        val targets = listOf(
+          Triple("PHONE", "📱 Телефон", "Отправить на телефон"),
+          Triple("PC", if (pcState.isOnline) "💻 ПК • онлайн" else "💻 ПК", "Отправить на экран ПК"),
+          Triple("BOTH", "📱+💻 Оба", "Отправить на телефон и ПК")
+        )
+        targets.forEach { (key, label, _) ->
+          val active = parentChatTarget == key
+          Button(
+            onClick = { parentChatTarget = key },
+            colors = ButtonDefaults.buttonColors(
+              containerColor = if (active) CyanContainer else Slate900,
+              contentColor = if (active) CyanLight else Slate400
+            ),
+            border = androidx.compose.foundation.BorderStroke(
+              1.dp,
+              if (active) CyanLight.copy(alpha = 0.7f) else Slate800
+            ),
+            shape = RoundedCornerShape(10.dp),
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+            modifier = Modifier
+              .weight(1f)
+              .height(30.dp)
+          ) {
+            Text(label, fontSize = 11.sp, fontWeight = if (active) FontWeight.ExtraBold else FontWeight.SemiBold, maxLines = 1)
+          }
+        }
+      }
+    }
+
     // Input Box Area
     Card(
       modifier = Modifier
@@ -412,7 +477,12 @@ fun FamilyChatScreen(
           },
           placeholder = {
             Text(
-              if (isParentRole) "Сообщение для ребенка..." else "Сообщение родителям...",
+              when {
+                !isParentRole -> "Сообщение родителям..."
+                parentChatTarget == "PC" -> "Сообщение на экран ПК..."
+                parentChatTarget == "BOTH" -> "Сообщение на телефон и ПК..."
+                else -> "Сообщение для ребенка..."
+              },
               color = Slate400,
               fontSize = 13.sp
             )
@@ -432,14 +502,34 @@ fun FamilyChatScreen(
 
         IconButton(
           onClick = {
-            if (messageInput.isNotBlank()) {
+            val cleanMsg = messageInput.trim()
+            if (cleanMsg.isNotBlank()) {
               lastTypingSentMs = 0L
               com.example.data.cloud.RealtimeCloudRelay.publishChatTypingStatus(
                 childId = childId,
                 senderRole = myRole,
                 isTyping = false
               )
-              onSendMessage(messageInput.trim())
+              if (isParentRole) {
+                when (parentChatTarget) {
+                  "PC" -> {
+                    com.example.data.pc.PcBlockerClient.sendPcChatMessage(
+                      text = cleanMsg,
+                      alsoRecordInFamilyChat = true
+                    )
+                  }
+                  "BOTH" -> {
+                    onSendMessage(cleanMsg)
+                    com.example.data.pc.PcBlockerClient.sendPcChatMessage(
+                      text = cleanMsg,
+                      alsoRecordInFamilyChat = false
+                    )
+                  }
+                  else -> onSendMessage(cleanMsg)
+                }
+              } else {
+                onSendMessage(cleanMsg)
+              }
               messageInput = ""
             }
           },

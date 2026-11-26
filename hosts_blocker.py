@@ -34,13 +34,16 @@ import secrets
 import select
 import shutil
 import socket
+import sqlite3
 import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 import atexit
 import zlib
 try:
@@ -61,8 +64,8 @@ except ImportError:
 IS_WIN = os.name == "nt"
 
 # Версия скрипта: по ней приложение/панель понимают, что на ПК действительно новый файл.
-SCRIPT_VERSION = "5.5"
-SCRIPT_BUILD = "2026-11-09"
+SCRIPT_VERSION = "5.7"
+SCRIPT_BUILD = "2026-11-26"
 if IS_WIN:
     import winreg
 
@@ -2040,17 +2043,180 @@ def load_activity_history():
     return {}
 
 
-def save_activity_history_day(day_iso, user, proc_sec, title_sec, proc_started=None, title_started=None):
+def _chromium_history_paths():
+    """Возвращает список файлов History основных Chromium-браузеров текущего пользователя Windows."""
+    if not IS_WIN:
+        return []
+    local = os.environ.get("LOCALAPPDATA") or ""
+    roam = os.environ.get("APPDATA") or ""
+    candidates = [
+        os.path.join(local, "Google", "Chrome", "User Data"),
+        os.path.join(local, "Microsoft", "Edge", "User Data"),
+        os.path.join(local, "Yandex", "YandexBrowser", "User Data"),
+        os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data"),
+        os.path.join(local, "Vivaldi", "User Data"),
+        os.path.join(roam, "Opera Software", "Opera Stable"),
+        os.path.join(roam, "Opera Software", "Opera GX Stable"),
+    ]
+    paths = []
+    for base in candidates:
+        if not base or not os.path.isdir(base):
+            continue
+        direct = os.path.join(base, "History")
+        if os.path.isfile(direct):
+            paths.append(direct)
+        try:
+            for sub in os.listdir(base):
+                if sub == "Default" or sub.startswith("Profile "):
+                    hp = os.path.join(base, sub, "History")
+                    if os.path.isfile(hp):
+                        paths.append(hp)
+        except Exception:
+            pass
+    return paths
+
+
+def _firefox_history_paths():
+    if not IS_WIN:
+        return []
+    roam = os.environ.get("APPDATA") or ""
+    prof_root = os.path.join(roam, "Mozilla", "Firefox", "Profiles")
+    if not os.path.isdir(prof_root):
+        return []
+    paths = []
+    try:
+        for sub in os.listdir(prof_root):
+            p = os.path.join(prof_root, sub, "places.sqlite")
+            if os.path.isfile(p):
+                paths.append(p)
+    except Exception:
+        pass
+    return paths
+
+
+def collect_browser_sites_for_day(day_iso, max_sites=40):
+    """Безопасно считывает посещённые сегодня сайты (домен, заголовок, число визитов, время)
+    из локальной истории браузеров текущего Windows-пользователя через временную копию БД."""
+    if not IS_WIN:
+        return []
+    try:
+        d_obj = datetime.date.fromisoformat(day_iso)
+    except Exception:
+        d_obj = datetime.date.today()
+    day_start_unix = time.mktime(datetime.datetime(d_obj.year, d_obj.month, d_obj.day, 0, 0, 0).timetuple())
+    day_end_unix = day_start_unix + 86400.0
+    # Chrome/Edge epoch: microseconds since 1601-01-01
+    chrome_epoch_delta = 11644473600
+    chrome_start = int((day_start_unix + chrome_epoch_delta) * 1_000_000)
+    chrome_end = int((day_end_unix + chrome_epoch_delta) * 1_000_000)
+    ff_start = int(day_start_unix * 1_000_000)
+    ff_end = int(day_end_unix * 1_000_000)
+
+    by_domain = {}
+
+    def _record_site(url, title, ts_ms):
+        try:
+            u = urllib.parse.urlparse(str(url or ""))
+            if u.scheme not in ("http", "https"):
+                return
+            dom = (u.hostname or "").lower().strip()
+            if dom.startswith("www."):
+                dom = dom[4:]
+            if not dom or dom in ("localhost", "127.0.0.1", "newtab") or "." not in dom:
+                return
+            t_clean = re.sub(r"\s+", " ", str(title or "").strip())[:90]
+            cur = by_domain.get(dom)
+            if cur is None:
+                by_domain[dom] = {
+                    "domain": dom,
+                    "title": t_clean,
+                    "visits": 1,
+                    "seconds": 20,
+                    "ts": int(ts_ms),
+                }
+            else:
+                cur["visits"] += 1
+                cur["seconds"] = min(36000, cur["visits"] * 20)
+                if int(ts_ms) >= cur["ts"]:
+                    cur["ts"] = int(ts_ms)
+                    if t_clean:
+                        cur["title"] = t_clean
+                elif not cur["title"] and t_clean:
+                    cur["title"] = t_clean
+        except Exception:
+            pass
+
+    tmp_dir = tempfile.gettempdir()
+    for idx, src in enumerate(_chromium_history_paths()):
+        tmp_copy = os.path.join(tmp_dir, f"kg_hb_chr_{os.getpid()}_{idx}.sqlite")
+        try:
+            shutil.copy2(src, tmp_copy)
+            conn = sqlite3.connect(tmp_copy, timeout=2.0)
+            try:
+                cur = conn.execute(
+                    """SELECT u.url, u.title, v.visit_time
+                       FROM visits v JOIN urls u ON v.url = u.id
+                       WHERE v.visit_time >= ? AND v.visit_time < ?
+                       ORDER BY v.visit_time DESC LIMIT 400""",
+                    (chrome_start, chrome_end),
+                )
+                for url, title, vtime in cur.fetchall():
+                    ts_ms = int(((int(vtime) / 1_000_000.0) - chrome_epoch_delta) * 1000.0)
+                    _record_site(url, title, ts_ms)
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        finally:
+            try:
+                if os.path.exists(tmp_copy):
+                    os.remove(tmp_copy)
+            except Exception:
+                pass
+
+    for idx, src in enumerate(_firefox_history_paths()):
+        tmp_copy = os.path.join(tmp_dir, f"kg_hb_ff_{os.getpid()}_{idx}.sqlite")
+        try:
+            shutil.copy2(src, tmp_copy)
+            conn = sqlite3.connect(tmp_copy, timeout=2.0)
+            try:
+                cur = conn.execute(
+                    """SELECT p.url, p.title, h.visit_date
+                       FROM moz_historyvisits h JOIN moz_places p ON h.place_id = p.id
+                       WHERE h.visit_date >= ? AND h.visit_date < ?
+                       ORDER BY h.visit_date DESC LIMIT 400""",
+                    (ff_start, ff_end),
+                )
+                for url, title, vtime in cur.fetchall():
+                    ts_ms = int(int(vtime) / 1000)
+                    _record_site(url, title, ts_ms)
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        finally:
+            try:
+                if os.path.exists(tmp_copy):
+                    os.remove(tmp_copy)
+            except Exception:
+                pass
+
+    return sorted(by_domain.values(), key=lambda x: (-x["visits"], -x["ts"]))[:max_sites]
+
+
+def save_activity_history_day(day_iso, user, proc_sec, title_sec, proc_started=None, title_started=None, sites=None):
     try:
         os.makedirs(PUB_DIR, exist_ok=True)
         hist = load_activity_history()
         day_entry = hist.setdefault(day_iso, {})
+        prev_sites = (day_entry.get(user) or {}).get("sites") or []
         day_entry[user] = {
             "date": day_iso,
             "proc": dict(proc_sec),
             "titles": dict(title_sec),
             "proc_started": dict(proc_started or {}),
             "title_started": dict(title_started or {}),
+            "sites": list(sites) if sites is not None else list(prev_sites),
             "ts": int(time.time() * 1000)
         }
         # Храним последние 30 дней
@@ -2463,6 +2629,547 @@ SCREENSHOT_STATUS = os.path.join(PUB_DIR, "screenshot_status.json")
 RECORD_DIR = os.path.join(PUB_DIR, "records")
 SHOT_DIR = os.path.join(PUB_DIR, "screenshots")
 
+# ====================== ЧАТ «РОДИТЕЛЬ <-> ПК» И ТРЕЙ-ИКОНКА ======================
+CHAT_STORE_FILE = os.path.join(PUB_DIR, "pc_chat_messages.json")
+CHAT_CONFIG_FILE = os.path.join(PUB_DIR, "pc_chat_config.json")
+CHAT_OUTBOX_FILE = os.path.join(PUB_DIR, "pc_chat_outbox.json")
+CHAT_LOCK = threading.Lock()
+_CHAT_BROADCAST_QUEUE = []
+
+
+def pc_chat_tray_enabled(cfg=None):
+    """По умолчанию иконка чата в трее ВЫКЛЮЧЕНА — ребёнок не может сам открыть чат,
+    пока родитель не включит эту опцию в приложении на телефоне."""
+    c = cfg if isinstance(cfg, dict) else (load_config() or {})
+    return bool(c.get("chat_tray_enabled", False))
+
+
+def pc_chat_sync_config_file(enabled):
+    _write_json_atomic(CHAT_CONFIG_FILE, {
+        "tray_enabled": bool(enabled),
+        "updated_at": int(time.time() * 1000)
+    })
+
+
+def _pc_chat_read_list(path):
+    d = _read_json(path)
+    msgs = d.get("messages")
+    return list(msgs) if isinstance(msgs, list) else []
+
+
+def pc_chat_drain_outbox():
+    """Переносит ответы ребёнка из CHAT_OUTBOX_FILE (пишет агент сеанса) в CHAT_STORE_FILE (ведёт служба).
+    Возвращает список новых сообщений для мгновенной рассылки родителю."""
+    new_items = []
+    with CHAT_LOCK:
+        outbox = _pc_chat_read_list(CHAT_OUTBOX_FILE)
+        if not outbox:
+            return []
+        store = _pc_chat_read_list(CHAT_STORE_FILE)
+        seen_ids = {str(m.get("id", "")) for m in store if isinstance(m, dict)}
+        for m in outbox:
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("id") or "").strip()
+            txt = str(m.get("text") or "").strip()
+            if not txt:
+                continue
+            if not mid:
+                mid = "pc_%d_%s" % (int(time.time() * 1000), secrets.token_hex(3))
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            entry = {
+                "id": mid,
+                "sender": str(m.get("sender") or "PC"),
+                "user": str(m.get("user") or "ПК"),
+                "text": txt[:2000],
+                "ts": int(m.get("ts") or int(time.time() * 1000))
+            }
+            store.append(entry)
+            new_items.append(entry)
+        store.sort(key=lambda x: int(x.get("ts") or 0))
+        if len(store) > 80:
+            store = store[-80:]
+        _write_json_atomic(CHAT_STORE_FILE, {"messages": store, "updated_at": int(time.time() * 1000)})
+        _write_json_atomic(CHAT_OUTBOX_FILE, {"messages": [], "updated_at": int(time.time() * 1000)})
+        if new_items:
+            _CHAT_BROADCAST_QUEUE.extend(new_items)
+            if len(_CHAT_BROADCAST_QUEUE) > 40:
+                del _CHAT_BROADCAST_QUEUE[:-40]
+    return new_items
+
+
+def pc_chat_load_messages(limit=40):
+    pc_chat_drain_outbox()
+    with CHAT_LOCK:
+        store = _pc_chat_read_list(CHAT_STORE_FILE)
+    return store[-limit:] if limit > 0 else store
+
+
+def pc_chat_add_message(sender, text, user="", msg_id="", ts=0):
+    clean_text = str(text or "").strip()[:2000]
+    if not clean_text:
+        return None
+    mid = str(msg_id or "").strip() or ("%s_%d_%s" % (
+        str(sender or "PARENT").lower(), int(time.time() * 1000), secrets.token_hex(3)
+    ))
+    now_ms = int(ts or 0) or int(time.time() * 1000)
+    entry = {
+        "id": mid,
+        "sender": str(sender or "PARENT"),
+        "user": str(user or ("Родитель" if sender == "PARENT" else "ПК")).strip()[:64],
+        "text": clean_text,
+        "ts": now_ms
+    }
+    with CHAT_LOCK:
+        store = _pc_chat_read_list(CHAT_STORE_FILE)
+        if any(isinstance(m, dict) and str(m.get("id", "")) == mid for m in store):
+            return entry
+        store.append(entry)
+        store.sort(key=lambda x: int(x.get("ts") or 0))
+        if len(store) > 80:
+            store = store[-80:]
+        _write_json_atomic(CHAT_STORE_FILE, {"messages": store, "updated_at": int(time.time() * 1000)})
+    return entry
+
+
+def _pc_chat_agent_append_outbox(user, text):
+    """Вызывается из пользовательского агента при отправке ответа ребёнком на ПК."""
+    clean_text = str(text or "").strip()[:2000]
+    if not clean_text:
+        return None
+    now_ms = int(time.time() * 1000)
+    entry = {
+        "id": "pc_%d_%s" % (now_ms, secrets.token_hex(4)),
+        "sender": "PC",
+        "user": str(user or os.environ.get("USERNAME", "ПК")),
+        "text": clean_text,
+        "ts": now_ms
+    }
+    try:
+        outbox = _pc_chat_read_list(CHAT_OUTBOX_FILE)
+        outbox.append(entry)
+        if len(outbox) > 40:
+            outbox = outbox[-40:]
+        _write_json_atomic(CHAT_OUTBOX_FILE, {"messages": outbox, "updated_at": now_ms})
+    except Exception:
+        pass
+    return entry
+
+
+def _start_pc_chat_desktop_agent(user):
+    """Запускает на рабочем столе активной сессии Windows:
+    1) Всплывающее окно чата поверх всех окон при получении сообщения от родителя;
+    2) Нативную иконку в системном трее Windows (ТОЛЬКО если родитель включил chat_tray_enabled)."""
+    if not IS_WIN or filedialog is None:
+        return
+
+    open_chat_event = threading.Event()
+    tray_state = {"desired": False, "visible": False, "stop": False}
+
+    # --- Нативный системный трей Windows (pure ctypes, без сторонних зависимостей) ---
+    def _win32_tray_thread():
+        try:
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+            kernel32 = ctypes.windll.kernel32
+
+            LRESULT = ctypes.c_ssize_t
+            WPARAM = ctypes.c_size_t
+            LPARAM = ctypes.c_ssize_t
+            WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, WPARAM, LPARAM)
+
+            WM_DESTROY = 0x0002
+            WM_COMMAND = 0x0111
+            WM_USER = 0x0400
+            WM_TRAY = WM_USER + 20
+            WM_LBUTTONUP = 0x0202
+            WM_LBUTTONDBLCLK = 0x0203
+            WM_RBUTTONUP = 0x0205
+            WM_TIMER = 0x0113
+
+            NIM_ADD = 0x00000000
+            NIM_DELETE = 0x00000002
+            NIF_MESSAGE = 0x00000001
+            NIF_ICON = 0x00000002
+            NIF_TIP = 0x00000004
+            IDI_INFORMATION = 32516
+            MF_STRING = 0x0000
+            TPM_LEFTALIGN = 0x0000
+            TPM_BOTTOMALIGN = 0x0020
+            CMD_OPEN_CHAT = 1001
+
+            class WNDCLASSEXW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.UINT),
+                    ("style", wintypes.UINT),
+                    ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int),
+                    ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", wintypes.HINSTANCE),
+                    ("hIcon", wintypes.HICON),
+                    ("hCursor", wintypes.HANDLE),
+                    ("hbrBackground", wintypes.HBRUSH),
+                    ("lpszMenuName", wintypes.LPCWSTR),
+                    ("lpszClassName", wintypes.LPCWSTR),
+                    ("hIconSm", wintypes.HICON),
+                ]
+
+            class NOTIFYICONDATAW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("hWnd", wintypes.HWND),
+                    ("uID", wintypes.UINT),
+                    ("uFlags", wintypes.UINT),
+                    ("uCallbackMessage", wintypes.UINT),
+                    ("hIcon", wintypes.HICON),
+                    ("szTip", wintypes.WCHAR * 128),
+                ]
+
+            user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, WPARAM, LPARAM]
+            user32.DefWindowProcW.restype = LRESULT
+            user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+            user32.LoadIconW.restype = wintypes.HICON
+            shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+            shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+
+            h_inst = kernel32.GetModuleHandleW(None)
+            h_icon = user32.LoadIconW(None, ctypes.cast(IDI_INFORMATION, wintypes.LPCWSTR))
+            hwnd_holder = [None]
+
+            def _make_nid(hwnd):
+                nid = NOTIFYICONDATAW()
+                nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+                nid.hWnd = hwnd
+                nid.uID = 1
+                nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+                nid.uCallbackMessage = WM_TRAY
+                nid.hIcon = h_icon
+                nid.szTip = "KidsGuard — Чат с родителем"
+                return nid
+
+            def _sync_tray_icon(hwnd):
+                want = bool(tray_state["desired"]) and _is_active_console_session()
+                if want and not tray_state["visible"]:
+                    nid = _make_nid(hwnd)
+                    if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+                        tray_state["visible"] = True
+                elif (not want) and tray_state["visible"]:
+                    nid = _make_nid(hwnd)
+                    shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+                    tray_state["visible"] = False
+
+            def _wnd_proc(hwnd, msg, wparam, lparam):
+                if msg == WM_TIMER:
+                    _sync_tray_icon(hwnd)
+                    return 0
+                if msg == WM_TRAY:
+                    ev = lparam & 0xFFFF
+                    if ev in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                        if tray_state["desired"]:
+                            open_chat_event.set()
+                        return 0
+                    if ev == WM_RBUTTONUP and tray_state["desired"]:
+                        try:
+                            menu = user32.CreatePopupMenu()
+                            user32.AppendMenuW(menu, MF_STRING, CMD_OPEN_CHAT, "💬 Открыть чат с родителем")
+                            pt = wintypes.POINT()
+                            user32.GetCursorPos(ctypes.byref(pt))
+                            user32.SetForegroundWindow(hwnd)
+                            user32.TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, None)
+                            user32.DestroyMenu(menu)
+                        except Exception:
+                            open_chat_event.set()
+                        return 0
+                if msg == WM_COMMAND and (wparam & 0xFFFF) == CMD_OPEN_CHAT:
+                    if tray_state["desired"]:
+                        open_chat_event.set()
+                    return 0
+                if msg == WM_DESTROY:
+                    if tray_state["visible"]:
+                        nid = _make_nid(hwnd)
+                        shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+                        tray_state["visible"] = False
+                    user32.PostQuitMessage(0)
+                    return 0
+                return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+            wnd_proc_ref = WNDPROC(_wnd_proc)
+            cls_name = "KidsGuardPcChatTrayWnd_%d" % os.getpid()
+            wc = WNDCLASSEXW()
+            wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+            wc.lpfnWndProc = wnd_proc_ref
+            wc.hInstance = h_inst
+            wc.lpszClassName = cls_name
+            user32.RegisterClassExW(ctypes.byref(wc))
+
+            hwnd = user32.CreateWindowExW(
+                0, cls_name, "KidsGuardChatTray", 0, 0, 0, 0, 0, None, None, h_inst, None
+            )
+            hwnd_holder[0] = hwnd
+            if not hwnd:
+                return
+            user32.SetTimer(hwnd, 1, 800, None)
+            msg_st = wintypes.MSG()
+            while not tray_state["stop"] and user32.GetMessageW(ctypes.byref(msg_st), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg_st))
+                user32.DispatchMessageW(ctypes.byref(msg_st))
+        except Exception:
+            pass
+
+    threading.Thread(target=_win32_tray_thread, daemon=True).start()
+
+    # --- Поток Tkinter-окна чата (скрыт по умолчанию, всплывает поверх всех окон при сообщении) ---
+    def _tk_chat_thread():
+        try:
+            root = tk.Tk()
+            root.title("KidsGuard — Сообщение от родителя")
+            root.configure(bg="#0F172A")
+            root.geometry("430x460")
+            root.minsize(360, 340)
+            root.withdraw()
+
+            # Центрируем окно на экране (правый нижний или центр экрана)
+            try:
+                sw = root.winfo_screenwidth()
+                sh = root.winfo_screenheight()
+                wx = max(40, (sw - 430) // 2)
+                wy = max(40, (sh - 460) // 2)
+                root.geometry(f"430x460+{wx}+{wy}")
+            except Exception:
+                pass
+
+            header = tk.Frame(root, bg="#1E293B", padx=14, pady=10)
+            header.pack(fill="x")
+            tk.Label(
+                header,
+                text="💬 Чат с родителем",
+                bg="#1E293B",
+                fg="#38BDF8",
+                font=("Segoe UI", 12, "bold")
+            ).pack(anchor="w")
+            sub_lbl = tk.Label(
+                header,
+                text=f"ПК • Пользователь: {user} • Напишите ответ или закройте окно",
+                bg="#1E293B",
+                fg="#94A3B8",
+                font=("Segoe UI", 9)
+            )
+            sub_lbl.pack(anchor="w", pady=(2, 0))
+
+            body = tk.Frame(root, bg="#0F172A", padx=12, pady=10)
+            body.pack(fill="both", expand=True)
+
+            msg_text = tk.Text(
+                body,
+                bg="#020617",
+                fg="#F8FAFC",
+                font=("Segoe UI", 10),
+                wrap="word",
+                relief="flat",
+                borderwidth=0,
+                padx=10,
+                pady=10,
+                state="disabled",
+                cursor="arrow"
+            )
+            scroll = tk.Scrollbar(body, command=msg_text.yview)
+            msg_text.configure(yscrollcommand=scroll.set)
+            scroll.pack(side="right", fill="y")
+            msg_text.pack(side="left", fill="both", expand=True)
+
+            msg_text.tag_configure("parent_hdr", foreground="#38BDF8", font=("Segoe UI", 9, "bold"))
+            msg_text.tag_configure("parent_body", foreground="#FFFFFF", font=("Segoe UI", 10), lmargin1=4, lmargin2=4)
+            msg_text.tag_configure("pc_hdr", foreground="#34D399", font=("Segoe UI", 9, "bold"))
+            msg_text.tag_configure("pc_body", foreground="#E2E8F0", font=("Segoe UI", 10), lmargin1=4, lmargin2=4)
+            msg_text.tag_configure("hint", foreground="#64748B", font=("Segoe UI", 9, "italic"))
+
+            footer = tk.Frame(root, bg="#1E293B", padx=12, pady=10)
+            footer.pack(fill="x")
+
+            reply_var = tk.StringVar()
+            entry = tk.Entry(
+                footer,
+                textvariable=reply_var,
+                bg="#0F172A",
+                fg="#FFFFFF",
+                insertbackground="#38BDF8",
+                relief="flat",
+                font=("Segoe UI", 10)
+            )
+            entry.pack(fill="x", ipady=7, pady=(0, 8))
+
+            btn_row = tk.Frame(footer, bg="#1E293B")
+            btn_row.pack(fill="x")
+
+            local_pending = []
+            seen_parent_ids = set()
+            # При старте агента запоминаем уже существующие старые сообщения,
+            # чтобы не всплывать со вчерашними при загрузке Windows.
+            try:
+                startup_msgs = _pc_chat_read_list(CHAT_STORE_FILE)
+                now_ms_start = int(time.time() * 1000)
+                for m in startup_msgs:
+                    if isinstance(m, dict) and str(m.get("sender", "")).upper() == "PARENT":
+                        # Если сообщение свежее (< 2 мин), покажем его; старые пометим просмотренными
+                        if now_ms_start - int(m.get("ts") or 0) > 120_000:
+                            seen_parent_ids.add(str(m.get("id", "")))
+            except Exception:
+                pass
+
+            last_render_sig = [""]
+
+            def _hide_window():
+                try:
+                    root.attributes("-topmost", False)
+                    root.withdraw()
+                except Exception:
+                    pass
+
+            def _show_window(beep=False):
+                try:
+                    if beep:
+                        try:
+                            import winsound
+                            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                        except Exception:
+                            pass
+                    root.deiconify()
+                    root.lift()
+                    root.attributes("-topmost", True)
+                    root.focus_force()
+                    entry.focus_set()
+                except Exception:
+                    pass
+
+            def _render_messages(msgs):
+                sig = json.dumps(msgs[-40:], ensure_ascii=False, sort_keys=True)
+                if sig == last_render_sig[0]:
+                    return
+                last_render_sig[0] = sig
+                msg_text.configure(state="normal")
+                msg_text.delete("1.0", "end")
+                if not msgs:
+                    msg_text.insert("end", "Пока нет сообщений. Напишите родителю ниже.\n", "hint")
+                else:
+                    for m in msgs[-40:]:
+                        sender = str(m.get("sender") or "PARENT").upper()
+                        text_val = str(m.get("text") or "").strip()
+                        ts_val = int(m.get("ts") or 0)
+                        t_str = ""
+                        if ts_val > 0:
+                            try:
+                                t_str = datetime.datetime.fromtimestamp(ts_val / 1000.0).strftime("%H:%M")
+                            except Exception:
+                                t_str = ""
+                        if sender == "PARENT":
+                            who = str(m.get("user") or "Родитель")
+                            msg_text.insert("end", f"{who} • {t_str}\n", "parent_hdr")
+                            msg_text.insert("end", f"{text_val}\n\n", "parent_body")
+                        else:
+                            who = str(m.get("user") or user)
+                            msg_text.insert("end", f"Вы ({who}) • {t_str}\n", "pc_hdr")
+                            msg_text.insert("end", f"{text_val}\n\n", "pc_body")
+                msg_text.configure(state="disabled")
+                msg_text.see("end")
+
+            def _send_reply(_event=None):
+                txt = reply_var.get().strip()
+                if not txt:
+                    return
+                reply_var.set("")
+                created = _pc_chat_agent_append_outbox(user, txt)
+                if created:
+                    local_pending.append(created)
+                    _poll_chat(force_render=True)
+
+            send_btn = tk.Button(
+                btn_row,
+                text="Отправить ответ",
+                command=_send_reply,
+                bg="#0284C7",
+                fg="#FFFFFF",
+                activebackground="#0369A1",
+                activeforeground="#FFFFFF",
+                relief="flat",
+                font=("Segoe UI", 10, "bold"),
+                padx=14,
+                pady=6,
+                cursor="hand2"
+            )
+            send_btn.pack(side="left")
+
+            close_btn = tk.Button(
+                btn_row,
+                text="Закрыть",
+                command=_hide_window,
+                bg="#334155",
+                fg="#E2E8F0",
+                activebackground="#475569",
+                activeforeground="#FFFFFF",
+                relief="flat",
+                font=("Segoe UI", 10),
+                padx=14,
+                pady=6,
+                cursor="hand2"
+            )
+            close_btn.pack(side="right")
+
+            entry.bind("<Return>", _send_reply)
+            root.protocol("WM_DELETE_WINDOW", _hide_window)
+
+            def _poll_chat(force_render=False):
+                try:
+                    # 1. Обновляем настройку иконки в трее (по умолчанию False!)
+                    cfg_d = _read_json(CHAT_CONFIG_FILE)
+                    tray_state["desired"] = bool(cfg_d.get("tray_enabled", False))
+
+                    # 2. Загружаем сообщения от службы + локально отправленные ещё не перенесённые
+                    store_msgs = _pc_chat_read_list(CHAT_STORE_FILE)
+                    store_ids = {str(m.get("id", "")) for m in store_msgs if isinstance(m, dict)}
+                    merged = list(store_msgs)
+                    still_pending = []
+                    for pm in local_pending:
+                        if str(pm.get("id", "")) not in store_ids:
+                            merged.append(pm)
+                            still_pending.append(pm)
+                    local_pending[:] = still_pending
+                    merged.sort(key=lambda x: int(x.get("ts") or 0))
+
+                    # 3. Проверяем, пришло ли новое сообщение от родителя
+                    has_new_parent = False
+                    for m in merged:
+                        if not isinstance(m, dict):
+                            continue
+                        if str(m.get("sender", "")).upper() == "PARENT":
+                            mid = str(m.get("id", ""))
+                            if mid and mid not in seen_parent_ids:
+                                seen_parent_ids.add(mid)
+                                has_new_parent = True
+
+                    if force_render or merged:
+                        _render_messages(merged)
+
+                    if has_new_parent and _is_active_console_session():
+                        _show_window(beep=True)
+                    elif open_chat_event.is_set():
+                        open_chat_event.clear()
+                        if tray_state["desired"] and _is_active_console_session():
+                            _render_messages(merged)
+                            _show_window(beep=False)
+                except Exception:
+                    pass
+                root.after(450, _poll_chat)
+
+            root.after(300, _poll_chat)
+            root.mainloop()
+        except Exception:
+            pass
+
+    threading.Thread(target=_tk_chat_thread, daemon=True).start()
+
 
 def _write_json_atomic(path, obj):
     try:
@@ -2638,6 +3345,7 @@ def agent_main():
     if not single_instance("Local\\HostsBlockerAgent"):
         return
     user = re.sub(r"[^\w.-]", "_", os.environ.get("USERNAME", "user"))
+    _start_pc_chat_desktop_agent(user)
     is_console = _is_active_console_session()
     path = os.path.join(PUB_DIR, f"agent_{user}.json")
     act_path = _activity_path(user)
@@ -2648,6 +3356,7 @@ def agent_main():
     proc_sec, title_sec = {}, {}
     # Точное время ПЕРВОГО запуска каждой программы/окна за день (epoch ms).
     proc_started, title_started = {}, {}
+    browser_sites = []
     try:
         if os.path.exists(act_path):
             with open(act_path, "r", encoding="utf-8") as f:
@@ -2657,6 +3366,7 @@ def agent_main():
                 title_sec = dict(saved_act.get("titles") or {})
                 proc_started = dict(saved_act.get("proc_started") or {})
                 title_started = dict(saved_act.get("title_started") or {})
+                browser_sites = list(saved_act.get("sites") or [])
             elif saved_act.get("date"):
                 save_activity_history_day(
                     str(saved_act.get("date")),
@@ -2664,13 +3374,16 @@ def agent_main():
                     saved_act.get("proc") or {},
                     saved_act.get("titles") or {},
                     saved_act.get("proc_started") or {},
-                    saved_act.get("title_started") or {}
+                    saved_act.get("title_started") or {},
+                    saved_act.get("sites") or []
                 )
     except Exception:
         proc_sec, title_sec = {}, {}
         proc_started, title_started = {}, {}
+        browser_sites = []
     last_close, last_act_save, last_scr, last_agent_write = 0.0, 0.0, 0.0, 0.0
     last_hist_save = 0.0
+    last_sites_scan = 0.0
     # HD-запись экрана: ведёт её именно агент сеанса (движок SYSTEM видит чёрный экран).
     rec = {"active": False, "f": None, "pos": None, "path": "", "frames": 0,
            "started": 0.0, "next": 0.0, "fps": 10.0, "quality": 85,
@@ -2713,9 +3426,10 @@ def agent_main():
             stream_cfg = None
         day = datetime.date.today().isoformat()
         if day != today:  # новый день — архивируем вчерашний день и считаем активность заново
-            save_activity_history_day(today, user, proc_sec, title_sec, proc_started, title_started)
+            save_activity_history_day(today, user, proc_sec, title_sec, proc_started, title_started, browser_sites)
             today, proc_sec, title_sec = day, {}, {}
             proc_started, title_started = {}, {}
+            browser_sites = []
         now_mono_ms = int(time.time() * 1000)
         if proc:
             proc_sec[proc] = proc_sec.get(proc, 0) + 1
@@ -2898,21 +3612,31 @@ def agent_main():
                 except Exception:
                     _stop_recording(traceback.format_exc()[:200])
 
+        if time.time() - last_sites_scan > 30:
+            last_sites_scan = time.time()
+            try:
+                scanned = collect_browser_sites_for_day(today, max_sites=40)
+                if scanned:
+                    browser_sites = scanned
+            except Exception:
+                pass
+
         if time.time() - last_act_save > 5:  # отчёт об активности — раз в 5 секунд
             last_act_save = time.time()
-            if len(title_sec) > 50:  # не даём файлу расти бесконечно
-                for k, _ in sorted(title_sec.items(), key=lambda kv: kv[1])[:len(title_sec) - 50]:
+            if len(title_sec) > 120:  # храним до 120 заголовков в день
+                for k, _ in sorted(title_sec.items(), key=lambda kv: kv[1])[:len(title_sec) - 120]:
                     title_sec.pop(k, None)
             try:
                 with open(act_path + ".tmp", "w", encoding="utf-8") as f:
                     json.dump({"date": today, "proc": proc_sec, "titles": title_sec,
-                               "proc_started": proc_started, "title_started": title_started}, f,
+                               "proc_started": proc_started, "title_started": title_started,
+                               "sites": browser_sites}, f,
                               ensure_ascii=False)
                 os.replace(act_path + ".tmp", act_path)
-                # 30-дневный архив пишем раз в минуту, а не каждые 5 секунд (бережём диск ПК).
-                if time.time() - last_hist_save > 60:
+                # 30-дневный архив пишем раз в 30 секунд, чтобы не терять данные при выключении ПК.
+                if time.time() - last_hist_save > 30:
                     last_hist_save = time.time()
-                    save_activity_history_day(today, user, proc_sec, title_sec, proc_started, title_started)
+                    save_activity_history_day(today, user, proc_sec, title_sec, proc_started, title_started, browser_sites)
             except Exception:
                 pass
         if rec["active"]:
@@ -3308,7 +4032,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
         if self.path in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
                          "/api/fulllock_schedule", "/api/add", "/api/delete",
-                         "/api/screenshot_hd", "/api/record_start", "/api/record_stop"):
+                         "/api/screenshot_hd", "/api/record_start", "/api/record_stop",
+                         "/api/chat/send", "/api/chat/config"):
             return self._send(200, panel_mutate(self.path, data))
         self._send(404, {"ok": False})
 
@@ -3437,15 +4162,17 @@ def panel_state(csrf, full=True):
     act_raw = load_activity(today_iso)
     act_out = {}
     for user, d in act_raw.items():
-        procs, titles = top_activity(d, n=12, min_seconds=5)
+        procs, titles = top_activity(d, n=35, min_seconds=3)
         p_started = d.get("proc_started") or {}
         t_started = d.get("title_started") or {}
+        sites = list(d.get("sites") or [])[:40]
         act_out[user] = {
             "date": today_iso,
             "procs": [{"name": p, "seconds": int(s),
                        "started": int(p_started.get(p) or 0)} for p, s in procs],
             "titles": [{"title": t, "seconds": int(s),
-                        "started": int(t_started.get(t) or 0)} for t, s in titles]
+                        "started": int(t_started.get(t) or 0)} for t, s in titles],
+            "sites": sites
         }
     act_by_date = {}
     if full:
@@ -3457,15 +4184,17 @@ def panel_state(csrf, full=True):
             for user, d in users_map.items():
                 if not isinstance(d, dict):
                     continue
-                procs, titles = top_activity(d, n=12, min_seconds=5)
+                procs, titles = top_activity(d, n=35, min_seconds=3)
                 p_started = d.get("proc_started") or {}
                 t_started = d.get("title_started") or {}
+                sites = list(d.get("sites") or [])[:40]
                 day_users_out[user] = {
                     "date": day_key,
                     "procs": [{"name": p, "seconds": int(s),
                                "started": int(p_started.get(p) or 0)} for p, s in procs],
                     "titles": [{"title": t, "seconds": int(s),
-                                "started": int(t_started.get(t) or 0)} for t, s in titles]
+                                "started": int(t_started.get(t) or 0)} for t, s in titles],
+                    "sites": sites
                 }
             if day_users_out:
                 act_by_date[day_key] = day_users_out
@@ -3473,6 +4202,9 @@ def panel_state(csrf, full=True):
         act_by_date[today_iso] = act_out
     agents = fresh_agents()
     acct = cfg.get("child_account", "") or detect_active_username(cfg)
+    tray_on = pc_chat_tray_enabled(cfg)
+    if not os.path.exists(CHAT_CONFIG_FILE):
+        pc_chat_sync_config_file(tray_on)
     return {
         "csrf": csrf,
         "pc_name": socket.gethostname(),
@@ -3522,12 +4254,33 @@ def panel_state(csrf, full=True):
         "stream_params": stream_params(),
         "recording": record_status(),
         "last_screenshot": screenshot_status(),
+        "chat_tray_enabled": pc_chat_tray_enabled(cfg),
+        "chat_messages": pc_chat_load_messages(limit=35),
         "ts": int(time.time() * 1000)
     }
 
 
 def panel_mutate(path, data):
     name = str(data.get("name", "")).strip()
+    if path == "/api/chat/send":
+        txt = str(data.get("text", "")).strip()
+        if not txt:
+            return {"ok": False, "error": "Пустое сообщение"}
+        sender_name = str(data.get("sender_name", "Родитель")).strip() or "Родитель"
+        msg_id = str(data.get("id", "")).strip()
+        ts_val = int(data.get("ts") or 0)
+        entry = pc_chat_add_message("PARENT", txt, user=sender_name, msg_id=msg_id, ts=ts_val)
+        return {"ok": True, "message": entry}
+    if path == "/api/chat/config":
+        with PANEL_LOCK:
+            cfg = load_config()
+            if not cfg:
+                return {"ok": False, "error": "Нет конфигурации"}
+            enabled = bool(data.get("tray_enabled", False))
+            cfg["chat_tray_enabled"] = enabled
+            save_config(cfg)
+            pc_chat_sync_config_file(enabled)
+            return {"ok": True, "chat_tray_enabled": enabled}
     if path == "/api/screenshot_hd":
         # HD-кадр снимает агент сеанса; ответ придёт в PC_STATE → last_screenshot.
         request_hd_screenshot()
@@ -3962,6 +4715,25 @@ def p2p_vps_bridge_worker(st):
                                 for r in roots:
                                     _ws_send(sock, _mqtt_pub_pkt("%s/pc_screen/%s" % (r, code), scr_json_str, retain=True))
 
+                    # Мгновенная пересылка ответов ребёнка из чата ПК через VPS Relay
+                    try:
+                        new_pc_msgs = pc_chat_drain_outbox()
+                        if new_pc_msgs:
+                            for cm in new_pc_msgs:
+                                chat_pkt = json.dumps({
+                                    "type": "PC_CHAT",
+                                    "pairing_code": code,
+                                    "pc_id": pc_id(),
+                                    "message": cm,
+                                    "chat_tray_enabled": pc_chat_tray_enabled(cur_cfg),
+                                    "ts": int(time.time() * 1000)
+                                }, ensure_ascii=False)
+                                for r in roots:
+                                    _ws_send(sock, _mqtt_pub_pkt("%s/pc_chat/%s" % (r, code), chat_pkt, retain=False))
+                            last_pub = 0.0
+                    except Exception:
+                        pass
+
                     # Живой стрим экрана ПК через уже открытый WS-сокет (без второго сокета).
                     if stream_p2p_active() and (now - last_stream_send) >= 0.35:
                         last_stream_send = now
@@ -4059,6 +4831,8 @@ def p2p_vps_bridge_worker(st):
                             request_record("start", data.get("fps", 10), data.get("quality", 85))
                         if action == "/api/record_stop":
                             request_record("stop")
+                        if action in ("/api/chat/send", "/api/chat/config"):
+                            panel_mutate(action, data)
                         if action == "/api/screen":
                             scr_res = panel_screen(force=True)
                             if scr_res.get("ok"):
@@ -4079,7 +4853,8 @@ def p2p_vps_bridge_worker(st):
                         if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
                                       "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync",
                                       "/api/stream_start", "/api/screen", "/api/screenshot_hd",
-                                      "/api/record_start", "/api/record_stop"):
+                                      "/api/record_start", "/api/record_stop",
+                                      "/api/chat/send", "/api/chat/config"):
                             is_sync = action == "/api/sync"
                             state_payload = panel_state("p2p", full=is_sync)
                             state_payload["type"] = "PC_STATE"
@@ -4196,6 +4971,25 @@ def p2p_bridge_worker(st, host, port):
                             for r in roots:
                                 sock.sendall(_mqtt_pub_pkt(f"{r}/pc_screen/{code}", scr_json_str, retain=True))
 
+                # Мгновенная пересылка ответов ребёнка из чата ПК через MQTT-брокер
+                try:
+                    new_pc_msgs = pc_chat_drain_outbox()
+                    if new_pc_msgs:
+                        for cm in new_pc_msgs:
+                            chat_pkt = json.dumps({
+                                "type": "PC_CHAT",
+                                "pairing_code": code,
+                                "pc_id": pc_id(),
+                                "message": cm,
+                                "chat_tray_enabled": pc_chat_tray_enabled(cur_cfg),
+                                "ts": int(time.time() * 1000)
+                            }, ensure_ascii=False)
+                            for r in roots:
+                                sock.sendall(_mqtt_pub_pkt(f"{r}/pc_chat/{code}", chat_pkt, retain=False))
+                        last_pub = 0.0
+                except Exception:
+                    pass
+
                 # Живой стрим экрана ПК через тот же сокет (каждый проход цикла).
                 if stream_p2p_active() and (now - last_stream_send) >= 0.35:
                     last_stream_send = now
@@ -4266,6 +5060,8 @@ def p2p_bridge_worker(st, host, port):
                                 request_record("start", data.get("fps", 10), data.get("quality", 85))
                             if action == "/api/record_stop":
                                 request_record("stop")
+                            if action in ("/api/chat/send", "/api/chat/config"):
+                                panel_mutate(action, data)
                             if action == "/api/screen":
                                 # Снимок — просмотр, не изменение правил: пароль панели не требуем.
                                 scr_res = panel_screen(force=True)
@@ -4284,7 +5080,8 @@ def p2p_bridge_worker(st, host, port):
                             if action in ("/api/toggle", "/api/limit", "/api/reset", "/api/fulllock",
                                           "/api/fulllock_schedule", "/api/add", "/api/delete", "/api/sync",
                                           "/api/stream_start", "/api/screen", "/api/screenshot_hd",
-                                          "/api/record_start", "/api/record_stop"):
+                                          "/api/record_start", "/api/record_stop",
+                                          "/api/chat/send", "/api/chat/config"):
                                 is_sync = action == "/api/sync"
                                 state_payload = panel_state("p2p", full=is_sync)
                                 state_payload["type"] = "PC_STATE"

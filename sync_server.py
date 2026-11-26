@@ -478,7 +478,7 @@ def build_live_snapshot():
                 apps = list(seen_pkgs.values())
 
             ch_out = dict(ch)
-            ch_out["appVersion"] = "3.3.35 Pro.78"
+            ch_out["appVersion"] = "3.3.35 Pro.80"
             ch_out["aliasIds"] = all_ids
             ch_out["aliasCodes"] = all_codes
             ch_out["activeForegroundApp"] = (best_screen or {}).get("activeAppName") or "Активный экран Android"
@@ -773,10 +773,32 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
         if path == '/hosts_blocker.py':
-            py_path = os.path.join(DIRECTORY, 'app/src/main/assets/hosts_blocker.py')
+            py_path = os.path.join(DIRECTORY, 'hosts_blocker.py')
             if not os.path.exists(py_path):
-                py_path = os.path.join(DIRECTORY, 'hosts_blocker.py')
+                py_path = os.path.join(DIRECTORY, 'app/src/main/assets/hosts_blocker.py')
             if self._serve_custom_file(py_path, 'text/x-python; charset=utf-8', 'hosts_blocker.py', head_only=head_only):
+                return
+
+        if path == '/kidsguard_parent.py':
+            py_path = os.path.join(DIRECTORY, 'kidsguard_parent.py')
+            if self._serve_custom_file(py_path, 'text/x-python; charset=utf-8', 'kidsguard_parent.py', head_only=head_only):
+                return
+
+        if path == '/build_windows_exes.bat':
+            bat_path = os.path.join(DIRECTORY, 'build_windows_exes.bat')
+            if self._serve_custom_file(bat_path, 'application/octet-stream', 'build_windows_exes.bat', head_only=head_only):
+                return
+
+        if path == '/run_parent_windows.bat':
+            bat_path = os.path.join(DIRECTORY, 'run_parent_windows.bat')
+            if self._serve_custom_file(bat_path, 'application/octet-stream', 'run_parent_windows.bat', head_only=head_only):
+                return
+
+        if path == '/KidsGuard-Windows-Pack.zip':
+            zip_path = os.path.join(DIRECTORY, 'KidsGuard-Windows-Pack.zip')
+            if not os.path.exists(zip_path):
+                zip_path = os.path.join(DIRECTORY, 'public/KidsGuard-Windows-Pack.zip')
+            if self._serve_custom_file(zip_path, 'application/zip', 'KidsGuard-Windows-Pack.zip', head_only=head_only):
                 return
 
         if path.endswith('.apk'):
@@ -785,7 +807,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 file_path = os.path.join(DIRECTORY, path.lstrip('/'))
             if not os.path.exists(file_path):
                 file_path = os.path.join(DIRECTORY, 'KidsGuard-latest.apk')
-            filename = os.path.basename(path) if path.endswith('.apk') else "KidsGuard-v3.3.35-Pro.78.apk"
+            filename = os.path.basename(path) if path.endswith('.apk') else "KidsGuard-v3.3.35-Pro.80.apk"
             if self._serve_custom_file(file_path, 'application/vnd.android.package-archive', filename, head_only=head_only):
                 return
 

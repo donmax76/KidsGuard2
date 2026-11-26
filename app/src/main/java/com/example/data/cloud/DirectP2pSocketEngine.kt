@@ -1111,6 +1111,7 @@ object DirectP2pSocketEngine {
               "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
               "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
               "$TOPIC_ROOT_LEGACY_PC/pc_stream/#",
+              "$TOPIC_ROOT_LEGACY_PC/pc_chat/#",
               "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#",
               "$TOPIC_ROOT_LEGACY_PC/cmd/#",
               "$TOPIC_ROOT_LEGACY_PC/lock/#",
@@ -1417,6 +1418,7 @@ object DirectP2pSocketEngine {
         "$TOPIC_ROOT_LEGACY_PC/pc_state/#",
         "$TOPIC_ROOT_LEGACY_PC/pc_screen/#",
         "$TOPIC_ROOT_LEGACY_PC/pc_stream/#",
+        "$TOPIC_ROOT_LEGACY_PC/pc_chat/#",
         "$TOPIC_ROOT_LEGACY_PC/pc_cmd/#"
       )
     }
@@ -2250,6 +2252,9 @@ object DirectP2pSocketEngine {
           }
           type == "PC_SCREEN" || topic.contains("/pc_screen") -> {
             com.example.data.pc.PcBlockerClient.ingestP2pScreenJson(msg)
+          }
+          type == "PC_CHAT" || topic.contains("/pc_chat") -> {
+            com.example.data.pc.PcBlockerClient.ingestP2pChatJson(msg)
           }
           type == "POWER_STATS" -> {
             com.example.data.cloud.ChildPowerStats.ingest(msg)

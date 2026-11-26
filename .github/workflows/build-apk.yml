@@ -74,7 +74,7 @@ jobs:
           generate_release_notes: true
 
   build-pc-agent:
-    name: Build Windows PC agent (.exe)
+    name: Build Windows PC agent (hosts_blocker.exe)
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -90,8 +90,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install pillow pyinstaller
 
-      - name: Build single-file PC agent
-        run: pyinstaller --noconsole --onefile --name hosts_blocker hosts_blocker.py
+      - name: Build single-file PC agent (no --uac-admin for user-session agent)
+        run: pyinstaller --noconfirm --clean --noconsole --onefile --name hosts_blocker hosts_blocker.py
 
       - name: Upload PC agent artifact
         uses: actions/upload-artifact@v4
@@ -101,3 +101,50 @@ jobs:
             dist/hosts_blocker.exe
             hosts_blocker.py
           if-no-files-found: error
+
+      - name: Attach hosts_blocker.exe to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/hosts_blocker.exe
+            hosts_blocker.py
+
+  build-windows-parent:
+    name: Build Windows Parent App (KidsGuardParent.exe)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller, pywebview and Pillow
+        run: |
+          python -m pip install --upgrade pip
+          pip install pywebview pillow pyinstaller
+
+      - name: Build single-file Windows Parent App
+        run: pyinstaller --noconfirm --clean --noconsole --onefile --name KidsGuardParent kidsguard_parent.py
+
+      - name: Upload Windows Parent artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KidsGuard-Parent-Windows
+          path: |
+            dist/KidsGuardParent.exe
+            kidsguard_parent.py
+            build_windows_exes.bat
+          if-no-files-found: error
+
+      - name: Attach KidsGuardParent.exe to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/KidsGuardParent.exe
+            kidsguard_parent.py
+            build_windows_exes.bat

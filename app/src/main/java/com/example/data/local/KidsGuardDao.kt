@@ -454,15 +454,31 @@ interface KidsGuardDao {
   """)
   suspend fun deletePcActivitySnapshotForDate(childId: Long, dateIso: String)
 
+  @Query("""
+    SELECT * FROM offline_activity_logs
+    WHERE deviceType = 'PC'
+      AND dateIso = :dateIso
+      AND (:childId <= 0 OR childId = :childId)
+      AND windowTitle != ''
+  """)
+  suspend fun getPcTitleLogsForDate(childId: Long, dateIso: String): List<OfflineActivityLogEntity>
+
   @Transaction
   suspend fun replacePcActivitySnapshotForDate(
     childId: Long,
     dateIso: String,
     logs: List<OfflineActivityLogEntity>
   ) {
+    val hasIncomingTitles = logs.any { it.windowTitle.isNotBlank() }
+    val preservedTitles = if (!hasIncomingTitles) {
+      getPcTitleLogsForDate(childId, dateIso)
+    } else {
+      emptyList()
+    }
     deletePcActivitySnapshotForDate(childId, dateIso)
-    if (logs.isNotEmpty()) {
-      insertOfflineActivityLogs(logs)
+    val merged = if (preservedTitles.isNotEmpty()) logs + preservedTitles else logs
+    if (merged.isNotEmpty()) {
+      insertOfflineActivityLogs(merged)
     }
   }
 
@@ -596,7 +612,7 @@ interface KidsGuardDao {
     WHERE id NOT IN (
       SELECT MIN(id)
       FROM offline_activity_logs
-      GROUP BY childId, LOWER(TRIM(packageName)), (timestamp / 2000)
+      GROUP BY childId, deviceType, dateIso, LOWER(TRIM(appName)), LOWER(TRIM(packageName)), LOWER(TRIM(windowTitle)), (timestamp / 2000)
     )
   """)
   suspend fun deduplicateOfflineActivityLogs()

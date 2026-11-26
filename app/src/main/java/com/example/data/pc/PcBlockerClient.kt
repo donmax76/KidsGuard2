@@ -94,7 +94,8 @@ data class PcActivityItem(
 data class PcActivityUser(
   val user: String,
   val procs: List<PcActivityItem> = emptyList(),
-  val titles: List<PcActivityItem> = emptyList()
+  val titles: List<PcActivityItem> = emptyList(),
+  val sites: List<PcActivityItem> = emptyList()
 )
 
 data class PcOfflineHistoryItem(
@@ -107,12 +108,20 @@ data class PcOfflineHistoryItem(
   val sec: Int
 )
 
+data class PcChatMessage(
+  val id: String,
+  val sender: String, // "PARENT" or "PC"
+  val user: String = "",
+  val text: String,
+  val timestampMs: Long = System.currentTimeMillis()
+)
+
 data class PcConnectionState(
   val isOnline: Boolean = false,
   val isLanHttpAuthenticated: Boolean = false,
   val transportLabel: String = "Ожидание связи с ПК (P2P / Wi-Fi)...",
   val pcName: String = "Windows ПК ребёнка",
-  /** Версия ПК-агента (hosts_blocker.py): 5.5+ умеет HD-кадр и REC HD. */
+  /** Версия ПК-агента (hosts_blocker.py): 5.5+ умеет HD-кадр и REC HD, 5.6+ умеет чат и трей-иконку. */
   val pcScriptVersion: String = "",
   val lanIp: String = "",
   val port: Int = 8765,
@@ -143,6 +152,10 @@ data class PcConnectionState(
   /** Последний HD-скриншот, сохранённый ПК-агентом на диск. */
   val lastScreenshotPath: String = "",
   val lastScreenshotAtMs: Long = 0L,
+  /** Разрешена ли ребёнку иконка чата в системном трее Windows (по умолчанию ВЫКЛ). */
+  val chatTrayEnabled: Boolean = false,
+  /** История сообщений чата с ПК. */
+  val chatMessages: List<PcChatMessage> = emptyList(),
   val statusMessage: String? = null
 )
 
@@ -284,6 +297,14 @@ object PcBlockerClient {
 
   @Volatile
   private var lastLanScanMs: Long = 0L
+
+  @Volatile
+  private var optimisticChatTrayEnabled: Boolean? = null
+
+  @Volatile
+  private var optimisticChatTrayExpiryMs: Long = 0L
+
+  private val ingestedPcChatIds = java.util.Collections.synchronizedSet(LinkedHashSet<String>())
 
   private fun pcPrefs() = DirectP2pSocketEngine.appContext
     ?.getSharedPreferences("kidsguard_pc_client", android.content.Context.MODE_PRIVATE)
@@ -771,6 +792,103 @@ object PcBlockerClient {
         transportLabel = computePcTransportLabel(),
         statusMessage = "Живой кадр монитора ПК получен"
       )
+    }
+  }
+
+  /** Мгновенное входящее сообщение из чата на Windows ПК (пакет PC_CHAT). */
+  fun ingestP2pChatJson(msg: JSONObject) {
+    if (DirectP2pSocketEngine.currentRole == "CHILD") return
+    loadPersistedPcIdentity()
+    val msgCode = msg.optString("pairing_code", "").trim()
+    val msgPcId = msg.optString("pc_id", "").trim()
+    if (!matchesConfiguredPc(msgCode, msgPcId)) return
+    markPcContact()
+    learnPcIdentity(msgCode, msgPcId)
+    val cmObj = msg.optJSONObject("message") ?: return
+    val item = parsePcChatMessageObj(cmObj) ?: return
+    val merged = mergePcChatLists(_state.value.chatMessages, listOf(item))
+    val trayVal = if (msg.has("chat_tray_enabled") && System.currentTimeMillis() >= optimisticChatTrayExpiryMs) {
+      msg.optBoolean("chat_tray_enabled", _state.value.chatTrayEnabled)
+    } else {
+      _state.value.chatTrayEnabled
+    }
+    _state.value = _state.value.copy(
+      isOnline = true,
+      chatTrayEnabled = trayVal,
+      chatMessages = merged
+    )
+    if (item.sender.equals("PC", ignoreCase = true)) {
+      persistIncomingPcChatToFamilyRoom(listOf(item))
+    }
+  }
+
+  private fun parsePcChatMessageObj(o: JSONObject?): PcChatMessage? {
+    if (o == null) return null
+    val txt = o.optString("text", "").trim()
+    if (txt.isBlank()) return null
+    val ts = o.optLong("ts", System.currentTimeMillis()).takeIf { it > 0L } ?: System.currentTimeMillis()
+    val sender = o.optString("sender", "PARENT").uppercase()
+    val user = o.optString("user", if (sender == "PARENT") "Родитель" else "ПК").trim()
+    val id = o.optString("id", "").trim().ifBlank { "${sender.lowercase()}_${ts}_${txt.hashCode()}" }
+    return PcChatMessage(id = id, sender = sender, user = user, text = txt, timestampMs = ts)
+  }
+
+  private fun mergePcChatLists(existing: List<PcChatMessage>, incoming: List<PcChatMessage>): List<PcChatMessage> {
+    if (incoming.isEmpty()) return existing
+    val byId = LinkedHashMap<String, PcChatMessage>()
+    for (m in existing) byId[m.id] = m
+    for (m in incoming) byId[m.id] = m
+    return byId.values.sortedBy { it.timestampMs }.takeLast(80)
+  }
+
+  private fun persistIncomingPcChatToFamilyRoom(items: List<PcChatMessage>) {
+    val ctx = DirectP2pSocketEngine.appContext ?: return
+    val prefs = pcPrefs()
+    val persistedSet = prefs?.getStringSet("ingested_pc_chat_ids", emptySet())?.toMutableSet() ?: mutableSetOf()
+    val newlyAdded = mutableListOf<PcChatMessage>()
+    for (item in items) {
+      if (!item.sender.equals("PC", ignoreCase = true)) continue
+      if (item.id in ingestedPcChatIds || item.id in persistedSet) continue
+      ingestedPcChatIds.add(item.id)
+      persistedSet.add(item.id)
+      newlyAdded.add(item)
+    }
+    if (newlyAdded.isEmpty()) return
+    try {
+      val trimmedSet = if (persistedSet.size > 160) {
+        persistedSet.toList().takeLast(120).toSet()
+      } else persistedSet
+      prefs?.edit()?.putStringSet("ingested_pc_chat_ids", trimmedSet)?.apply()
+    } catch (_: Exception) {}
+
+    scope.launch {
+      try {
+        val dao = KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+        val cfg = dao.getFamilyConfigOnce()
+        val children = dao.getAllChildrenOnce()
+        val childId = when {
+          cfg != null && cfg.currentActiveChildId > 0L -> cfg.currentActiveChildId
+          children.isNotEmpty() -> children.first().id
+          else -> 1L
+        }
+        for (item in newlyAdded) {
+          val winUser = item.user.ifBlank { "Компьютер" }
+          com.example.data.repository.ParentalControlRepository.ingestIncomingChatIfNew(
+            context = ctx,
+            dao = dao,
+            incomingMsg = com.example.data.model.ChatMessageEntity(
+              id = 0,
+              childId = childId,
+              senderRole = "CHILD",
+              senderName = "💻 ПК • $winUser",
+              text = item.text,
+              timestamp = item.timestampMs,
+              isRead = false,
+              isAttentionSignal = false
+            )
+          )
+        }
+      } catch (_: Exception) {}
     }
   }
 
@@ -1374,7 +1492,8 @@ object PcBlockerClient {
     // не опознан по pc_id. Блокируем только ИЗМЕНЕНИЕ правил, чтобы не задеть чужой ПК.
     val isReadOnly = action == "/api/sync" || action == "/api/screen" ||
       action == "/api/screenshot_hd" || action == "/api/record_start" ||
-      action == "/api/record_stop" || action == "/api/stream_start" || action == "/api/stream_stop"
+      action == "/api/record_stop" || action == "/api/stream_start" || action == "/api/stream_stop" ||
+      action == "/api/chat/send" || action == "/api/chat/config"
     if (!isReadOnly && configuredPcId.isBlank() && !codeExplicitlySet) {
       _state.value = _state.value.copy(
         statusMessage = "Укажите код P2P компьютера в «⚙ Настройка подключения к ПК»"
@@ -1461,6 +1580,96 @@ object PcBlockerClient {
       sendP2pCommand("/api/record_start", data)
       if (_state.value.isLanHttpAuthenticated) {
         postLanAction("/api/record_start", data)
+      }
+    }
+  }
+
+  /** Отправка сообщения от Родителя в всплывающее окно чата на ПК (поверх всех окон). */
+  fun sendPcChatMessage(
+    text: String,
+    senderName: String = "Родитель",
+    alsoRecordInFamilyChat: Boolean = true
+  ) {
+    val clean = text.trim()
+    if (clean.isBlank()) return
+    loadPersistedPcIdentity()
+    val now = System.currentTimeMillis()
+    val msgId = "parent_${now}_${(1000..9999).random()}"
+    val localMsg = PcChatMessage(
+      id = msgId,
+      sender = "PARENT",
+      user = senderName.ifBlank { "Родитель" },
+      text = clean,
+      timestampMs = now
+    )
+    _state.value = _state.value.copy(
+      chatMessages = mergePcChatLists(_state.value.chatMessages, listOf(localMsg)),
+      statusMessage = "💬 Сообщение отправлено на ПК"
+    )
+    val data = JSONObject().apply {
+      put("id", msgId)
+      put("text", clean)
+      put("sender_name", localMsg.user)
+      put("ts", now)
+    }
+    scope.launch {
+      try {
+        DirectP2pSocketEngine.ensureConnectedAndWake()
+      } catch (_: Exception) {}
+      sendP2pCommand("/api/chat/send", data)
+      if (_state.value.isLanHttpAuthenticated) {
+        postLanAction("/api/chat/send", data)
+      }
+      if (alsoRecordInFamilyChat) {
+        val ctx = DirectP2pSocketEngine.appContext
+        if (ctx != null) {
+          try {
+            val dao = KidsGuardDatabase.getDatabase(ctx).kidsGuardDao()
+            val cfg = dao.getFamilyConfigOnce()
+            val children = dao.getAllChildrenOnce()
+            val childId = when {
+              cfg != null && cfg.currentActiveChildId > 0L -> cfg.currentActiveChildId
+              children.isNotEmpty() -> children.first().id
+              else -> 1L
+            }
+            dao.insertChatMessage(
+              com.example.data.model.ChatMessageEntity(
+                id = 0,
+                childId = childId,
+                senderRole = "PARENT",
+                senderName = "Родитель → 💻 ПК",
+                text = clean,
+                timestamp = now,
+                isRead = true,
+                isAttentionSignal = false
+              )
+            )
+          } catch (_: Exception) {}
+        }
+      }
+    }
+  }
+
+  /** Включает или выключает иконку чата в системном трее Windows (по умолчанию ВЫКЛ). */
+  fun setPcChatTrayEnabled(enabled: Boolean) {
+    loadPersistedPcIdentity()
+    optimisticChatTrayEnabled = enabled
+    optimisticChatTrayExpiryMs = System.currentTimeMillis() + 8_000L
+    _state.value = _state.value.copy(
+      chatTrayEnabled = enabled,
+      statusMessage = if (enabled) {
+        "💬 Иконка чата в трее ПК ВКЛЮЧЕНА (ребёнок может писать сам)"
+      } else {
+        "🔒 Иконка чата в трее ПК ВЫКЛЮЧЕНА (чат открывается только от родителя)"
+      }
+    )
+    val data = JSONObject().apply {
+      put("tray_enabled", enabled)
+    }
+    scope.launch {
+      sendP2pCommand("/api/chat/config", data)
+      if (_state.value.isLanHttpAuthenticated) {
+        postLanAction("/api/chat/config", data)
       }
     }
   }
@@ -1769,8 +1978,10 @@ object PcBlockerClient {
         val uObj = usersObj.optJSONObject(u) ?: continue
         val pArr = uObj.optJSONArray("procs")
         val tArr = uObj.optJSONArray("titles")
+        val sArr = uObj.optJSONArray("sites")
         val procs = mutableListOf<PcActivityItem>()
         val titles = mutableListOf<PcActivityItem>()
+        val sites = mutableListOf<PcActivityItem>()
         if (pArr != null) {
           for (i in 0 until pArr.length()) {
             val item = pArr.optJSONObject(i) ?: continue
@@ -1795,7 +2006,33 @@ object PcBlockerClient {
             )
           }
         }
-        result.add(PcActivityUser(user = u, procs = procs, titles = titles))
+        if (sArr != null) {
+          for (i in 0 until sArr.length()) {
+            val item = sArr.optJSONObject(i) ?: continue
+            val domain = item.optString("domain").trim()
+            val pageTitle = item.optString("title").trim()
+            val visits = item.optInt("visits", 1).coerceAtLeast(1)
+            val sec = item.optInt("seconds", visits * 15).coerceAtLeast(15)
+            val tsMs = item.optLong("ts", item.optLong("started", 0L))
+            val label = when {
+              domain.isNotBlank() && pageTitle.isNotBlank() && !pageTitle.equals(domain, ignoreCase = true) ->
+                "🌐 $domain — $pageTitle"
+              domain.isNotBlank() -> "🌐 $domain"
+              else -> pageTitle
+            }
+            if (label.isNotBlank()) {
+              sites.add(
+                PcActivityItem(
+                  label = label,
+                  seconds = sec,
+                  startedAtMs = tsMs,
+                  userName = u
+                )
+              )
+            }
+          }
+        }
+        result.add(PcActivityUser(user = u, procs = procs, titles = titles, sites = sites))
       }
       return result
     }
@@ -1891,6 +2128,24 @@ object PcBlockerClient {
       todayUsers.sumOf { u -> u.procs.sumOf { it.seconds } }
     }
 
+    val incomingChatList = mutableListOf<PcChatMessage>()
+    val chatArr = msg.optJSONArray("chat_messages")
+    if (chatArr != null) {
+      for (i in 0 until chatArr.length()) {
+        parsePcChatMessageObj(chatArr.optJSONObject(i))?.let { incomingChatList.add(it) }
+      }
+    }
+    if (incomingChatList.any { it.sender.equals("PC", ignoreCase = true) }) {
+      persistIncomingPcChatToFamilyRoom(incomingChatList)
+    }
+    val resolvedChatTray = if (System.currentTimeMillis() < optimisticChatTrayExpiryMs && optimisticChatTrayEnabled != null) {
+      optimisticChatTrayEnabled!!
+    } else if (msg.has("chat_tray_enabled")) {
+      msg.optBoolean("chat_tray_enabled", false)
+    } else {
+      current.chatTrayEnabled
+    }
+
     return current.copy(
       isOnline = true,
       transportLabel = transport,
@@ -1944,6 +2199,8 @@ object PcBlockerClient {
       pcRecordingFrames = recFrames,
       lastScreenshotPath = shotPath.ifBlank { current.lastScreenshotPath },
       lastScreenshotAtMs = if (shotTs > 0L) shotTs else current.lastScreenshotAtMs,
+      chatTrayEnabled = resolvedChatTray,
+      chatMessages = mergePcChatLists(current.chatMessages, incomingChatList),
       lastSyncMs = System.currentTimeMillis()
     )
   }
@@ -1992,7 +2249,8 @@ object PcBlockerClient {
       if (dateIso.isBlank()) continue
       val sig = users.joinToString("|") { u ->
         u.user + ":" + u.procs.joinToString(",") { "${it.label}=${it.seconds}" } +
-          ";" + u.titles.joinToString(",") { "${it.label}=${it.seconds}" }
+          ";" + u.titles.joinToString(",") { "${it.label}=${it.seconds}" } +
+          ";" + u.sites.joinToString(",") { "${it.label}=${it.seconds}" }
       }.hashCode()
       if (syncedPcActivityHashes[dateIso] != sig) {
         changed[dateIso] = Pair(users, sig)
@@ -2000,7 +2258,7 @@ object PcBlockerClient {
     }
     if (changed.isEmpty()) return
     val now = System.currentTimeMillis()
-    if (now - lastPcActivitySyncMs < 15_000L) return
+    if (now - lastPcActivitySyncMs < 5_000L) return
     lastPcActivitySyncMs = now
     scope.launch {
       try {
@@ -2018,6 +2276,7 @@ object PcBlockerClient {
           val cal = Calendar.getInstance().apply { timeInMillis = anchorTs }
           val hour = cal.get(Calendar.HOUR_OF_DAY).coerceIn(0, 23)
           val dayLogs = mutableListOf<OfflineActivityLogEntity>()
+          var rowOffset = 0L
           for (uAct in users) {
             val winUser = uAct.user.ifBlank { "Windows" }
             for (p in uAct.procs) {
@@ -2032,7 +2291,7 @@ object PcBlockerClient {
                     durationSeconds = p.seconds,
                     hourOfDay = hour,
                     dateIso = dateIso,
-                    timestamp = anchorTs,
+                    timestamp = anchorTs + (rowOffset++),
                     startedAtMs = p.startedAtMs,
                     isSyncedToParent = true
                   )
@@ -2060,21 +2319,42 @@ object PcBlockerClient {
                 )
               }
             for (t in mergedTitles) {
+              val titleKey = t.label.lowercase().hashCode().toUInt().toString(16)
               dayLogs.add(
                 OfflineActivityLogEntity(
                   childId = childId,
                   deviceType = "PC",
-                  packageName = "browser",
+                  packageName = "pc_title:$titleKey",
                   appName = winUser,
                   windowTitle = t.label,
                   durationSeconds = t.seconds,
                   hourOfDay = hour,
                   dateIso = dateIso,
-                  timestamp = anchorTs,
+                  timestamp = anchorTs + (rowOffset++),
                   startedAtMs = t.startedAtMs,
                   isSyncedToParent = true
                 )
               )
+            }
+            for (s in uAct.sites) {
+              if (s.label.isNotBlank()) {
+                val siteKey = s.label.lowercase().hashCode().toUInt().toString(16)
+                dayLogs.add(
+                  OfflineActivityLogEntity(
+                    childId = childId,
+                    deviceType = "PC",
+                    packageName = "pc_site:$siteKey",
+                    appName = winUser,
+                    windowTitle = s.label,
+                    durationSeconds = s.seconds.coerceAtLeast(15),
+                    hourOfDay = hour,
+                    dateIso = dateIso,
+                    timestamp = anchorTs + (rowOffset++),
+                    startedAtMs = s.startedAtMs,
+                    isSyncedToParent = true
+                  )
+                )
+              }
             }
           }
           dao.replacePcActivitySnapshotForDate(childId, dateIso, dayLogs)

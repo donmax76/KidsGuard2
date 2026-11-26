@@ -30,12 +30,12 @@ val versionProps = Properties().apply {
 val verMajor = versionProps.getProperty("VERSION_MAJOR", "3").toIntOrNull() ?: 3
 val verMinor = versionProps.getProperty("VERSION_MINOR", "3").toIntOrNull() ?: 3
 val currentPatch = maxOf(35, versionProps.getProperty("VERSION_PATCH", "35").toIntOrNull() ?: 35)
-val currentBuild = maxOf(78, versionProps.getProperty("VERSION_BUILD", "78").toIntOrNull() ?: 78)
-val currentVerCode = maxOf(218, versionProps.getProperty("VERSION_CODE", "218").toIntOrNull() ?: 218)
+val currentBuild = maxOf(80, versionProps.getProperty("VERSION_BUILD", "80").toIntOrNull() ?: 80)
+val currentVerCode = maxOf(220, versionProps.getProperty("VERSION_CODE", "220").toIntOrNull() ?: 220)
 val currentVerName = "$verMajor.$verMinor.$currentPatch Pro"
-// Каждый запуск CI получает новый versionCode/versionName, но никогда не ниже текущей версии (Pro.78 / Build 218).
+// Каждый запуск CI получает новый versionCode/versionName, но никогда не ниже текущей версии (Pro.80 / Build 220).
 val ciBuildNumber = maxOf(currentBuild, System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: currentBuild)
-val effectiveVersionCode = maxOf(218, currentVerCode, 140 + ciBuildNumber)
+val effectiveVersionCode = maxOf(220, currentVerCode, 140 + ciBuildNumber)
 val effectiveVersionName = if (ciBuildNumber > 0) "$currentVerName.${ciBuildNumber}" else currentVerName
 
 android {

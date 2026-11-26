@@ -163,22 +163,29 @@
 
 ---
 
-## 5. Сборка одного `.exe`
+## 5. Сборка `.exe` (Агент ПК `hosts_blocker.exe` и Программа родителя `KidsGuardParent.exe`)
 
+### Вариант A — Автоматически в GitHub Actions (рекомендуется)
+При каждом пуше в `main` / `master` или при создании тега релиза (`v*`) GitHub Actions на Windows автоматически собирает и публикует три комплекта:
+- **`KidsGuard-debug-apk`** — Android-приложение (`app-debug.apk`);
+- **`KidsGuard-PC-Agent`** — агент для ПК ребёнка (`hosts_blocker.exe` + `hosts_blocker.py`);
+- **`KidsGuard-Parent-Windows`** — настольная программа родителя (`KidsGuardParent.exe` + `kidsguard_parent.py` + `build_windows_exes.bat`).
+
+### Вариант B — В один клик на вашем компьютере Windows
+Запустите **`build_windows_exes.bat`** из корня проекта — скрипт сам установит `pillow`, `pywebview`, `pyinstaller` и соберёт оба файла в папку `dist\`:
+- `dist\hosts_blocker.exe` — для ПК ребёнка (первый запуск от имени администратора);
+- `dist\KidsGuardParent.exe` — программа родителя для Windows (обычный запуск, работает в отдельном окне, сворачивается в системный трей и хранит архив истории в `%APPDATA%\KidsGuardParent\history.db`).
+
+### Ручные команды PyInstaller
 ```bat
-pip install pillow pyinstaller
-pyinstaller --noconsole --onefile --name hosts_blocker hosts_blocker.py
+pip install pillow pywebview pyinstaller
+pyinstaller --noconfirm --clean --noconsole --onefile --name hosts_blocker hosts_blocker.py
+pyinstaller --noconfirm --clean --noconsole --onefile --name KidsGuardParent kidsguard_parent.py
 ```
 
 * `--noconsole` — без чёрного окна консоли;
-* `--onefile` — один файл (`dist\hosts_blocker.exe`);
-* **НЕ добавляйте `--uac-admin`**: агент запускается автозапуском при входе пользователя и
-  не может пройти UAC молча — без агента не будет ни активности, ни экрана пользователя.
-  Права администратора GUI запрашивает сам (`relaunch_as_admin`), а движок работает как SYSTEM.
-
-Готовый `hosts_blocker.exe` скопируйте на ПК ребёнка (например, в
-`C:\ProgramData\HostsBlocker\`) и запустите один раз от администратора. Дальше программу
-поднимает Планировщик (`HostsBlockerEngine`, `HostsBlockerWatchdog`) и автозапуск агента.
+* `--onefile` — один исполняемый `.exe` файл;
+* **НЕ добавляйте `--uac-admin` для `hosts_blocker.exe`**: агент запускается автозапуском при входе пользователя и не может пройти UAC молча — права администратора GUI запрашивает сам (`relaunch_as_admin`), а движок работает как `SYSTEM`.
 
 ---
 
